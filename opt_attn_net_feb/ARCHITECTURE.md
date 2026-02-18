@@ -62,10 +62,10 @@ Fusion + task representation:
   mixer MLP -> z_tasks [B, 4, mixer_hidden]
 
 Heads:
-  Classification heads (per-task linear):
+  Classification heads (per-task residual MLP predictor):
     z_tasks -> logits [B, 4]
 
-  Auxiliary shared heads (from mean task embedding):
+  Auxiliary shared heads (residual MLP predictors from mean task embedding):
     z_aux = mean(z_tasks over task axis) [B, mixer_hidden]
     z_aux -> abs_heads  -> abs_out  [B, 2]
     z_aux -> fluo_heads -> fluo_out [B, 4]
@@ -131,6 +131,12 @@ Auxiliary absorbance targets (`AUX_ABS_COLS`):
 Auxiliary fluorescence is built from base columns `wl_pred_nm` and `qy_pred`,
 expanded to 4 outputs to align with task structure.
 
+Head architecture note:
+
+- Heads are V3-like residual MLP predictors (not plain linear layers)
+- Each head uses residual FFN blocks with SwiGLU, LayerNorm, DropPath, and learnable residual scaling
+- Final scalar output per head is produced by a small-gain linear output layer
+
 ## 3) Losses and Training Objective
 
 Primary loss assembly: `models/mil_task_attn_mixer/training.py`
@@ -186,6 +192,10 @@ HPO search space is defined in `training/hpo.py::search_space`.
 - `mixer_hidden` (`{512, 1024}`): Width of the fusion mixer MLP that maps concatenated 2D/3D task features to task embeddings.
 - `mixer_layers` (`[3, 5]`): Depth of the fusion mixer; controls complexity of cross-modal feature interaction.
 - `mixer_dropout` (`[0.05, 0.2]`): Dropout in fusion mixer blocks; regularizes final task representations.
+- `head_num_layers` (`{1, 2}`): Shared residual predictor depth for all classification/aux heads.
+- `head_dropout` (`[0.0, 0.2]`): Shared dropout inside residual predictor blocks across all heads.
+- `head_stochastic_depth` (`[0.0, 0.1]`, conditional): Shared DropPath rate for heads; fixed to `0.0` when `head_num_layers=1`.
+- `head_fc2_gain_non_last` (`{1e-3, 3e-3, 1e-2}`): Shared non-last residual block `fc2` init gain in all heads (controls early optimization speed).
 - `activation` (`{GELU, SiLU, Mish, ReLU, LeakyReLU}`): Nonlinearity used by the mixer MLP (and by encoders only if gating is disabled).
 
 ### 4.2 Optimization and effective batch size

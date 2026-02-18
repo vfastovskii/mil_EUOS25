@@ -12,7 +12,7 @@ from ...utils.metrics import ap_per_task
 from ...utils.mlp import make_mlp, make_residual_mlp_embedder_v3
 from ..task_attention import TaskAttentionPool
 from .constants import NUM_ABS_HEADS, NUM_FLUO_HEADS, NUM_TASKS
-from .heads import apply_shared_heads, apply_task_heads, make_linear_heads, make_projection
+from .heads import apply_shared_heads, apply_task_heads, make_predictor_heads, make_projection
 from .training import compute_training_losses
 
 
@@ -51,6 +51,10 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         lambda_aux_fluo: float,
         reg_loss_type: str,
         activation: str = "GELU",
+        head_num_layers: int = 2,
+        head_dropout: float = 0.1,
+        head_stochastic_depth: float = 0.1,
+        head_fc2_gain_non_last: float = 1e-2,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["pos_weight", "gamma", "lam"])
@@ -88,9 +92,33 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             activation=str(activation),
         )
 
-        self.cls_heads = make_linear_heads(int(mixer_hidden), NUM_TASKS)
-        self.abs_heads = make_linear_heads(int(mixer_hidden), NUM_ABS_HEADS)
-        self.fluo_heads = make_linear_heads(int(mixer_hidden), NUM_FLUO_HEADS)
+        self.cls_heads = make_predictor_heads(
+            int(mixer_hidden),
+            NUM_TASKS,
+            activation=str(activation),
+            num_layers=int(head_num_layers),
+            dropout=float(head_dropout),
+            stochastic_depth=float(head_stochastic_depth),
+            fc2_gain_non_last=float(head_fc2_gain_non_last),
+        )
+        self.abs_heads = make_predictor_heads(
+            int(mixer_hidden),
+            NUM_ABS_HEADS,
+            activation=str(activation),
+            num_layers=int(head_num_layers),
+            dropout=float(head_dropout),
+            stochastic_depth=float(head_stochastic_depth),
+            fc2_gain_non_last=float(head_fc2_gain_non_last),
+        )
+        self.fluo_heads = make_predictor_heads(
+            int(mixer_hidden),
+            NUM_FLUO_HEADS,
+            activation=str(activation),
+            num_layers=int(head_num_layers),
+            dropout=float(head_dropout),
+            stochastic_depth=float(head_stochastic_depth),
+            fc2_gain_non_last=float(head_fc2_gain_non_last),
+        )
 
         self.cls_loss = MultiTaskFocal(pos_weight=pos_weight, gamma=gamma)
         self.register_buffer("lam", torch.tensor(lam, dtype=torch.float32))

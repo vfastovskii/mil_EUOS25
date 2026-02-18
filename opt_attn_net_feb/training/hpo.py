@@ -53,6 +53,11 @@ def search_space(trial: Trial) -> Dict[str, Any]:
         "mixer_layers": trial.suggest_int("mixer_layers", 3, 5),
         "mixer_dropout": trial.suggest_float("mixer_dropout", 0.05, 0.2),
 
+        # Shared predictor-head architecture knobs (applied to all heads)
+        "head_num_layers": trial.suggest_categorical("head_num_layers", [1, 2]),
+        "head_dropout": trial.suggest_float("head_dropout", 0.0, 0.2),
+        "head_fc2_gain_non_last": trial.suggest_categorical("head_fc2_gain_non_last", [1e-3, 3e-3, 1e-2]),
+
         # Activation choice for encoders and mixer
         "activation": trial.suggest_categorical("activation", ["GELU", "SiLU", "Mish", "ReLU", "LeakyReLU"]),
 
@@ -91,6 +96,11 @@ def search_space(trial: Trial) -> Dict[str, Any]:
 
         "accumulate_grad_batches": trial.suggest_categorical("accumulate_grad_batches", [8, 16]),
     }
+    if int(p["head_num_layers"]) == 1:
+        # No depth schedule when only one block is present.
+        p["head_stochastic_depth"] = 0.0
+    else:
+        p["head_stochastic_depth"] = trial.suggest_float("head_stochastic_depth", 0.0, 0.1)
     if int(p["inst_hidden"]) % int(p["attn_heads"]) != 0:
         raise optuna.TrialPruned("inst_hidden must be divisible by attn_heads")
     return p
@@ -230,6 +240,10 @@ def objective_mil_cv(
             lambda_aux_fluo=float(p["lambda_aux_fluo"]),
             reg_loss_type=str(p["reg_loss_type"]),
             activation=str(p.get("activation", "GELU")),
+            head_num_layers=int(p.get("head_num_layers", 2)),
+            head_dropout=float(p.get("head_dropout", 0.1)),
+            head_stochastic_depth=float(p.get("head_stochastic_depth", 0.0 if int(p.get("head_num_layers", 2)) == 1 else 0.1)),
+            head_fc2_gain_non_last=float(p.get("head_fc2_gain_non_last", 1e-2)),
         )
 
         fold_ckpt_dir = ckpt_root / f"mil_trial{trial.number}_fold{f}"
@@ -478,6 +492,15 @@ def train_best_and_export(
         lambda_aux_fluo=float(best_params["lambda_aux_fluo"]),
         reg_loss_type=str(best_params["reg_loss_type"]),
         activation=str(best_params.get("activation", "GELU")),
+        head_num_layers=int(best_params.get("head_num_layers", 2)),
+        head_dropout=float(best_params.get("head_dropout", 0.1)),
+        head_stochastic_depth=float(
+            best_params.get(
+                "head_stochastic_depth",
+                0.0 if int(best_params.get("head_num_layers", 2)) == 1 else 0.1,
+            )
+        ),
+        head_fc2_gain_non_last=float(best_params.get("head_fc2_gain_non_last", 1e-2)),
     )
 
     final_dir = outdir / "final_best_train_vs_leaderboard"
