@@ -21,6 +21,11 @@ def search_space(trial: Trial) -> Dict[str, Any]:
         "mixer_hidden": trial.suggest_categorical("mixer_hidden", [512, 1024]),
         "mixer_layers": trial.suggest_int("mixer_layers", 3, 5),
         "mixer_dropout": trial.suggest_float("mixer_dropout", 0.05, 0.2),
+        # Component selection by name (extensible registries)
+        "mol_embedder_name": trial.suggest_categorical("mol_embedder_name", ["mlp_v3_2d"]),
+        "inst_embedder_name": trial.suggest_categorical("inst_embedder_name", ["mlp_v3_3d"]),
+        "aggregator_name": trial.suggest_categorical("aggregator_name", ["task_attention_pool"]),
+        "predictor_name": trial.suggest_categorical("predictor_name", ["mlp_v3"]),
         # Shared predictor-head architecture knobs (applied to all heads)
         "head_num_layers": trial.suggest_categorical("head_num_layers", [1, 2]),
         "head_dropout": trial.suggest_float("head_dropout", 0.0, 0.2),

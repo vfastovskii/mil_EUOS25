@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from ..models.mil_task_attn_mixer import MILTaskAttnMixerWithAux
+from ..models.multimodal_mil import MILTaskAttnMixerWithAux
 
 
 @dataclass(frozen=True)
@@ -59,6 +59,10 @@ class MILModelBuilder:
             lambda_aux_fluo=float(params["lambda_aux_fluo"]),
             reg_loss_type=str(params["reg_loss_type"]),
             activation=str(params.get("activation", "GELU")),
+            mol_embedder_name=str(params.get("mol_embedder_name", "mlp_v3_2d")),
+            inst_embedder_name=str(params.get("inst_embedder_name", "mlp_v3_3d")),
+            aggregator_name=str(params.get("aggregator_name", "task_attention_pool")),
+            predictor_name=str(params.get("predictor_name", "mlp_v3")),
             head_num_layers=int(params.get("head_num_layers", 2)),
             head_dropout=float(params.get("head_dropout", 0.1)),
             head_stochastic_depth=_resolve_head_stochastic_depth(params),

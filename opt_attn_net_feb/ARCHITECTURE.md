@@ -33,9 +33,66 @@ Canonical imports:
 
 Primary implementation:
 
-- `models/mil_task_attn_mixer/model.py`
-- `models/task_attention/pool.py`
-- `models/mil_task_attn_mixer/heads.py`
+- `models/multimodal_mil/model.py`
+- `models/multimodal_mil/embedders.py`
+- `models/multimodal_mil/aggregators.py`
+- `models/multimodal_mil/predictors.py`
+- `models/attention_pooling/pool.py`
+- `models/multimodal_mil/heads.py`
+
+### 2.0 Componentized structure (extensible by name)
+
+Model assembly is now explicit and layered:
+
+- `embedder`:
+  - `2D` embedder registry in `models/multimodal_mil/embedders.py`
+  - `3D` embedder registry in `models/multimodal_mil/embedders.py`
+- `aggregator`:
+  - registry in `models/multimodal_mil/aggregators.py`
+  - current default: `task_attention_pool`
+- `predictor`:
+  - head-builder registry in `models/multimodal_mil/predictors.py`
+  - current default: `mlp_v3`
+
+Selection is name-based in model init:
+
+- `mol_embedder_name`
+- `inst_embedder_name`
+- `aggregator_name`
+- `predictor_name`
+
+Current defaults preserve existing behavior:
+
+- `mol_embedder_name="mlp_v3_2d"`
+- `inst_embedder_name="mlp_v3_3d"`
+- `aggregator_name="task_attention_pool"`
+- `predictor_name="mlp_v3"`
+
+Design rule:
+
+- 2D modality is molecule-level (`[B, F2]`) and does not use an aggregator.
+- 3D modality is instance-level (`[B, N, F3]`) and must pass through an aggregator to produce per-task pooled representation.
+
+Extension workflow:
+
+- Add new 2D embedder:
+  - implement a builder with signature `(input_dim, hidden_dim, layers, dropout, activation)`
+  - register it via `register_2d_embedder("name", builder)`
+- Add new 3D embedder:
+  - implement a builder with the same signature
+  - register it via `register_3d_embedder("name", builder)`
+- Add new aggregator:
+  - implement a builder with signature `(dim, n_heads, dropout, n_tasks, **kwargs)`
+  - register it via `register_aggregator("name", builder)`
+- Add new predictor family:
+  - implement a builder with signature `(in_dim, count, activation, num_layers, dropout, stochastic_depth, fc2_gain_non_last)`
+  - register it via `register_predictor("name", builder)`
+
+Compatibility note:
+
+- Legacy embedder value `mlp_v3` is accepted and resolved internally as:
+  - 2D: `mlp_v3_2d`
+  - 3D: `mlp_v3_3d`
 
 ### 2.1 End-to-end flow
 
@@ -46,14 +103,13 @@ Input:
   kpm        [B, N]   (True = padding)
 
 Branch A (molecule / 2D):
-  x2d -> mol_enc MLP -> [B, mol_hidden]
+  x2d -> 2D embedder (by name) -> [B, mol_hidden]
       -> proj2d (Linear + LayerNorm) -> e2d [B, proj_dim]
       -> repeat per task -> e2d_rep [B, 4, proj_dim]
 
 Branch B (instance / 3D):
-  x3d_pad -> inst_enc MLP per instance -> [B, N, inst_hidden]
-          -> LayerNorm
-          -> TaskAttentionPool (4 learned queries, MHA)
+  x3d_pad -> 3D embedder (by name) per instance -> [B, N, inst_hidden]
+          -> aggregator (by name; current TaskAttentionPool)
           -> pooled_tasks [B, 4, inst_hidden]
           -> proj3d (Linear + LayerNorm) -> e3d [B, 4, proj_dim]
 
@@ -133,13 +189,13 @@ expanded to 4 outputs to align with task structure.
 
 Head architecture note:
 
-- Heads are V3-like residual MLP predictors (not plain linear layers)
+- Heads are selected by predictor name (current: V3-like residual MLP predictors; not plain linear layers)
 - Each head uses residual FFN blocks with SwiGLU, LayerNorm, DropPath, and learnable residual scaling
 - Final scalar output per head is produced by a small-gain linear output layer
 
 ## 3) Losses and Training Objective
 
-Primary loss assembly: `models/mil_task_attn_mixer/training.py`
+Primary loss assembly: `models/multimodal_mil/training.py`
 
 ### 3.1 Classification loss (`MultiTaskFocal`)
 
@@ -176,7 +232,7 @@ Validation metrics:
 
 ## 4) Hyperparameters
 
-HPO search space is defined in `training/hpo.py::search_space`.
+HPO search space is defined in `training/search_space.py::search_space`.
 
 ### 4.1 Architecture capacity and regularization
 
@@ -192,6 +248,10 @@ HPO search space is defined in `training/hpo.py::search_space`.
 - `mixer_hidden` (`{512, 1024}`): Width of the fusion mixer MLP that maps concatenated 2D/3D task features to task embeddings.
 - `mixer_layers` (`[3, 5]`): Depth of the fusion mixer; controls complexity of cross-modal feature interaction.
 - `mixer_dropout` (`[0.05, 0.2]`): Dropout in fusion mixer blocks; regularizes final task representations.
+- `mol_embedder_name` (fixed: `{mlp_v3_2d}`): 2D embedder implementation selected from registry.
+- `inst_embedder_name` (fixed: `{mlp_v3_3d}`): 3D instance embedder implementation selected from registry.
+- `aggregator_name` (fixed: `{task_attention_pool}`): 3D token aggregator selected from registry.
+- `predictor_name` (fixed: `{mlp_v3}`): Predictor head family selected from registry.
 - `head_num_layers` (`{1, 2}`): Shared residual predictor depth for all classification/aux heads.
 - `head_dropout` (`[0.0, 0.2]`): Shared dropout inside residual predictor blocks across all heads.
 - `head_stochastic_depth` (`[0.0, 0.1]`, conditional): Shared DropPath rate for heads; fixed to `0.0` when `head_num_layers=1`.

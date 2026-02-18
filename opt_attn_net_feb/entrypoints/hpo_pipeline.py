@@ -207,7 +207,7 @@ def _run_hpo(args, outdir, num_workers, pin_memory, hpo):
     ckpt_root = outdir / "_tmp_best_ckpts"
     ckpt_root.mkdir(parents=True, exist_ok=True)
 
-    study_name = "mil_task_attn_mixer_aux_gpu"
+    study_name = "multimodal_mil_aux_gpu"
     study = optuna.create_study(
         direction="maximize",
         sampler=sampler,
