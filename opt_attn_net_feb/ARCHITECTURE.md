@@ -95,9 +95,14 @@ Both `mol_enc` and `inst_enc` use `utils.mlp.make_residual_mlp_embedder_v3`
 
 - Learned query tensor: `[1, n_tasks, dim]` (expanded to batch)
 - `nn.MultiheadAttention(batch_first=True)` with `attn_heads`
-- Per-head attention is averaged (when available), then:
+- Pre-layer normalization before attention (V4-style)
+- Optional query temperature scaling
+- Per-head attention is averaged, then:
   - padding positions masked to zero
   - renormalized so each task attention sums to 1 over valid instances
+- Pooling source can be configured (`inputs`, `normed_inputs`, or `attn_out`)
+- Value projection can be tied to MHA V-projection (`tie_mha_v`)
+- Supports top-k attention pooling and optional residual blend with mean pooling
 
 Constraint:
 

@@ -5,7 +5,6 @@ from typing import List, Optional, Tuple
 import numpy as np
 import pytorch_lightning as pl
 import torch
-import torch.nn.functional as F
 from torch.cuda.amp import autocast
 
 from ...losses.multi_task_focal import MultiTaskFocal
@@ -136,7 +135,6 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         batch_size, n_instances, feature_dim = x3d_pad.shape
         tok = self.inst_enc(x3d_pad.reshape(batch_size * n_instances, feature_dim)).reshape(batch_size, n_instances, -1)
-        tok = F.layer_norm(tok, (tok.shape[-1],))
         return self.attn_pool(tok, key_padding_mask=key_padding_mask, return_attn=return_attn)
 
     def _build_task_representations(self, *, x2d: torch.Tensor, pooled_tasks: torch.Tensor) -> torch.Tensor:
