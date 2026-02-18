@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 import json
 import gc
 import shutil
@@ -11,16 +11,15 @@ import pandas as pd
 import torch
 import optuna
 from optuna.trial import Trial
-from torch.utils.data import DataLoader
 
-from ..models.mil_task_attn_mixer import MILTaskAttnMixerWithAux
 from ..data.datasets import MILTrainDataset, MILExportDataset
 from ..data.collate import collate_train, collate_export
 from ..data.exports import export_leaderboard_attention
+from .builders import DataLoaderBuilder, LoaderConfig, MILModelBuilder
+from .loss_config import compute_gamma, compute_lam, compute_posw_clips
 from .trainer import make_trainer_gpu, eval_best_epoch
 from ..utils.ops import (
     set_all_seeds,
-    lambda_from_prevalence,
     pos_weight_per_task,
     fit_standardizer,
     apply_standardizer,
@@ -141,35 +140,14 @@ def objective_mil_cv(
     min_w = float(p.get("min_w", 0.30))
 
     device = torch.device("cuda" if torch.cuda.is_available() and accelerator in ("gpu", "cuda") else "cpu")
+    loader_builder = DataLoaderBuilder(LoaderConfig(num_workers=int(num_workers), pin_memory=bool(pin_memory)))
 
     for step, (tr, va, f) in enumerate(folds_info):
         set_all_seeds(seed + 5000 * f + trial.number)
 
-        lam_vec = np.array([
-            float(p["lam_t0"]),
-            float(p["lam_t1"]),
-            float(p["lam_t2"]),
-            float(p["lam_t3"]),
-        ], dtype=np.float32)
-        lam = lam_vec / max(float(lam_vec.mean()), 1e-12)
-        lam = np.clip(lam, float(p["lam_floor"]), float(p["lam_ceil"]))
-        lam = lam / max(float(lam.mean()), 1e-12)
-        # Per-task pos_weight clipping
-        posw_clip_vec = [
-            float(p["posw_clip_t0"]),
-            float(p["posw_clip_t1"]),
-            float(p["posw_clip_t2"]),
-            float(p["posw_clip_t3"]),
-        ]
-        posw = pos_weight_per_task(y_cls[tr], clip=posw_clip_vec)
-
-        gamma = np.array([
-            float(p["gamma_t0"]),
-            float(p["gamma_t1"]),
-            float(p["gamma_t2"]),
-            float(p["gamma_t3"]),
-        ], dtype=np.float32)
-        gamma_t = torch.tensor(gamma, dtype=torch.float32)
+        lam = compute_lam(p, y_train=y_cls[tr])
+        posw = pos_weight_per_task(y_cls[tr], clip=compute_posw_clips(p))
+        gamma_t = compute_gamma(p)
 
         # aux standardization fit on TRAIN indices only
         mu_abs, sd_abs = fit_standardizer(y_abs, m_abs, tr)
@@ -204,46 +182,25 @@ def objective_mil_cv(
                     sample_weight_cap=float(p["sample_weight_cap"]),
                 )
 
-        nw = int(num_workers)
-        dl_kw = dict(
-            num_workers=nw,
-            pin_memory=pin_memory,
-            persistent_workers=(nw > 0),
+        dl_tr = loader_builder.train_loader(
+            ds_tr,
+            batch_size=int(p["batch_size"]),
+            sampler=sampler,
+            collate_fn=collate_train,
         )
-        if nw > 0:
-            dl_kw["prefetch_factor"] = 2
+        dl_va = loader_builder.eval_loader(
+            ds_va,
+            batch_size=min(128, int(p["batch_size"])),
+            collate_fn=collate_train,
+        )
 
-        dl_tr = DataLoader(ds_tr, batch_size=int(p["batch_size"]), sampler=sampler, collate_fn=collate_train, **dl_kw)
-        dl_va = DataLoader(ds_va, batch_size=min(128, int(p["batch_size"])), shuffle=False, collate_fn=collate_train, **dl_kw)
-
-        model = MILTaskAttnMixerWithAux(
+        model = MILModelBuilder.build(
+            params=p,
             mol_dim=int(X2d_scaled.shape[1]),
             inst_dim=int(Xinst_sorted.shape[1]),
-            mol_hidden=int(p["mol_hidden"]),
-            mol_layers=int(p["mol_layers"]),
-            mol_dropout=float(p["mol_dropout"]),
-            inst_hidden=int(p["inst_hidden"]),
-            inst_layers=int(p["inst_layers"]),
-            inst_dropout=float(p["inst_dropout"]),
-            proj_dim=int(p["proj_dim"]),
-            attn_heads=int(p["attn_heads"]),
-            attn_dropout=float(p["attn_dropout"]),
-            mixer_hidden=int(p["mixer_hidden"]),
-            mixer_layers=int(p["mixer_layers"]),
-            mixer_dropout=float(p["mixer_dropout"]),
-            lr=float(p["lr"]),
-            weight_decay=float(p["weight_decay"]),
             pos_weight=posw,
             gamma=gamma_t,
             lam=lam,
-            lambda_aux_abs=float(p["lambda_aux_abs"]),
-            lambda_aux_fluo=float(p["lambda_aux_fluo"]),
-            reg_loss_type=str(p["reg_loss_type"]),
-            activation=str(p.get("activation", "GELU")),
-            head_num_layers=int(p.get("head_num_layers", 2)),
-            head_dropout=float(p.get("head_dropout", 0.1)),
-            head_stochastic_depth=float(p.get("head_stochastic_depth", 0.0 if int(p.get("head_num_layers", 2)) == 1 else 0.1)),
-            head_fc2_gain_non_last=float(p.get("head_fc2_gain_non_last", 1e-2)),
         )
 
         fold_ckpt_dir = ckpt_root / f"mil_trial{trial.number}_fold{f}"
@@ -395,41 +352,15 @@ def train_best_and_export(
     y_fluo_lb_sc = apply_standardizer(y_fluo_lb, mu_f, sd_f)
 
     # loss weights
-    if all(k in best_params for k in ("lam_t0", "lam_t1", "lam_t2", "lam_t3")):
-        lam_vec = np.array([
-            float(best_params["lam_t0"]),
-            float(best_params["lam_t1"]),
-            float(best_params["lam_t2"]),
-            float(best_params["lam_t3"]),
-        ], dtype=np.float32)
-        lam = lam_vec / max(float(lam_vec.mean()), 1e-12)
-        lam_floor = float(best_params.get("lam_floor", 0.25))
-        lam_ceil = float(best_params.get("lam_ceil", 6.0))
-        lam = np.clip(lam, lam_floor, lam_ceil)
-        lam = lam / max(float(lam.mean()), 1e-12)
-    else:
-        # Backward compatibility: use prevalence-based lambda if per-task lam not present
-        lam = lambda_from_prevalence(y_tr, power=float(best_params.get("lambda_power", 1.0)))
-
-    # Per-task pos_weight clipping for final training (with backward compatibility)
-    if all(k in best_params for k in ("posw_clip_t0", "posw_clip_t1", "posw_clip_t2", "posw_clip_t3")):
-        posw_clip_vec = [
-            float(best_params["posw_clip_t0"]),
-            float(best_params["posw_clip_t1"]),
-            float(best_params["posw_clip_t2"]),
-            float(best_params["posw_clip_t3"]),
-        ]
-    else:
-        posw_clip_vec = float(best_params.get("pos_weight_clip", 50.0))
-    posw = pos_weight_per_task(y_tr, clip=posw_clip_vec)
-
-    gamma = np.array([
-        float(best_params["gamma_t0"]),
-        float(best_params["gamma_t1"]),
-        float(best_params["gamma_t2"]),
-        float(best_params["gamma_t3"]),
-    ], dtype=np.float32)
-    gamma_t = torch.tensor(gamma, dtype=torch.float32)
+    lam = compute_lam(
+        best_params,
+        y_train=y_tr,
+        fallback_lambda_power=1.0,
+        fallback_lam_floor=0.25,
+        fallback_lam_ceil=6.0,
+    )
+    posw = pos_weight_per_task(y_tr, clip=compute_posw_clips(best_params, fallback_clip=50.0))
+    gamma_t = compute_gamma(best_params)
 
     # datasets + loaders
     ds_tr = MILTrainDataset(
@@ -456,51 +387,26 @@ def train_best_and_export(
         sample_weight_cap=float(best_params.get("sample_weight_cap", 10.0)),
     )
 
-    nw = int(num_workers)
-    dl_kw = dict(
-        num_workers=nw,
-        pin_memory=pin_memory,
-        persistent_workers=(nw > 0),
+    loader_builder = DataLoaderBuilder(LoaderConfig(num_workers=int(num_workers), pin_memory=bool(pin_memory)))
+    dl_tr = loader_builder.train_loader(
+        ds_tr,
+        batch_size=int(best_params["batch_size"]),
+        sampler=sampler_tr,
+        collate_fn=collate_train,
     )
-    if nw > 0:
-        dl_kw["prefetch_factor"] = 2
+    dl_val = loader_builder.eval_loader(
+        ds_lb,
+        batch_size=min(128, int(best_params["batch_size"])),
+        collate_fn=collate_train,
+    )
 
-    dl_tr = DataLoader(ds_tr, batch_size=int(best_params["batch_size"]), sampler=sampler_tr, collate_fn=collate_train, **dl_kw)
-    dl_val = DataLoader(ds_lb, batch_size=min(128, int(best_params["batch_size"])), shuffle=False, collate_fn=collate_train, **dl_kw)
-
-    model = MILTaskAttnMixerWithAux(
+    model = MILModelBuilder.build(
+        params=best_params,
         mol_dim=int(X2d_tr.shape[1]),
         inst_dim=int(Xinst_sorted.shape[1]),
-        mol_hidden=int(best_params["mol_hidden"]),
-        mol_layers=int(best_params["mol_layers"]),
-        mol_dropout=float(best_params["mol_dropout"]),
-        inst_hidden=int(best_params["inst_hidden"]),
-        inst_layers=int(best_params["inst_layers"]),
-        inst_dropout=float(best_params["inst_dropout"]),
-        proj_dim=int(best_params["proj_dim"]),
-        attn_heads=int(best_params["attn_heads"]),
-        attn_dropout=float(best_params["attn_dropout"]),
-        mixer_hidden=int(best_params["mixer_hidden"]),
-        mixer_layers=int(best_params["mixer_layers"]),
-        mixer_dropout=float(best_params["mixer_dropout"]),
-        lr=float(best_params["lr"]),
-        weight_decay=float(best_params["weight_decay"]),
         pos_weight=posw,
         gamma=gamma_t,
         lam=lam,
-        lambda_aux_abs=float(best_params["lambda_aux_abs"]),
-        lambda_aux_fluo=float(best_params["lambda_aux_fluo"]),
-        reg_loss_type=str(best_params["reg_loss_type"]),
-        activation=str(best_params.get("activation", "GELU")),
-        head_num_layers=int(best_params.get("head_num_layers", 2)),
-        head_dropout=float(best_params.get("head_dropout", 0.1)),
-        head_stochastic_depth=float(
-            best_params.get(
-                "head_stochastic_depth",
-                0.0 if int(best_params.get("head_num_layers", 2)) == 1 else 0.1,
-            )
-        ),
-        head_fc2_gain_non_last=float(best_params.get("head_fc2_gain_non_last", 1e-2)),
     )
 
     final_dir = outdir / "final_best_train_vs_leaderboard"
@@ -547,7 +453,11 @@ def train_best_and_export(
         max_instances=0,
         seed=int(args.seed) + 123,
     )
-    export_dl = DataLoader(export_ds, batch_size=min(64, int(best_params["batch_size"])), shuffle=False, collate_fn=collate_export, **dl_kw)
+    export_dl = loader_builder.eval_loader(
+        export_ds,
+        batch_size=min(64, int(best_params["batch_size"])),
+        collate_fn=collate_export,
+    )
 
     dev = torch.device("cuda" if torch.cuda.is_available() and str(args.nn_accelerator) in ("gpu", "cuda") else "cpu")
     out_path = Path(args.attn_out) if args.attn_out else (outdir / "leaderboard_attn.parquet")
