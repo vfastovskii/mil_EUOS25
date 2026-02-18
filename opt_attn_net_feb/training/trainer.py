@@ -85,3 +85,6 @@ def eval_best_epoch(model, dl_va: DataLoader, device: torch.device) -> Tuple[flo
     W = np.concatenate(ws, axis=0).astype(np.float32)
     aps = ap_per_task(Y, P, w_cls=W, weighted_tasks=(0, 1))
     return float(np.mean(aps)), aps
+
+
+__all__ = ["make_trainer_gpu", "eval_best_epoch"]

@@ -13,7 +13,7 @@ import optuna
 from optuna.trial import Trial
 from torch.utils.data import DataLoader
 
-from ..models.mil_task_attn_mixer_with_aux import MILTaskAttnMixerWithAux
+from ..models.mil_task_attn_mixer import MILTaskAttnMixerWithAux
 from ..data.datasets import MILTrainDataset, MILExportDataset
 from ..data.collate import collate_train, collate_export
 from ..data.exports import export_leaderboard_attention
@@ -533,3 +533,13 @@ def train_best_and_export(
     dev = torch.device("cuda" if torch.cuda.is_available() and str(args.nn_accelerator) in ("gpu", "cuda") else "cpu")
     out_path = Path(args.attn_out) if args.attn_out else (outdir / "leaderboard_attn.parquet")
     export_leaderboard_attention(model, export_dl, device=dev, out_path=out_path)
+
+
+__all__ = [
+    "search_space",
+    "objective_mil_cv",
+    "save_study_artifacts",
+    "save_best_fold_metrics",
+    "drop_ids_without_bags",
+    "train_best_and_export",
+]

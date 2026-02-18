@@ -15,7 +15,7 @@ Output folder is set by `--study_dir`.
 
 ## 2) Example `sbatch` script
 
-Create a file such as `run_mil_hpo.sbatch`:
+Create a file such as `run_mil_hpo.slurm`:
 
 ```bash
 #!/bin/bash
@@ -71,7 +71,7 @@ python -m opt_attn_net_feb.interface \
   --pin_memory \
   --export_leaderboard_attn \
   --leaderboard_split leaderboard \
-  --attn_out "${OUT_DIR}/leaderboard_attn.parquet"
+  --attn_out "${OUT_DIR}/leaderboard_attn.csv"
 ```
 
 ## 3) Submit and monitor

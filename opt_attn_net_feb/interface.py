@@ -4,7 +4,7 @@ from __future__ import annotations
 Stable public interface for the Attention MIL package.
 
 This module exposes public symbols used by downstream code and keeps a
-backward-compatible `main()` entrypoint.
+stable `main()` entrypoint.
 """
 
 from typing import Any
@@ -30,9 +30,29 @@ from .utils import (  # noqa: F401
     WEIGHT_COLS,
 )
 
+__all__ = [
+    "MILTaskAttnMixerWithAux",
+    "TaskAttentionPool",
+    "MultiTaskFocal",
+    "MILTrainDataset",
+    "MILExportDataset",
+    "collate_train",
+    "collate_export",
+    "export_leaderboard_attention",
+    "OptunaPruningCallbackLocal",
+    "TASK_COLS",
+    "AUX_ABS_COLS",
+    "AUX_FLUO_BASE_COLS",
+    "WEIGHT_COLS",
+    "NONFEAT_2D",
+    "NONFEAT_3D",
+    "NONFEAT_QM",
+    "main",
+]
+
 
 def main(argv: Any | None = None) -> None:
-    """Backward-compatible wrapper around the HPO pipeline entrypoint."""
+    """Package-level entrypoint delegating to the HPO pipeline."""
     _pipeline_main(argv)
 
 
