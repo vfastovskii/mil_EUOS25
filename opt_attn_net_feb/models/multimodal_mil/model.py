@@ -9,12 +9,14 @@ from torch.cuda.amp import autocast
 
 from ...losses.multi_task_focal import MultiTaskFocal
 from ...utils.metrics import ap_per_task
-from ...utils.mlp import make_mlp
-from .aggregators import build_aggregator
 from .constants import NUM_ABS_HEADS, NUM_FLUO_HEADS, NUM_TASKS
-from .embedders import build_2d_embedder, build_3d_embedder
 from .heads import apply_shared_heads, apply_task_heads, make_projection
-from .predictors import build_predictor_heads
+from .make_2d_embedder import make_2d_embedder
+from .make_3d_embedder import make_3d_embedder
+from .make_aggregator import make_aggregator
+from .make_aux_pred_head import make_aux_pred_head
+from .make_mixer import make_mixer
+from .make_pred_head import make_pred_head
 from .training import compute_training_losses
 
 
@@ -66,7 +68,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=["pos_weight", "gamma", "lam"])
 
-        self.mol_enc = build_2d_embedder(
+        self.mol_enc = make_2d_embedder(
             name=str(mol_embedder_name),
             input_dim=int(mol_dim),
             hidden_dim=int(mol_hidden),
@@ -74,7 +76,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             dropout=float(mol_dropout),
             activation=str(activation),
         )
-        self.inst_enc = build_3d_embedder(
+        self.inst_enc = make_3d_embedder(
             name=str(inst_embedder_name),
             input_dim=int(inst_dim),
             hidden_dim=int(inst_hidden),
@@ -82,33 +84,27 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             dropout=float(inst_dropout),
             activation=str(activation),
         )
-
-        agg_kwargs = dict(aggregator_kwargs or {})
-        reserved_agg_keys = {"dim", "n_heads", "dropout", "n_tasks"}
-        overlap = reserved_agg_keys.intersection(agg_kwargs.keys())
-        if overlap:
-            raise ValueError(f"aggregator_kwargs cannot override reserved keys: {sorted(overlap)}")
-        self.attn_pool = build_aggregator(
+        self.attn_pool = make_aggregator(
             name=str(aggregator_name),
             dim=int(inst_hidden),
             n_heads=int(attn_heads),
             dropout=float(attn_dropout),
             n_tasks=NUM_TASKS,
-            **agg_kwargs,
+            aggregator_kwargs=aggregator_kwargs,
         )
 
         self.proj2d = make_projection(int(mol_hidden), int(proj_dim))
         self.proj3d = make_projection(int(inst_hidden), int(proj_dim))
 
-        self.mixer = make_mlp(
-            int(2 * proj_dim),
-            int(mixer_hidden),
-            int(mixer_layers),
-            float(mixer_dropout),
+        self.mixer = make_mixer(
+            input_dim=int(2 * proj_dim),
+            hidden_dim=int(mixer_hidden),
+            layers=int(mixer_layers),
+            dropout=float(mixer_dropout),
             activation=str(activation),
         )
 
-        self.cls_heads = build_predictor_heads(
+        self.cls_heads = make_pred_head(
             name=str(predictor_name),
             in_dim=int(mixer_hidden),
             count=NUM_TASKS,
@@ -118,7 +114,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             stochastic_depth=float(head_stochastic_depth),
             fc2_gain_non_last=float(head_fc2_gain_non_last),
         )
-        self.abs_heads = build_predictor_heads(
+        self.abs_heads = make_aux_pred_head(
             name=str(predictor_name),
             in_dim=int(mixer_hidden),
             count=NUM_ABS_HEADS,
@@ -128,7 +124,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             stochastic_depth=float(head_stochastic_depth),
             fc2_gain_non_last=float(head_fc2_gain_non_last),
         )
-        self.fluo_heads = build_predictor_heads(
+        self.fluo_heads = make_aux_pred_head(
             name=str(predictor_name),
             in_dim=int(mixer_hidden),
             count=NUM_FLUO_HEADS,

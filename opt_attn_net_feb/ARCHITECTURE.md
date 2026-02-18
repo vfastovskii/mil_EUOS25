@@ -37,6 +37,12 @@ Primary implementation:
 - `models/multimodal_mil/embedders.py`
 - `models/multimodal_mil/aggregators.py`
 - `models/multimodal_mil/predictors.py`
+- `models/multimodal_mil/make_2d_embedder.py`
+- `models/multimodal_mil/make_3d_embedder.py`
+- `models/multimodal_mil/make_aggregator.py`
+- `models/multimodal_mil/make_mixer.py`
+- `models/multimodal_mil/make_pred_head.py`
+- `models/multimodal_mil/make_aux_pred_head.py`
 - `models/attention_pooling/pool.py`
 - `models/multimodal_mil/heads.py`
 
@@ -60,6 +66,15 @@ Selection is name-based in model init:
 - `inst_embedder_name`
 - `aggregator_name`
 - `predictor_name`
+
+Factory entrypoints are split per concern:
+
+- `make_2d_embedder` -> `models/multimodal_mil/make_2d_embedder.py`
+- `make_3d_embedder` -> `models/multimodal_mil/make_3d_embedder.py`
+- `make_aggregator` -> `models/multimodal_mil/make_aggregator.py`
+- `make_mixer` -> `models/multimodal_mil/make_mixer.py`
+- `make_pred_head` -> `models/multimodal_mil/make_pred_head.py`
+- `make_aux_pred_head` -> `models/multimodal_mil/make_aux_pred_head.py`
 
 Current defaults preserve existing behavior:
 
@@ -115,7 +130,7 @@ Branch B (instance / 3D):
 
 Fusion + task representation:
   concat(e2d_rep, e3d) -> [B, 4, 2*proj_dim]
-  mixer MLP -> z_tasks [B, 4, mixer_hidden]
+  mixer residual MLP (V3-like, same logic family as embedders) -> z_tasks [B, 4, mixer_hidden]
 
 Heads:
   Classification heads (per-task residual MLP predictor):
@@ -132,7 +147,7 @@ Optional explainability output:
 
 ### 2.2 Embedders
 
-Both `mol_enc` and `inst_enc` use `utils.mlp.make_residual_mlp_embedder_v3`
+`mol_enc`, `inst_enc`, and `mixer` use `utils.mlp.make_residual_mlp_embedder_v3`
 (`MLPEmbedderV3Like`):
 
 - Input normalization + optional projection to hidden width
@@ -256,7 +271,7 @@ HPO search space is defined in `training/search_space.py::search_space`.
 - `head_dropout` (`[0.0, 0.2]`): Shared dropout inside residual predictor blocks across all heads.
 - `head_stochastic_depth` (`[0.0, 0.1]`, conditional): Shared DropPath rate for heads; fixed to `0.0` when `head_num_layers=1`.
 - `head_fc2_gain_non_last` (`{1e-3, 3e-3, 1e-2}`): Shared non-last residual block `fc2` init gain in all heads (controls early optimization speed).
-- `activation` (`{GELU, SiLU, Mish, ReLU, LeakyReLU}`): Nonlinearity used by the mixer MLP (and by encoders only if gating is disabled).
+- `activation` (`{GELU, SiLU, Mish, ReLU, LeakyReLU}`): Nonlinearity selection passed to embedder and mixer blocks.
 
 ### 4.2 Optimization and effective batch size
 
