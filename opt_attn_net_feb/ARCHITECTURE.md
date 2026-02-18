@@ -119,18 +119,22 @@ Input:
 
 Branch A (molecule / 2D):
   x2d -> 2D embedder (by name) -> [B, mol_hidden]
+      -> LayerNorm (post-embedder normalization)
       -> proj2d (Linear + LayerNorm) -> e2d [B, proj_dim]
       -> repeat per task -> e2d_rep [B, 4, proj_dim]
 
 Branch B (instance / 3D):
   x3d_pad -> 3D embedder (by name) per instance -> [B, N, inst_hidden]
+          -> LayerNorm (post-embedder normalization, before aggregator)
           -> aggregator (by name; current TaskAttentionPool)
           -> pooled_tasks [B, 4, inst_hidden]
+          -> LayerNorm (post-aggregator normalization)
           -> proj3d (Linear + LayerNorm) -> e3d [B, 4, proj_dim]
 
 Fusion + task representation:
   concat(e2d_rep, e3d) -> [B, 4, 2*proj_dim]
   mixer residual MLP (V3-like, same logic family as embedders) -> z_tasks [B, 4, mixer_hidden]
+  LayerNorm (post-mixer normalization, before predictors)
 
 Heads:
   Classification heads (per-task residual MLP predictor):

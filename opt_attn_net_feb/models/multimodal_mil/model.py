@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pytorch_lightning as pl
 import torch
+import torch.nn as nn
 from torch.cuda.amp import autocast
 
 from ...losses.multi_task_focal import MultiTaskFocal
@@ -84,6 +85,9 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             dropout=float(inst_dropout),
             activation=str(activation),
         )
+        self.mol_post_embed_norm = nn.LayerNorm(int(mol_hidden))
+        self.inst_post_embed_norm = nn.LayerNorm(int(inst_hidden))
+
         self.attn_pool = make_aggregator(
             name=str(aggregator_name),
             dim=int(inst_hidden),
@@ -92,6 +96,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             n_tasks=NUM_TASKS,
             aggregator_kwargs=aggregator_kwargs,
         )
+        self.agg_post_norm = nn.LayerNorm(int(inst_hidden))
 
         self.proj2d = make_projection(int(mol_hidden), int(proj_dim))
         self.proj3d = make_projection(int(inst_hidden), int(proj_dim))
@@ -103,6 +108,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             dropout=float(mixer_dropout),
             activation=str(activation),
         )
+        self.mixer_post_norm = nn.LayerNorm(int(mixer_hidden))
 
         self.cls_heads = make_pred_head(
             name=str(predictor_name),
@@ -178,17 +184,21 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         batch_size, n_instances, feature_dim = x3d_pad.shape
         tok = self.inst_enc(x3d_pad.reshape(batch_size * n_instances, feature_dim)).reshape(batch_size, n_instances, -1)
+        tok = self.inst_post_embed_norm(tok)
         return self.attn_pool(tok, key_padding_mask=key_padding_mask, return_attn=return_attn)
 
     def _build_task_representations(self, *, x2d: torch.Tensor, pooled_tasks: torch.Tensor) -> torch.Tensor:
         batch_size = x2d.shape[0]
-        e2d = self.proj2d(self.mol_enc(x2d))  # [B,proj]
+        mol_emb = self.mol_post_embed_norm(self.mol_enc(x2d))
+        e2d = self.proj2d(mol_emb)  # [B,proj]
         e2d_rep = e2d.unsqueeze(1).expand(-1, NUM_TASKS, -1)  # [B,4,proj]
 
+        pooled_tasks = self.agg_post_norm(pooled_tasks)
         e3d = self.proj3d(pooled_tasks.reshape(batch_size * NUM_TASKS, -1)).reshape(batch_size, NUM_TASKS, -1)  # [B,4,proj]
 
         mix_in = torch.cat([e2d_rep, e3d], dim=2).reshape(batch_size * NUM_TASKS, -1)  # [B*4,2*proj]
-        return self.mixer(mix_in).reshape(batch_size, NUM_TASKS, -1)  # [B,4,mixer_hidden]
+        z_tasks = self.mixer(mix_in).reshape(batch_size, NUM_TASKS, -1)  # [B,4,mixer_hidden]
+        return self.mixer_post_norm(z_tasks)
 
     def training_step(self, batch, batch_idx):
         x2d, x3d, kpm, y_cls, w_cls, y_abs, m_abs, w_abs, y_fluo, m_fluo, w_fluo = batch
