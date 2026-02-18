@@ -84,10 +84,9 @@ def search_space(trial: Trial) -> Dict[str, Any]:
 
         "lambda_aux_abs": trial.suggest_float("lambda_aux_abs", 0.05, 0.5),
         "lambda_aux_fluo": trial.suggest_float("lambda_aux_fluo", 0.05, 0.5),
-        "reg_loss_type": trial.suggest_categorical("reg_loss_type", ["smoothl1", "mse"]),
+        "reg_loss_type": trial.suggest_categorical("reg_loss_type", ["mse"]),
 
-        # HPO objective controls
-        "objective_mode": trial.suggest_categorical("objective_mode", ["macro", "macro_plus_min"]),
+        # HPO objective controls (fixed to macro_plus_min to avoid neglecting weaker tasks)
         "min_w": trial.suggest_float("min_w", 0.1, 0.6),
 
         "accumulate_grad_batches": trial.suggest_categorical("accumulate_grad_batches", [8, 16]),
@@ -127,8 +126,8 @@ def objective_mil_cv(
     scores: List[float] = []
     fold_detail: Dict[str, Any] = {}
 
-    # Objective mode and weight for worst task influence
-    objective_mode = str(p.get("objective_mode", "macro_plus_min"))
+    # Objective is fixed to macro_plus_min to jointly optimize mean AP and weakest task AP.
+    objective_mode = "macro_plus_min"
     min_w = float(p.get("min_w", 0.30))
 
     device = torch.device("cuda" if torch.cuda.is_available() and accelerator in ("gpu", "cuda") else "cpu")
@@ -259,10 +258,7 @@ def objective_mil_cv(
 
         best_macro, best_aps = eval_best_epoch(model, dl_va, device=device)
         best_min = float(np.min(best_aps))
-        if objective_mode == "macro_plus_min":
-            fold_score = float((1.0 - min_w) * float(best_macro) + min_w * best_min)
-        else:
-            fold_score = float(best_macro)
+        fold_score = float((1.0 - min_w) * float(best_macro) + min_w * best_min)
 
         print(
             f"[MIL-TASK-ATTN] trial={trial.number} fold={f} trained_epochs={epochs_trained} best_epoch={best_epoch} "

@@ -10,7 +10,7 @@ from torch.cuda.amp import autocast
 
 from ...losses.multi_task_focal import MultiTaskFocal
 from ...utils.metrics import ap_per_task
-from ...utils.mlp import make_mlp
+from ...utils.mlp import make_mlp, make_residual_mlp_embedder_v3
 from ..task_attention import TaskAttentionPool
 from .constants import NUM_ABS_HEADS, NUM_FLUO_HEADS, NUM_TASKS
 from .heads import apply_shared_heads, apply_task_heads, make_linear_heads, make_projection
@@ -56,14 +56,14 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=["pos_weight", "gamma", "lam"])
 
-        self.mol_enc = make_mlp(
+        self.mol_enc = make_residual_mlp_embedder_v3(
             int(mol_dim),
             int(mol_hidden),
             int(mol_layers),
             float(mol_dropout),
             activation=str(activation),
         )
-        self.inst_enc = make_mlp(
+        self.inst_enc = make_residual_mlp_embedder_v3(
             int(inst_dim),
             int(inst_hidden),
             int(inst_layers),

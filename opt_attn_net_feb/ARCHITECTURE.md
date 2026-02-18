@@ -76,11 +76,18 @@ Optional explainability output:
 
 ### 2.2 Embedders
 
-Both `mol_enc` and `inst_enc` use `utils.mlp.make_mlp`:
+Both `mol_enc` and `inst_enc` use `utils.mlp.make_residual_mlp_embedder_v3`
+(`MLPEmbedderV3Like`):
 
-- Repeated block: `Linear -> LayerNorm -> Activation -> Dropout`
-- Activation options: `GELU`, `SiLU`, `Mish`, `ReLU`, `LeakyReLU`
-- Hidden width is constant across layers within each MLP
+- Input normalization + optional projection to hidden width
+- Stack of residual FFN blocks with:
+  - pre-norm layout
+  - SwiGLU-style gated FFN
+  - residual dropout
+  - stochastic depth (DropPath) across depth
+  - learnable residual scaling (with warmup for early blocks)
+- Last block FF2 is zero-initialized for near-identity start
+- Hidden width is constant across residual blocks
 
 ### 2.3 Pooling (task-specific attention)
 
@@ -136,7 +143,7 @@ Primary loss assembly: `models/mil_task_attn_mixer/training.py`
 
 `losses/regression.py`:
 
-- Supports `smoothl1` or `mse`
+- Supports `mse`
 - Applies boolean masks to ignore missing labels
 - Uses per-output weights and stable denominator clamping
 
@@ -160,50 +167,61 @@ Validation metrics:
 
 HPO search space is defined in `training/hpo.py::search_space`.
 
-Architecture/search parameters:
+### 4.1 Architecture capacity and regularization
 
-- `mol_hidden`: `{1024, 2048}`
-- `mol_layers`: `[2, 5]`
-- `mol_dropout`: `[0.10, 0.25]`
-- `inst_hidden`: `{256, 512, 1024}`
-- `inst_layers`: `[3, 5]`
-- `inst_dropout`: `[0.05, 0.15]`
-- `proj_dim`: `{512, 1024}`
-- `attn_heads`: `{8, 16}`
-- `attn_dropout`: `[0.05, 0.2]`
-- `mixer_hidden`: `{512, 1024}`
-- `mixer_layers`: `[3, 5]`
-- `mixer_dropout`: `[0.05, 0.2]`
-- `activation`: `{GELU, SiLU, Mish, ReLU, LeakyReLU}`
+- `mol_hidden` (`{1024, 2048}`): Hidden width of the 2D molecule encoder MLP; larger values increase representational capacity and memory use.
+- `mol_layers` (`[2, 5]`): Depth of the 2D encoder; deeper models can learn richer nonlinear combinations but are more prone to optimization instability.
+- `mol_dropout` (`[0.10, 0.25]`): Dropout probability in each 2D encoder block; higher values increase regularization and reduce overfitting risk.
+- `inst_hidden` (`{256, 512, 1024}`): Hidden width of the 3D instance encoder; directly controls token embedding dimensionality entering attention.
+- `inst_layers` (`[3, 5]`): Depth of the 3D encoder; affects expressiveness of conformation-level token features.
+- `inst_dropout` (`[0.05, 0.15]`): Dropout in 3D encoder blocks; regularizes token features before attention pooling.
+- `proj_dim` (`{512, 1024}`): Common projection dimension for 2D and pooled 3D representations before fusion.
+- `attn_heads` (`{8, 16}`): Number of heads in task-attention pooling; must divide `inst_hidden`.
+- `attn_dropout` (`[0.05, 0.2]`): Dropout inside multihead attention; regularizes per-task instance weighting.
+- `mixer_hidden` (`{512, 1024}`): Width of the fusion mixer MLP that maps concatenated 2D/3D task features to task embeddings.
+- `mixer_layers` (`[3, 5]`): Depth of the fusion mixer; controls complexity of cross-modal feature interaction.
+- `mixer_dropout` (`[0.05, 0.2]`): Dropout in fusion mixer blocks; regularizes final task representations.
+- `activation` (`{GELU, SiLU, Mish, ReLU, LeakyReLU}`): Nonlinearity used by the mixer MLP (and by encoders only if gating is disabled).
 
-Optimization/training parameters:
+### 4.2 Optimization and effective batch size
 
-- `lr`: `[8e-5, 8e-4]` (log scale)
-- `weight_decay`: `[3e-6, 3e-4]` (log scale)
-- `batch_size`: `{128, 256, 512}`
-- `accumulate_grad_batches`: `{8, 16}`
+- `lr` (`[8e-5, 8e-4]`, log): AdamW learning rate; primary control of convergence speed vs instability.
+- `weight_decay` (`[3e-6, 3e-4]`, log): L2 regularization strength in AdamW; larger values can improve generalization but may underfit.
+- `batch_size` (`{128, 256, 512}`): Per-step minibatch size; larger values reduce gradient noise but increase memory pressure.
+- `accumulate_grad_batches` (`{8, 16}`): Gradient accumulation factor; increases effective batch size without increasing device memory footprint.
 
-Class imbalance / weighting parameters:
+### 4.3 Class imbalance and task balancing
 
-- `posw_clip_t0..t3`: each `[10, 200]` (log scale)
-- `gamma_t0..t3`: each `[0, 4]`
-- `lam_t0..t3`: each `[0.25, 3.0]` (log scale), then normalized/clipped
-- `lam_floor`: `[0.25, 1.0]`
-- `lam_ceil`: `[1.0, 3.5]`
-- `rare_oversample_mult`: `[0, 200]`
-- `rare_prev_thr`: `[0.005, 0.05]`
-- `sample_weight_cap`: `[2.0, 20.0]`
+- `posw_clip_t0..t3` (each `[10, 200]`, log): Upper bound for per-task positive class weights used by BCE; prevents extreme rare-class amplification.
+- `gamma_t0..t3` (each `[0, 4]`): Focal exponents per task; higher gamma increases focus on hard examples and downweights easy ones.
+- `rare_oversample_mult` (`[0, 200]`): Multiplier for sampler weights on samples positive for rare tasks.
+- `rare_prev_thr` (`[0.005, 0.05]`): Prevalence threshold defining which tasks are considered rare for oversampling.
+- `sample_weight_cap` (`[2.0, 20.0]`): Maximum per-sample sampler weight; limits oversampling aggressiveness.
+- `lam_t0..t3` (each `[0.25, 3.0]`, log): Raw per-task classification loss multipliers before normalization.
+- `lam_floor` (`[0.25, 1.0]`): Lower bound for normalized per-task lambda weights.
+- `lam_ceil` (`[1.0, 3.5]`): Upper bound for normalized per-task lambda weights.
 
-Auxiliary loss parameters:
+Lambda processing used in training:
 
-- `lambda_aux_abs`: `[0.05, 0.5]`
-- `lambda_aux_fluo`: `[0.05, 0.5]`
-- `reg_loss_type`: `{smoothl1, mse}`
+- Raw `lam_t*` values are normalized by mean.
+- Values are clipped by `lam_floor/lam_ceil`.
+- Weights are renormalized by mean again.
+- Final `lam` scales per-task focal loss before averaging.
 
-HPO objective parameters:
+### 4.4 Auxiliary regression weighting
 
-- `objective_mode`: `{macro, macro_plus_min}`
-- `min_w`: `[0.1, 0.6]` (used when `macro_plus_min`)
+- `lambda_aux_abs` (`[0.05, 0.5]`): Weight of absorbance auxiliary regression loss in total objective.
+- `lambda_aux_fluo` (`[0.05, 0.5]`): Weight of fluorescence auxiliary regression loss in total objective.
+- `reg_loss_type` (fixed: `{mse}`): Regression criterion for auxiliary heads; currently constrained to MSE only in search space.
+
+### 4.5 HPO objective control
+
+- `objective_mode` (fixed: `macro_plus_min`): Trial score combines overall AP and worst-task AP to discourage neglecting harder tasks.
+- `min_w` (`[0.1, 0.6]`): Weight of `min_ap` in score.
+
+Fold score formula:
+
+- `score = (1 - min_w) * macro_ap + min_w * min_ap`
 
 ## 5) Training Behavior (non-search)
 
