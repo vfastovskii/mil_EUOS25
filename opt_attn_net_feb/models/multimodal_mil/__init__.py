@@ -1,6 +1,13 @@
 from __future__ import annotations
 
 from .aggregators import available_aggregators, build_aggregator, register_aggregator
+from .configs import (
+    MILBackboneConfig,
+    MILModelConfig,
+    MILOptimizationConfig,
+    MILLossConfig,
+    MILPredictorConfig,
+)
 from .embedders import (
     available_2d_embedders,
     available_3d_embedders,
@@ -20,6 +27,11 @@ from .predictors import available_predictors, build_predictor_heads, register_pr
 
 __all__ = [
     "MILTaskAttnMixerWithAux",
+    "MILBackboneConfig",
+    "MILPredictorConfig",
+    "MILOptimizationConfig",
+    "MILLossConfig",
+    "MILModelConfig",
     "register_2d_embedder",
     "register_3d_embedder",
     "build_2d_embedder",

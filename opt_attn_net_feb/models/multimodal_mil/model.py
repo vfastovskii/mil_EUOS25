@@ -10,6 +10,7 @@ from torch.cuda.amp import autocast
 
 from ...losses.multi_task_focal import MultiTaskFocal
 from ...utils.metrics import ap_per_task
+from .configs import MILModelConfig
 from .constants import NUM_ABS_HEADS, NUM_FLUO_HEADS, NUM_TASKS
 from .heads import apply_shared_heads, apply_task_heads, make_projection
 from .make_2d_embedder import make_2d_embedder
@@ -30,6 +31,54 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
     - cls logits from task-specific z_task
     - aux heads from mean(z_task)
     """
+
+    @classmethod
+    def from_config(
+        cls,
+        *,
+        config: MILModelConfig,
+        pos_weight: torch.Tensor,
+        gamma: torch.Tensor,
+        lam: np.ndarray,
+    ) -> MILTaskAttnMixerWithAux:
+        b = config.backbone
+        h = config.predictor
+        opt = config.optimization
+        loss = config.loss
+        return cls(
+            mol_dim=int(b.mol_dim),
+            inst_dim=int(b.inst_dim),
+            mol_hidden=int(b.mol_hidden),
+            mol_layers=int(b.mol_layers),
+            mol_dropout=float(b.mol_dropout),
+            inst_hidden=int(b.inst_hidden),
+            inst_layers=int(b.inst_layers),
+            inst_dropout=float(b.inst_dropout),
+            proj_dim=int(b.proj_dim),
+            attn_heads=int(b.attn_heads),
+            attn_dropout=float(b.attn_dropout),
+            mixer_hidden=int(b.mixer_hidden),
+            mixer_layers=int(b.mixer_layers),
+            mixer_dropout=float(b.mixer_dropout),
+            lr=float(opt.lr),
+            weight_decay=float(opt.weight_decay),
+            pos_weight=pos_weight,
+            gamma=gamma,
+            lam=lam,
+            lambda_aux_abs=float(loss.lambda_aux_abs),
+            lambda_aux_fluo=float(loss.lambda_aux_fluo),
+            reg_loss_type=str(loss.reg_loss_type),
+            activation=str(b.activation),
+            mol_embedder_name=str(b.mol_embedder_name),
+            inst_embedder_name=str(b.inst_embedder_name),
+            aggregator_name=str(b.aggregator_name),
+            aggregator_kwargs=b.aggregator_kwargs,
+            predictor_name=str(h.predictor_name),
+            head_num_layers=int(h.num_layers),
+            head_dropout=float(h.dropout),
+            head_stochastic_depth=float(h.stochastic_depth),
+            head_fc2_gain_non_last=float(h.fc2_gain_non_last),
+        )
 
     def __init__(
         self,

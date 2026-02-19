@@ -8,6 +8,14 @@ import torch
 from torch.utils.data import DataLoader
 
 from ..models.multimodal_mil import MILTaskAttnMixerWithAux
+from ..models.multimodal_mil.configs import (
+    MILBackboneConfig,
+    MILModelConfig,
+    MILOptimizationConfig,
+    MILLossConfig,
+    MILPredictorConfig,
+)
+from .configs import HPOConfig
 
 
 @dataclass(frozen=True)
@@ -15,58 +23,66 @@ class LoaderConfig:
     num_workers: int
     pin_memory: bool
 
-
-def _resolve_head_stochastic_depth(params: Dict[str, Any]) -> float:
-    if "head_stochastic_depth" in params:
-        return float(params["head_stochastic_depth"])
-    return 0.0 if int(params.get("head_num_layers", 2)) == 1 else 0.1
-
-
 class MILModelBuilder:
-    """Centralized model construction from flat HPO parameters."""
+    """Centralized model construction from typed training config objects."""
 
     @staticmethod
     def build(
         *,
-        params: Dict[str, Any],
+        config: HPOConfig,
         mol_dim: int,
         inst_dim: int,
         pos_weight: torch.Tensor,
         gamma: torch.Tensor,
         lam: np.ndarray,
     ) -> MILTaskAttnMixerWithAux:
-        return MILTaskAttnMixerWithAux(
-            mol_dim=int(mol_dim),
-            inst_dim=int(inst_dim),
-            mol_hidden=int(params["mol_hidden"]),
-            mol_layers=int(params["mol_layers"]),
-            mol_dropout=float(params["mol_dropout"]),
-            inst_hidden=int(params["inst_hidden"]),
-            inst_layers=int(params["inst_layers"]),
-            inst_dropout=float(params["inst_dropout"]),
-            proj_dim=int(params["proj_dim"]),
-            attn_heads=int(params["attn_heads"]),
-            attn_dropout=float(params["attn_dropout"]),
-            mixer_hidden=int(params["mixer_hidden"]),
-            mixer_layers=int(params["mixer_layers"]),
-            mixer_dropout=float(params["mixer_dropout"]),
-            lr=float(params["lr"]),
-            weight_decay=float(params["weight_decay"]),
+        b = config.backbone
+        h = config.heads
+        opt = config.optimization
+        loss = config.loss
+        model_cfg = MILModelConfig(
+            backbone=MILBackboneConfig(
+                mol_dim=int(mol_dim),
+                inst_dim=int(inst_dim),
+                mol_hidden=int(b.mol_hidden),
+                mol_layers=int(b.mol_layers),
+                mol_dropout=float(b.mol_dropout),
+                inst_hidden=int(b.inst_hidden),
+                inst_layers=int(b.inst_layers),
+                inst_dropout=float(b.inst_dropout),
+                proj_dim=int(b.proj_dim),
+                attn_heads=int(b.attn_heads),
+                attn_dropout=float(b.attn_dropout),
+                mixer_hidden=int(b.mixer_hidden),
+                mixer_layers=int(b.mixer_layers),
+                mixer_dropout=float(b.mixer_dropout),
+                activation=str(b.activation),
+                mol_embedder_name=str(b.mol_embedder_name),
+                inst_embedder_name=str(b.inst_embedder_name),
+                aggregator_name=str(b.aggregator_name),
+            ),
+            predictor=MILPredictorConfig(
+                predictor_name=str(b.predictor_name),
+                num_layers=int(h.num_layers),
+                dropout=float(h.dropout),
+                stochastic_depth=float(h.stochastic_depth),
+                fc2_gain_non_last=float(h.fc2_gain_non_last),
+            ),
+            optimization=MILOptimizationConfig(
+                lr=float(opt.lr),
+                weight_decay=float(opt.weight_decay),
+            ),
+            loss=MILLossConfig(
+                lambda_aux_abs=float(loss.lambda_aux_abs),
+                lambda_aux_fluo=float(loss.lambda_aux_fluo),
+                reg_loss_type=str(loss.reg_loss_type),
+            ),
+        )
+        return MILTaskAttnMixerWithAux.from_config(
+            config=model_cfg,
             pos_weight=pos_weight,
             gamma=gamma,
             lam=lam,
-            lambda_aux_abs=float(params["lambda_aux_abs"]),
-            lambda_aux_fluo=float(params["lambda_aux_fluo"]),
-            reg_loss_type=str(params["reg_loss_type"]),
-            activation=str(params.get("activation", "GELU")),
-            mol_embedder_name=str(params.get("mol_embedder_name", "mlp_v3_2d")),
-            inst_embedder_name=str(params.get("inst_embedder_name", "mlp_v3_3d")),
-            aggregator_name=str(params.get("aggregator_name", "task_attention_pool")),
-            predictor_name=str(params.get("predictor_name", "mlp_v3")),
-            head_num_layers=int(params.get("head_num_layers", 2)),
-            head_dropout=float(params.get("head_dropout", 0.1)),
-            head_stochastic_depth=_resolve_head_stochastic_depth(params),
-            head_fc2_gain_non_last=float(params.get("head_fc2_gain_non_last", 1e-2)),
         )
 
 

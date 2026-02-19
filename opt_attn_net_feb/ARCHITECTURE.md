@@ -29,11 +29,38 @@ Canonical imports:
 - `opt_attn_net_feb.models`
 - `opt_attn_net_feb.interface`
 
+### 1.1 Configuration contracts
+
+Large parameter groups are passed as typed dataclasses instead of ad-hoc dicts:
+
+- Training-level config (`training/configs.py`):
+  - `HPOConfig` with grouped sub-configs:
+    - `BackboneConfig`
+    - `HeadConfig`
+    - `OptimizationConfig`
+    - `RuntimeConfig`
+    - `SamplerConfig`
+    - `LossWeightingConfig`
+    - `ObjectiveConfig`
+- Model-level config (`models/multimodal_mil/configs.py`):
+  - `MILModelConfig` with grouped sub-configs:
+    - `MILBackboneConfig`
+    - `MILPredictorConfig`
+    - `MILOptimizationConfig`
+    - `MILLossConfig`
+
+Flow:
+
+- `search_space` (flat Optuna dict) -> `HPOConfig.from_params(...)`
+- `MILModelBuilder.build(config=HPOConfig, ...)` maps to `MILModelConfig`
+- `MILTaskAttnMixerWithAux.from_config(...)` constructs the model from one structured object + loss tensors (`pos_weight`, `gamma`, `lam`)
+
 ## 2) Model Architecture (`MILTaskAttnMixerWithAux`)
 
 Primary implementation:
 
 - `models/multimodal_mil/model.py`
+- `models/multimodal_mil/configs.py`
 - `models/multimodal_mil/embedders.py`
 - `models/multimodal_mil/aggregators.py`
 - `models/multimodal_mil/predictors.py`
@@ -60,7 +87,7 @@ Model assembly is now explicit and layered:
   - head-builder registry in `models/multimodal_mil/predictors.py`
   - current default: `mlp_v3`
 
-Selection is name-based in model init:
+Selection is name-based in model config:
 
 - `mol_embedder_name`
 - `inst_embedder_name`

@@ -16,6 +16,7 @@ from ..data.datasets import MILTrainDataset, MILExportDataset
 from ..data.collate import collate_train, collate_export
 from ..data.exports import export_leaderboard_attention
 from .builders import DataLoaderBuilder, LoaderConfig, MILModelBuilder
+from .configs import HPOConfig
 from .loss_config import compute_gamma, compute_lam, compute_posw_clips
 from .search_space import search_space
 from .trainer import make_trainer_gpu, eval_best_epoch
@@ -57,14 +58,15 @@ def objective_mil_cv(
     ckpt_root: Path,
 ) -> float:
     p = search_space(trial)
+    cfg = HPOConfig.from_params(p)
     max_instances = 0
 
     scores: List[float] = []
     fold_detail: Dict[str, Any] = {}
 
     # Objective is fixed to macro_plus_min to jointly optimize mean AP and weakest task AP.
-    objective_mode = "macro_plus_min"
-    min_w = float(p.get("min_w", 0.30))
+    objective_mode = str(cfg.objective.mode)
+    min_w = float(cfg.objective.min_w)
 
     device = torch.device("cuda" if torch.cuda.is_available() and accelerator in ("gpu", "cuda") else "cpu")
     loader_builder = DataLoaderBuilder(LoaderConfig(num_workers=int(num_workers), pin_memory=bool(pin_memory)))
@@ -72,9 +74,9 @@ def objective_mil_cv(
     for step, (tr, va, f) in enumerate(folds_info):
         set_all_seeds(seed + 5000 * f + trial.number)
 
-        lam = compute_lam(p, y_train=y_cls[tr])
-        posw = pos_weight_per_task(y_cls[tr], clip=compute_posw_clips(p))
-        gamma_t = compute_gamma(p)
+        lam = compute_lam(cfg.loss, y_train=y_cls[tr])
+        posw = pos_weight_per_task(y_cls[tr], clip=compute_posw_clips(cfg.loss))
+        gamma_t = compute_gamma(cfg.loss)
 
         # aux standardization fit on TRAIN indices only
         mu_abs, sd_abs = fit_standardizer(y_abs, m_abs, tr)
@@ -124,25 +126,25 @@ def objective_mil_cv(
 
         sampler = make_weighted_sampler(
             y_cls[tr],
-            rare_mult=float(p["rare_oversample_mult"]),
-            rare_prev_thr=float(p["rare_prev_thr"]),
-            sample_weight_cap=float(p["sample_weight_cap"]),
+            rare_mult=float(cfg.sampler.rare_oversample_mult),
+            rare_prev_thr=float(cfg.sampler.rare_prev_thr),
+            sample_weight_cap=float(cfg.sampler.sample_weight_cap),
         )
 
         dl_tr = loader_builder.train_loader(
             ds_tr,
-            batch_size=int(p["batch_size"]),
+            batch_size=int(cfg.runtime.batch_size),
             sampler=sampler,
             collate_fn=collate_train,
         )
         dl_va = loader_builder.eval_loader(
             ds_va,
-            batch_size=min(128, int(p["batch_size"])),
+            batch_size=min(128, int(cfg.runtime.batch_size)),
             collate_fn=collate_train,
         )
 
         model = MILModelBuilder.build(
-            params=p,
+            config=cfg,
             mol_dim=int(X2d_scaled.shape[1]),
             inst_dim=int(Xinst_sorted.shape[1]),
             pos_weight=posw,
@@ -159,7 +161,7 @@ def objective_mil_cv(
             accelerator=accelerator,
             devices=devices,
             precision=precision,
-            accumulate_grad_batches=int(p["accumulate_grad_batches"]),
+            accumulate_grad_batches=int(cfg.runtime.accumulate_grad_batches),
             ckpt_dir=str(fold_ckpt_dir),
             trial=trial,
         )
@@ -196,7 +198,7 @@ def objective_mil_cv(
             "ap_task1": float(best_aps[1]),
             "ap_task2": float(best_aps[2]),
             "ap_task3": float(best_aps[3]),
-            "accumulate_grad_batches": int(p["accumulate_grad_batches"]),
+            "accumulate_grad_batches": int(cfg.runtime.accumulate_grad_batches),
         }
 
         try:
@@ -258,6 +260,14 @@ def train_best_and_export(
     num_workers: int,
     pin_memory: bool,
 ):
+    cfg = HPOConfig.from_params(
+        best_params,
+        fallback_lambda_power=1.0,
+        fallback_lam_floor=0.25,
+        fallback_lam_ceil=6.0,
+        fallback_pos_weight_clip=50.0,
+    )
+
     df_tr = df_full[df_full[args.split_col] == "train"].copy().reset_index(drop=True)
     df_lb = df_full[df_full[args.split_col] == args.leaderboard_split].copy().reset_index(drop=True)
     if len(df_lb) == 0:
@@ -297,14 +307,14 @@ def train_best_and_export(
 
     # loss weights
     lam = compute_lam(
-        best_params,
+        cfg.loss,
         y_train=y_tr,
         fallback_lambda_power=1.0,
         fallback_lam_floor=0.25,
         fallback_lam_ceil=6.0,
     )
-    posw = pos_weight_per_task(y_tr, clip=compute_posw_clips(best_params, fallback_clip=50.0))
-    gamma_t = compute_gamma(best_params)
+    posw = pos_weight_per_task(y_tr, clip=compute_posw_clips(cfg.loss, fallback_clip=50.0))
+    gamma_t = compute_gamma(cfg.loss)
 
     # datasets + loaders
     ds_tr = MILTrainDataset(
@@ -346,26 +356,26 @@ def train_best_and_export(
 
     sampler_tr = make_weighted_sampler(
         y_tr,
-        rare_mult=float(best_params["rare_oversample_mult"]),
-        rare_prev_thr=float(best_params.get("rare_prev_thr", 0.02)),
-        sample_weight_cap=float(best_params.get("sample_weight_cap", 10.0)),
+        rare_mult=float(cfg.sampler.rare_oversample_mult),
+        rare_prev_thr=float(cfg.sampler.rare_prev_thr),
+        sample_weight_cap=float(cfg.sampler.sample_weight_cap),
     )
 
     loader_builder = DataLoaderBuilder(LoaderConfig(num_workers=int(num_workers), pin_memory=bool(pin_memory)))
     dl_tr = loader_builder.train_loader(
         ds_tr,
-        batch_size=int(best_params["batch_size"]),
+        batch_size=int(cfg.runtime.batch_size),
         sampler=sampler_tr,
         collate_fn=collate_train,
     )
     dl_val = loader_builder.eval_loader(
         ds_lb,
-        batch_size=min(128, int(best_params["batch_size"])),
+        batch_size=min(128, int(cfg.runtime.batch_size)),
         collate_fn=collate_train,
     )
 
     model = MILModelBuilder.build(
-        params=best_params,
+        config=cfg,
         mol_dim=int(X2d_tr.shape[1]),
         inst_dim=int(Xinst_sorted.shape[1]),
         pos_weight=posw,
@@ -382,7 +392,7 @@ def train_best_and_export(
         accelerator=str(args.nn_accelerator),
         devices=int(args.nn_devices),
         precision=str(args.precision),
-        accumulate_grad_batches=int(best_params["accumulate_grad_batches"]),
+        accumulate_grad_batches=int(cfg.runtime.accumulate_grad_batches),
         ckpt_dir=str(final_dir),
         trial=None,
     )
@@ -421,7 +431,7 @@ def train_best_and_export(
     )
     export_dl = loader_builder.eval_loader(
         export_ds,
-        batch_size=min(64, int(best_params["batch_size"])),
+        batch_size=min(64, int(cfg.runtime.batch_size)),
         collate_fn=collate_export,
     )
 

@@ -1,57 +1,81 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Mapping, List
 
 import numpy as np
 import torch
 
+from .configs import LossWeightingConfig
 from ..utils.ops import lambda_from_prevalence
 
 
+def _as_loss_config(
+    params: LossWeightingConfig | Mapping[str, Any],
+    *,
+    fallback_lambda_power: float = 1.0,
+    fallback_lam_floor: float = 0.25,
+    fallback_lam_ceil: float = 3.5,
+    fallback_pos_weight_clip: float = 50.0,
+) -> LossWeightingConfig:
+    if isinstance(params, LossWeightingConfig):
+        return params
+    return LossWeightingConfig.from_params(
+        params,
+        fallback_lambda_power=fallback_lambda_power,
+        fallback_lam_floor=fallback_lam_floor,
+        fallback_lam_ceil=fallback_lam_ceil,
+        fallback_pos_weight_clip=fallback_pos_weight_clip,
+    )
+
+
 def compute_lam(
-    params: Dict[str, Any],
+    params: LossWeightingConfig | Mapping[str, Any],
     *,
     y_train: np.ndarray,
     fallback_lambda_power: float = 1.0,
     fallback_lam_floor: float = 0.25,
     fallback_lam_ceil: float = 3.5,
 ) -> np.ndarray:
-    if all(k in params for k in ("lam_t0", "lam_t1", "lam_t2", "lam_t3")):
+    cfg = _as_loss_config(
+        params,
+        fallback_lambda_power=fallback_lambda_power,
+        fallback_lam_floor=fallback_lam_floor,
+        fallback_lam_ceil=fallback_lam_ceil,
+    )
+    lam_per_task = cfg.per_task_lam()
+    if lam_per_task is not None:
         lam_vec = np.array(
-            [
-                float(params["lam_t0"]),
-                float(params["lam_t1"]),
-                float(params["lam_t2"]),
-                float(params["lam_t3"]),
-            ],
+            list(lam_per_task),
             dtype=np.float32,
         )
         lam = lam_vec / max(float(lam_vec.mean()), 1e-12)
-        lam_floor = float(params.get("lam_floor", fallback_lam_floor))
-        lam_ceil = float(params.get("lam_ceil", fallback_lam_ceil))
+        lam_floor = float(cfg.lam_floor)
+        lam_ceil = float(cfg.lam_ceil)
         lam = np.clip(lam, lam_floor, lam_ceil)
         return lam / max(float(lam.mean()), 1e-12)
-    return lambda_from_prevalence(y_train, power=float(params.get("lambda_power", fallback_lambda_power)))
+    return lambda_from_prevalence(y_train, power=float(cfg.lambda_power))
 
 
-def compute_posw_clips(params: Dict[str, Any], *, fallback_clip: float = 50.0) -> List[float] | float:
-    if all(k in params for k in ("posw_clip_t0", "posw_clip_t1", "posw_clip_t2", "posw_clip_t3")):
-        return [
-            float(params["posw_clip_t0"]),
-            float(params["posw_clip_t1"]),
-            float(params["posw_clip_t2"]),
-            float(params["posw_clip_t3"]),
-        ]
-    return float(params.get("pos_weight_clip", fallback_clip))
+def compute_posw_clips(
+    params: LossWeightingConfig | Mapping[str, Any],
+    *,
+    fallback_clip: float = 50.0,
+) -> List[float] | float:
+    cfg = _as_loss_config(params, fallback_pos_weight_clip=fallback_clip)
+    posw_clips = cfg.per_task_posw_clips()
+    if posw_clips is not None:
+        return [float(v) for v in posw_clips]
+    return float(cfg.pos_weight_clip)
 
 
-def compute_gamma(params: Dict[str, Any]) -> torch.Tensor:
+def compute_gamma(params: LossWeightingConfig | Mapping[str, Any]) -> torch.Tensor:
+    cfg = _as_loss_config(params)
     gamma = np.array(
         [
-            float(params["gamma_t0"]),
-            float(params["gamma_t1"]),
-            float(params["gamma_t2"]),
-            float(params["gamma_t3"]),
+            float(cfg.gamma_t0),
+            float(cfg.gamma_t1),
+            float(cfg.gamma_t2),
+            float(cfg.gamma_t3),
         ],
         dtype=np.float32,
     )

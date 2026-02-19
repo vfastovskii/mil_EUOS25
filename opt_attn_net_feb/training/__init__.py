@@ -1,6 +1,16 @@
 from __future__ import annotations
 
 from .builders import DataLoaderBuilder, LoaderConfig, MILModelBuilder  # noqa: F401
+from .configs import (  # noqa: F401
+    BackboneConfig,
+    HeadConfig,
+    HPOConfig,
+    LossWeightingConfig,
+    ObjectiveConfig,
+    OptimizationConfig,
+    RuntimeConfig,
+    SamplerConfig,
+)
 from .pipeline import (  # noqa: F401
     drop_ids_without_bags,
     objective_mil_cv,
@@ -13,6 +23,14 @@ from .loss_config import compute_gamma, compute_lam, compute_posw_clips  # noqa:
 from .trainer import eval_best_epoch, make_trainer_gpu  # noqa: F401
 
 __all__ = [
+    "BackboneConfig",
+    "HeadConfig",
+    "OptimizationConfig",
+    "RuntimeConfig",
+    "SamplerConfig",
+    "LossWeightingConfig",
+    "ObjectiveConfig",
+    "HPOConfig",
     "LoaderConfig",
     "MILModelBuilder",
     "DataLoaderBuilder",
