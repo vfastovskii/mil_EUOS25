@@ -84,7 +84,6 @@ class CLIRuntimeConfig:
 
 @dataclass(frozen=True)
 class CLIExportConfig:
-    export_leaderboard_attn: bool
     attn_out: str | None
 
 
@@ -146,7 +145,6 @@ class PipelineConfigFactory:
                 pin_memory=bool(args.pin_memory),
             ),
             export=CLIExportConfig(
-                export_leaderboard_attn=bool(args.export_leaderboard_attn),
                 attn_out=args.attn_out,
             ),
         )
@@ -306,7 +304,7 @@ class MILPipelineOrchestrator:
         ckpt_root.mkdir(parents=True, exist_ok=True)
 
         study = self._run_hpo(env=env, hpo_data=hpo_data, ckpt_root=ckpt_root)
-        self._run_final_if_needed(env=env, hpo_data=hpo_data, study=study)
+        self._run_final(env=env, hpo_data=hpo_data, study=study)
 
         try:
             shutil.rmtree(ckpt_root, ignore_errors=True)
@@ -344,10 +342,7 @@ class MILPipelineOrchestrator:
         )
         return study_runner.run()
 
-    def _run_final_if_needed(self, *, env: PipelineEnvironment, hpo_data: PreparedHPOData, study):
-        if not self.config.export.export_leaderboard_attn:
-            return
-
+    def _run_final(self, *, env: PipelineEnvironment, hpo_data: PreparedHPOData, study):
         c = self.config.columns
         p = self.config.data_paths
         split = self.config.splits
@@ -437,6 +432,7 @@ def _parse_args(argv: Any | None = None):
     ap.add_argument("--num_workers", type=int, default=-1)
     ap.add_argument("--pin_memory", action="store_true")
 
+    # Deprecated compatibility flag; final train+leaderboard stage now always runs.
     ap.add_argument("--export_leaderboard_attn", action="store_true")
     ap.add_argument("--leaderboard_split", default="leaderboard")
     ap.add_argument("--attn_out", default=None)
