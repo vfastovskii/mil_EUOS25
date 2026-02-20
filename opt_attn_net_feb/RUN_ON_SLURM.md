@@ -1,6 +1,9 @@
 # Run on Slurm
 
-This guide shows how to run the HPO/training pipeline as a Slurm job.
+This guide shows how to run the MIL HPO/training pipeline as a Slurm job
+using the project entrypoint script:
+
+- `opt_net_fast.py`
 
 ## 1) Expected inputs
 
@@ -39,17 +42,14 @@ OUT_DIR="/path/to/experiments/mil_hpo_${SLURM_JOB_ID}"
 mkdir -p "${PROJECT_DIR}/logs"
 mkdir -p "${OUT_DIR}"
 
-cd "${REPO_PARENT}"
+cd "${PROJECT_DIR}"
 
 # If needed, activate your environment
 # module load cuda/12.1
 # source ~/miniconda3/etc/profile.d/conda.sh
 # conda activate your_env
 
-# Ensure package is importable as `opt_attn_net_feb`
-export PYTHONPATH="${REPO_PARENT}:${PYTHONPATH:-}"
-
-python -m opt_attn_net_feb.interface \
+python "${PROJECT_DIR}/opt_net_fast.py" \
   --labels "${DATA_DIR}/labels.csv" \
   --feat2d_scaled "${DATA_DIR}/feat2d_scaled.csv" \
   --feat3d_scaled "${DATA_DIR}/feat3d_scaled.csv" \
@@ -79,7 +79,7 @@ python -m opt_attn_net_feb.interface \
 Submit:
 
 ```bash
-sbatch run_mil_hpo.sbatch
+sbatch run_mil_hpo.slurm
 ```
 
 Check queue:

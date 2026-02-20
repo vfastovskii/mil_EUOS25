@@ -203,7 +203,8 @@ class HPOConfig:
         )
 
         objective = ObjectiveConfig(
-            mode=str(params.get("objective_mode", "macro_plus_min")),
+            # Fixed objective policy: optimize mean AP while preventing weak-task neglect.
+            mode="macro_plus_min",
             min_w=float(params.get("min_w", fallback_min_w)),
         )
 

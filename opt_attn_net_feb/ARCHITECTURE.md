@@ -14,7 +14,8 @@ opt_attn_net_feb/
   models/           # Neural architecture
   training/         # HPO, trainer construction, final training/export
   utils/            # Data/metrics/ops/constants helpers
-  interface.py      # Stable facade entrypoint
+  __init__.py       # Stable package-level public API exports
+  opt_net_fast.py   # Single project CLI entrypoint (root)
 ```
 
 Dependency direction:
@@ -27,7 +28,7 @@ Canonical imports:
 
 - `opt_attn_net_feb.training`
 - `opt_attn_net_feb.models`
-- `opt_attn_net_feb.interface`
+- `opt_attn_net_feb`
 
 ### 1.1 Configuration contracts
 
@@ -54,6 +55,31 @@ Flow:
 - `search_space` (flat Optuna dict) -> `HPOConfig.from_params(...)`
 - `MILModelBuilder.build(config=HPOConfig, ...)` maps to `MILModelConfig`
 - `MILTaskAttnMixerWithAux.from_config(...)` constructs the model from one structured object + loss tensors (`pos_weight`, `gamma`, `lam`)
+
+### 1.2 Class-based training orchestration
+
+Core orchestration now follows explicit classes and typed handoff objects:
+
+- Entry pipeline (`entrypoints/hpo_pipeline.py`)
+  - `PipelineConfigFactory` parses CLI args into `PipelineConfig`
+  - `PipelineEnvironmentFactory` resolves output/runtime environment
+  - `HPODataBuilder` builds `PreparedHPOData` and `MILCVData`
+  - `MILPipelineOrchestrator` runs HPO and final export stages
+- Execution layer (`training/execution.py`)
+  - `MILCrossValidator` owns Optuna objective flow
+  - `MILFoldTrainer` handles one CV fold train/eval cycle
+  - `MILStudyRunner` owns Optuna study lifecycle + artifact writes
+  - `MILFinalTrainer` runs best-config train and leaderboard export
+- Trainer/eval infrastructure (`training/trainer.py`)
+  - `LightningTrainerFactory` builds deterministic Lightning trainers
+  - `ModelEvaluator` computes AP metrics from checkpoints
+
+Config handoff chain:
+
+- CLI args -> `PipelineConfig`
+- `PipelineConfig` + prepared arrays -> `MILCVData`
+- `MILCVData` + `CVRunConfig` -> `MILCrossValidator`
+- Best params + `MILFinalData` + `FinalTrainConfig` -> `MILFinalTrainer`
 
 ## 2) Model Architecture (`MILTaskAttnMixerWithAux`)
 
