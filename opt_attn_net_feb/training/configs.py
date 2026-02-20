@@ -6,6 +6,42 @@ from typing import Any, Mapping
 
 @dataclass(frozen=True)
 class BackboneConfig:
+    """
+    Configuration class for the Backbone model.
+
+    This class provides a structured and immutable configuration for defining
+    the hyperparameters and settings of the Backbone model. It is designed
+    to manage the model's layer dimensions, dropout rates, activation
+    functions, embedder names, and other components required during
+    initialization or training of the model.
+
+    Attributes:
+        mol_hidden: Integer specifying the hidden size for molecular layers.
+        mol_layers: Integer specifying the number of layers for molecular
+            embeddings.
+        mol_dropout: Float specifying the dropout rate for molecular layers.
+        inst_hidden: Integer specifying the hidden size for instance layers.
+        inst_layers: Integer specifying the number of layers for instance
+            embeddings.
+        inst_dropout: Float specifying the dropout rate for instance layers.
+        proj_dim: Integer specifying the dimensionality of the projection
+            layer.
+        attn_heads: Integer specifying the number of attention heads.
+        attn_dropout: Float specifying the dropout rate for attention layers.
+        mixer_hidden: Integer specifying the hidden size for the mixer layers.
+        mixer_layers: Integer specifying the number of mixer layers.
+        mixer_dropout: Float specifying the dropout rate for mixer layers.
+        activation: String specifying the activation function used throughout
+            the model.
+        mol_embedder_name: String specifying the name of the embedding method
+            used for molecular inputs.
+        inst_embedder_name: String specifying the name of the embedding method
+            used for instance inputs.
+        aggregator_name: String specifying the name of the aggregation method
+            used in the model.
+        predictor_name: String specifying the name of the predictor method
+            used in the output layers.
+    """
     mol_hidden: int = 1024
     mol_layers: int = 2
     mol_dropout: float = 0.10
@@ -27,6 +63,20 @@ class BackboneConfig:
 
 @dataclass(frozen=True)
 class HeadConfig:
+    """
+    Configuration for the head of a model.
+
+    This class provides various parameters that define the structure and behavior
+    of the model's head. It uses a dataclass to ensure immutability and simplifies
+    the creation and management of configuration objects.
+
+    Attributes:
+        num_layers: Number of layers in the head.
+        dropout: Dropout probability for the layers.
+        stochastic_depth: Probability of stochastic depth in the layers.
+        fc2_gain_non_last: Gain value applied to the second fully-connected
+            layer in non-last layers.
+    """
     num_layers: int = 2
     dropout: float = 0.1
     stochastic_depth: float = 0.1
@@ -35,18 +85,46 @@ class HeadConfig:
 
 @dataclass(frozen=True)
 class OptimizationConfig:
+    """
+    Representation of an optimization configuration for machine learning models.
+
+    This class encapsulates parameters for configuring the optimization process,
+    including learning rate (`lr`) and weight decay. It is used to store these
+    parameters in an immutable way to ensure consistency throughout the training
+    pipeline.
+    """
     lr: float = 8e-5
     weight_decay: float = 3e-6
 
 
 @dataclass(frozen=True)
 class RuntimeConfig:
+    """
+    Encapsulates immutable runtime configuration settings.
+
+    This dataclass is used to store various configuration settings
+    associated with the runtime of an application or model training,
+    such as batch size and gradient accumulation steps. The frozen
+    property ensures the immutability of its instances after creation.
+
+    Attributes:
+        batch_size: The size of each batch to process during training or
+            runtime.
+        accumulate_grad_batches: Number of gradient accumulation steps.
+    """
     batch_size: int = 128
     accumulate_grad_batches: int = 8
 
 
 @dataclass(frozen=True)
 class SamplerConfig:
+    """
+    Represents configuration settings for a sampler.
+
+    This data class provides parameters to manage sampler configurations,
+    focusing on controlling the weights and thresholds for sampling data.
+    It is designed to be immutable due to the `frozen` attribute.
+    """
     rare_oversample_mult: float = 0.0
     rare_prev_thr: float = 0.02
     sample_weight_cap: float = 10.0
@@ -54,6 +132,54 @@ class SamplerConfig:
 
 @dataclass(frozen=True)
 class LossWeightingConfig:
+    """
+    Configuration used for loss weighting in a model.
+
+    This dataclass contains parameters for adjusting the weightings of
+    various tasks and related configuration options. It includes bounds
+    for lambda coefficients, clipping values for positive weights,
+    and auxiliary loss components. The class can also generate specific
+    configuration tuples that simplify access to parameter groupings.
+
+    Attributes:
+        lam_t0: Weighting coefficient for task 0. Defaults to None.
+        lam_t1: Weighting coefficient for task 1. Defaults to None.
+        lam_t2: Weighting coefficient for task 2. Defaults to None.
+        lam_t3: Weighting coefficient for task 3. Defaults to None.
+        lam_floor: Minimum bounding value for lambda coefficients. Defaults to 0.25.
+        lam_ceil: Maximum bounding value for lambda coefficients. Defaults to 3.5.
+        lambda_power: Exponent applied to lambda calculations. Defaults to 1.0.
+        posw_clip_t0: Clip threshold for task 0 positive weights. Defaults to None.
+        posw_clip_t1: Clip threshold for task 1 positive weights. Defaults to None.
+        posw_clip_t2: Clip threshold for task 2 positive weights. Defaults to None.
+        posw_clip_t3: Clip threshold for task 3 positive weights. Defaults to None.
+        pos_weight_clip: Global positive weight clipping value. Defaults to 50.0.
+        gamma_t0: Parameter representing a gamma adjustment for task 0. Defaults to 0.0.
+        gamma_t1: Parameter representing a gamma adjustment for task 1. Defaults to 0.0.
+        gamma_t2: Parameter representing a gamma adjustment for task 2. Defaults to 0.0.
+        gamma_t3: Parameter representing a gamma adjustment for task 3. Defaults to 0.0.
+        lambda_aux_abs: Auxiliary absolute loss weighting. Defaults to 0.05.
+        lambda_aux_fluo: Auxiliary fluorescence loss weighting. Defaults to 0.05.
+        reg_loss_type: Type of regression loss to be used. Defaults to 'mse'.
+
+    Methods:
+        per_task_lam:
+            Retrieves a tuple of lambda weights for each task if all tasks have
+            defined values. Returns None if any task lambda is undefined.
+
+        per_task_posw_clips:
+            Retrieves a tuple of positive weight clip thresholds for each task
+            if all tasks have defined values. Returns None if any task threshold is undefined.
+
+        from_params:
+            A factory method for creating a LossWeightingConfig instance from
+            a dictionary of parameters. Supports default fallback values for
+            missing attributes.
+
+    Raises:
+        ValueError: Raised by the methods if inconsistent parameter values
+        are calculated or invalid configurations are provided by input mapping.
+    """
     lam_t0: float | None = None
     lam_t1: float | None = None
     lam_t2: float | None = None
@@ -121,12 +247,55 @@ class LossWeightingConfig:
 
 @dataclass(frozen=True)
 class ObjectiveConfig:
+    """
+    Data class for configuring objectives.
+
+    Represents configuration parameters for setting up objectives. Provides options
+    to define the objective calculation mode and associated weights.
+
+    Attributes:
+        mode: Mode for calculating objectives, with a default value of
+              "macro_plus_min".
+        min_w: Minimum weight for objectives, with a default value of 0.30.
+    """
     mode: str = "macro_plus_min"
     min_w: float = 0.30
 
 
 @dataclass(frozen=True)
 class HPOConfig:
+    """
+    Represents the configuration for hyperparameter optimization (HPO).
+
+    The HPOConfig class is designed to encapsulate all the necessary configurations
+    required for conducting hyperparameter optimization in a machine learning
+    or related workflow. It gathers configurations for the model's backbone, heads,
+    optimization, runtime, sampler settings, loss weighting, and objective strategies.
+    This structure aids in maintaining consistency, modularity, and clarity for
+    managing extensive parameter profiles, enabling robust and reproducible
+    experimental setups.
+
+    Attributes:
+        backbone (BackboneConfig): Configuration of the model's backbone, including
+                                   hidden layers, dropout rates, attention heads,
+                                   and embedder names.
+        heads (HeadConfig): Configuration of the model's head layers, such as number
+                            of layers, dropout, stochastic depth, and gain factors.
+        optimization (OptimizationConfig): Settings for optimization, covering
+                                           learning rate and weight decay.
+        runtime (RuntimeConfig): Runtime configurations including batch size and
+                                 gradient accumulation.
+        sampler (SamplerConfig): Configuration related to data sampling, including
+                                  oversampling multiplier and sample weight caps.
+        loss (LossWeightingConfig): Settings for managing and weighting loss values.
+        objective (ObjectiveConfig): Objectives for optimization, specifying the
+                                     optimization mode and its constraints.
+
+    Methods:
+        from_params: Class method to initialize an HPOConfig object from a given
+                     set of parameters. It allows for flexible fallback values
+                     and validates specific configurations.
+    """
     backbone: BackboneConfig
     heads: HeadConfig
     optimization: OptimizationConfig

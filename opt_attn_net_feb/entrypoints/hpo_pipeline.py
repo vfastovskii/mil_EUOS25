@@ -47,6 +47,21 @@ from ..utils.ops import (
 
 @dataclass(frozen=True)
 class CLIDataPathsConfig:
+    """
+    Configuration class to store paths for various CLI data files.
+
+    This immutable data class holds the paths for labels, 2D features, scaled
+    3D features, QM-scaled 3D features, and the study directory. It is designed
+    to ensure consistency and immutability, helping to organize and standardize
+    file path configuration for a CLI application.
+
+    Attributes:
+        labels: The path to the labels file.
+        feat2d_scaled: The path to the scaled 2D feature file.
+        feat3d_scaled: The path to the scaled 3D feature file.
+        feat3d_qm_scaled: The path to the QM-scaled 3D feature file.
+        study_dir: The directory path where the study files are stored.
+    """
     labels: str
     feat2d_scaled: str
     feat3d_scaled: str
@@ -56,6 +71,20 @@ class CLIDataPathsConfig:
 
 @dataclass(frozen=True)
 class CLIColumnsConfig:
+    """
+    Configuration class to define column names for CLI operations.
+
+    This class is used to specify the column names required for various CLI
+    functionalities, such as identifiers, configuration details, data splits,
+    and folds. It is immutable due to the use of the `@dataclass(frozen=True)`
+    decorator, ensuring that once initialized, its fields cannot be modified.
+
+    Attributes:
+        id_col: The name of the column used for identifying entries.
+        conf_col: The name of the column used to store configuration details.
+        split_col: The name of the column used for specifying data splits.
+        fold_col: The name of the column used to denote data folds.
+    """
     id_col: str
     conf_col: str
     split_col: str
@@ -64,6 +93,23 @@ class CLIColumnsConfig:
 
 @dataclass(frozen=True)
 class CLISplitsConfig:
+    """
+    Configuration for CLI splits.
+
+    This dataclass encapsulates configuration details for CLI-based
+    splits used in a data processing or machine learning workflow. It
+    defines the splits to be used, folds for training/testing, and the
+    leaderboard split for evaluation. The class is immutable.
+
+    Attributes:
+    use_splits (tuple[str, ...]): The dataset splits that are specified
+        for use.
+    folds (tuple[int, ...] | None): Optional. Specifies the folds for
+        cross-validation or other purposes. Can be None if not
+        applicable.
+    leaderboard_split (str): Name of the dataset split designated for
+        leaderboard evaluation or final assessment.
+    """
     use_splits: tuple[str, ...]
     folds: tuple[int, ...] | None
     leaderboard_split: str
@@ -71,6 +117,26 @@ class CLISplitsConfig:
 
 @dataclass(frozen=True)
 class CLIRuntimeConfig:
+    """
+    Represents the configuration for running a CLI-based machine learning training workflow.
+
+    This class is used to encapsulate runtime configuration settings for a machine learning
+    workflow. These settings include parameters for training control, hardware preferences,
+    and data loading behaviors. The configuration is immutable, and the specified parameters
+    serve as directives for how the workflow should proceed.
+
+    Attributes:
+        max_epochs: Maximum number of epochs for training the model.
+        patience: Number of epochs to wait for improvement before early stopping.
+        trials: Number of trials to perform in hyperparameter optimization.
+        seed: Seed value for reproducibility of results.
+        nn_accelerator: The accelerator to use, such as "cpu", "gpu", or other supported
+                        hardware.
+        nn_devices: The number of devices to allocate for neural network training.
+        precision: Precision format for training, such as "32-bit" or "16-bit".
+        num_workers: Number of subprocesses to use for data loading.
+        pin_memory: Whether to load data into pinned memory for faster transfer to device.
+    """
     max_epochs: int
     patience: int
     trials: int
@@ -84,11 +150,39 @@ class CLIRuntimeConfig:
 
 @dataclass(frozen=True)
 class CLIExportConfig:
+    """
+    Configuration class for CLI Export.
+
+    Represents the necessary configuration settings for exporting data
+    via the command-line interface. This class utilizes immutability to
+    ensure the configuration's integrity during runtime.
+
+    Attributes:
+        attn_out: Specifies the output location or parameter for attention
+            mechanism output. It could be a valid path or None.
+    """
     attn_out: str | None
 
 
 @dataclass(frozen=True)
 class PipelineConfig:
+    """
+    Represents configuration for a processing pipeline.
+
+    This class holds the various configuration settings required to manage the
+    operation of a processing pipeline. These settings are categorized into
+    several groups, such as paths for data inputs and outputs, configuration for
+    data columns, splitting of data, runtime behaviors, and export configurations.
+    The configuration values are immutable and encapsulated for use across the
+    pipeline processes.
+
+    Attributes:
+        data_paths: Configuration for data input and output paths.
+        columns: Configuration for data column usage and behavior.
+        splits: Configuration for data splitting (e.g., training/testing splits).
+        runtime: Configuration for runtime behaviors and settings.
+        export: Configuration for exporting the results of the pipeline.
+    """
     data_paths: CLIDataPathsConfig
     columns: CLIColumnsConfig
     splits: CLISplitsConfig
@@ -98,6 +192,22 @@ class PipelineConfig:
 
 @dataclass(frozen=True)
 class PipelineEnvironment:
+    """
+    Represents the environment configuration for a pipeline.
+
+    This class is used to store settings related to the runtime environment
+    of a pipeline. It includes directories, processing configurations, and
+    memory management settings.
+
+    Attributes:
+        outdir: Path object representing the output directory for pipeline-related
+            data and results.
+        num_workers: Integer specifying the number of workers to be used for
+            parallel processing tasks within the pipeline.
+        pin_memory: Boolean indicating whether memory pinning is enabled for
+            operations, typically useful in data loading for enhanced
+            performance.
+    """
     outdir: Path
     num_workers: int
     pin_memory: bool
@@ -105,6 +215,26 @@ class PipelineEnvironment:
 
 @dataclass(frozen=True)
 class PreparedHPOData:
+    """
+    Encapsulates prepared data for hyperparameter optimization.
+
+    This class is designed to store and manage data that has been preprocessed
+    and prepared for hyperparameter optimization. It is intended to ensure
+    consistency and organization of the required datasets and files during the
+    optimization workflow.
+
+    Attributes:
+    ----------
+    df_full : pd.DataFrame
+        The complete DataFrame containing all the relevant data for processing
+        and analysis.
+    ids_2d_file : List[str]
+        A list of identifiers related to 2D file data.
+    X2d_file : np.ndarray
+        A NumPy array representing 2D file data used in the process.
+    cv_data : MILCVData
+        Cross-validation data utilized in model training and evaluation.
+    """
     df_full: pd.DataFrame
     ids_2d_file: List[str]
     X2d_file: np.ndarray
@@ -112,6 +242,18 @@ class PreparedHPOData:
 
 
 class PipelineConfigFactory:
+    """
+    Factory class for creating PipelineConfig instances from command-line arguments.
+
+    Provides a method to generate a fully populated PipelineConfig object based on
+    the provided command-line arguments. This simplifies the process of configuring
+    a pipeline by directly converting arguments into structured configurations
+    such as paths, columns, splits, runtime settings, and export options.
+
+    Methods:
+        from_args (static): Creates a PipelineConfig object from parsed
+        command-line arguments.
+    """
     @staticmethod
     def from_args(args) -> PipelineConfig:
         return PipelineConfig(
@@ -151,6 +293,18 @@ class PipelineConfigFactory:
 
 
 class PipelineEnvironmentFactory:
+    """
+    PipelineEnvironmentFactory is responsible for configuring and preparing the pipeline environment.
+
+    This class serves as a factory for constructing and configuring the pipeline environment.
+    It ensures that necessary directories are created, runtime seeds and configurations are set,
+    and environment metadata is logged appropriately. The main objective of this class is to
+    facilitate ease of pipeline environment setup while adhering to the provided configuration.
+
+    Attributes:
+        config: PipelineConfig
+            Configuration object that contains runtime and data path settings.
+    """
     def __init__(self, config: PipelineConfig):
         self.config = config
 
@@ -188,6 +342,26 @@ class PipelineEnvironmentFactory:
 
 
 class HPODataBuilder:
+    """
+    Class used for building HPO (Hyperparameter Optimization) data.
+
+    This class is responsible for processing input data, applying transformations, and
+    assembling all necessary components for HPO experiments. It performs steps such as
+    data loading, filtering, target preparation, weight computation, and dataset segmentation.
+    The main output is structured data compatible with HPO pipelines.
+
+    Attributes:
+        config: PipelineConfig
+            Configuration object containing paths, column names, and split information
+            required for building the HPO data.
+
+    Methods:
+        build():
+            Constructs and returns the complete PreparedHPOData object by processing
+            input data and preparing all required features and targets.
+        _resolve_folds(df_hpo: pd.DataFrame) -> Sequence[int]:
+            Resolves data folds based on configuration or directly from the input dataframe.
+    """
     def __init__(self, config: PipelineConfig):
         self.config = config
 
@@ -287,6 +461,28 @@ class HPODataBuilder:
 
 
 class MILPipelineOrchestrator:
+    """Orchestrates the execution of a MIL (Multiple Instance Learning) pipeline.
+
+    This class manages the high-level process of running the pipeline, including
+    the configuration, the handling of preparatory steps, the execution of hyperparameter
+    optimization, and the final training phase of the MIL pipeline.
+
+    This orchestrator is designed to work with a provided pipeline configuration and
+    optional command-line arguments. It ensures that the proper environment is set up,
+    data is prepared, and the necessary components for the pipeline are executed in the
+    correct sequence.
+
+    Attributes:
+        config: PipelineConfig
+            The configuration object that holds all necessary settings for the pipeline.
+        argv: Any | None
+            Optional command-line arguments passed to the pipeline.
+
+    Methods:
+        run() -> None:
+            Executes the main operations of the pipeline including environment setup,
+            hyperparameter optimization (HPO), final training, and cleanup.
+    """
     def __init__(self, *, config: PipelineConfig, argv: Any | None):
         self.config = config
         self.argv = argv
@@ -402,6 +598,23 @@ class MILPipelineOrchestrator:
 
 
 def _parse_args(argv: Any | None = None):
+    """
+    Parses and processes command-line arguments for configuring training and evaluation.
+
+    The function uses `argparse` to define and interpret various command-line arguments
+    required for launching and configuring a machine learning training pipeline. It
+    supports parameters for data paths, training settings, splits, cross-validation,
+    and experiment-specific controls. Deprecated and compatibility-related flags are
+    also included for backward compatibility.
+
+    Args:
+        argv: Optional specification of command-line arguments. If None, defaults
+              to `sys.argv`.
+
+    Returns:
+        Namespace: A namespace populated with the parsed arguments where the associated
+                   flags and options can be accessed as attributes.
+    """
     import argparse
 
     ap = argparse.ArgumentParser()
@@ -444,11 +657,40 @@ def _parse_args(argv: Any | None = None):
 
 
 def _normalize_compat_args(args) -> None:
+    """
+    Normalizes compatibility arguments for trials.
+
+    This function converts the 'trials_mil' argument in the provided object
+    to an integer and assigns it to the 'trials' attribute if 'trials_mil'
+    is not None. It modifies the object in place and does not return any
+    value.
+
+    Parameters:
+        args (Any): The object containing trials_mil and potentially other attributes.
+
+    Returns:
+        None
+    """
     if args.trials_mil is not None:
         args.trials = int(args.trials_mil)
 
 
 def main(argv: Any | None = None) -> None:
+    """
+    The `main` function serves as the entry point for the execution of the pipeline
+    orchestration process. It initializes the required configurations and manages
+    the execution of a pipeline by invoking the orchestrator.
+
+    Args:
+        argv (Any | None): Command-line arguments provided by the user or defaulted
+            to None if not provided.
+
+    Raises:
+        None
+
+    Returns:
+        None
+    """
     args = _parse_args(argv)
     _normalize_compat_args(args)
     config = PipelineConfigFactory.from_args(args)

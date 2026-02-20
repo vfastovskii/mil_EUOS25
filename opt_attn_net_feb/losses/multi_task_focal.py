@@ -9,9 +9,22 @@ import torch.nn.functional as F
 
 class MultiTaskFocal(nn.Module):
     """
-    Weighted focal BCE per task:
-      - w: per-sample per-task weights
-      - returns per-task scalar losses (shape [4])
+    Computes the Multi-Task Focal Loss.
+
+    The Multi-Task Focal Loss is an adaptation of the focal loss designed to handle
+    multi-task learning scenarios, where tasks might have varying levels of
+    importance and difficulty. It uses task-specific weights and a focal adjustment
+    to focus training on more difficult examples in each task.
+
+    Attributes:
+        pos_weight (torch.Tensor): A tensor representing the positive class weighting for
+            each task.
+        gamma (torch.Tensor): A tensor that controls the focusing parameter for the focal
+            loss, per task.
+
+    Methods:
+        forward: Computes the weighted multi-task focal loss given the logits, targets,
+                 and task weights.
     """
 
     def __init__(self, pos_weight: torch.Tensor, gamma: torch.Tensor):

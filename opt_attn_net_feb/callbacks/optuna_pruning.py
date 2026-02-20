@@ -13,10 +13,19 @@ from optuna.trial import Trial
 
 
 class OptunaPruningCallbackLocal(Callback):
-    """Optuna pruning callback compatible with Lightning Trainer.
+    """
+    Callback for integrating Optuna's pruning feature with PyTorch Lightning.
 
-    Monitors a metric and reports it to the Optuna trial. If the trial should be
-    pruned according to Optuna's logic, raises optuna.TrialPruned.
+    This class serves as a wrapper that implements a callback which periodically
+    monitors a specified validation metric during training and reports the value
+    to an Optuna trial. If the monitored metric suggests that the trial should
+    be pruned, the callback raises a `TrialPruned` exception to terminate the
+    current trial early.
+
+    Attributes:
+        trial (Trial): An Optuna Trial instance used to report metrics and decide
+            pruning.
+        monitor (str): The name of the metric to monitor for pruning signals.
     """
 
     def __init__(self, trial: Trial, monitor: str = "val_macro_ap"):

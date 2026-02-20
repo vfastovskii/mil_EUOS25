@@ -601,7 +601,7 @@ class MILFinalTrainer:
             batch_size=min(64, int(cfg.runtime.batch_size)),
             collate_fn=collate_export,
         )
-        out_path = Path(self.config.attn_out) if self.config.attn_out else (outdir / "leaderboard_attn.parquet")
+        out_path = Path(self.config.attn_out) if self.config.attn_out else (outdir / "leaderboard_attn.csv")
         export_leaderboard_attention(model, export_dl, device=self.eval_device, out_path=out_path)
 
 

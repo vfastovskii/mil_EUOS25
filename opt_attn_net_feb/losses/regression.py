@@ -11,15 +11,24 @@ def reg_loss_weighted(
     w: torch.Tensor,
     loss_type: str,
 ) -> torch.Tensor:
-    """Masked, weighted regression loss averaged across outputs.
+    """
+    Computes a weighted regression loss between predicted and target tensors using the provided mask
+    and weights. Supports different types of loss functions such as Smooth L1 and MSE. Invalid
+    targets are ignored using a specified mask to prevent numerical instabilities.
 
-    Parameters
-    ----------
-    pred: [B, C] predictions
-    target: [B, C] targets
-    mask: [B, C] boolean mask indicating valid targets
-    w: [B, C] non-negative weights
-    loss_type: 'smoothl1' or 'mse'
+    Parameters:
+        pred (torch.Tensor): The predicted values.
+        target (torch.Tensor): The target values for comparison against predictions.
+        mask (torch.Tensor): A tensor indicating valid elements for loss computation as a boolean mask.
+        w (torch.Tensor): The weight tensor for scaling the loss computation.
+        loss_type (str): Specifies the type of loss to calculate. Valid options are "smoothl1"
+                         and "mse".
+
+    Returns:
+        torch.Tensor: The computed weighted regression loss as a single scalar tensor.
+
+    Raises:
+        ValueError: If the specified loss_type is not "smoothl1" or "mse".
     """
     # Ensure boolean mask and avoid computing loss on invalid targets (prevents NaNs)
     mask_b = mask.bool()

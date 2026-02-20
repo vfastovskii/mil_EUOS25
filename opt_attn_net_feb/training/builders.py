@@ -20,11 +20,38 @@ from .configs import HPOConfig
 
 @dataclass(frozen=True)
 class LoaderConfig:
+    """
+    Configuration class for a data loader.
+
+    This class defines the configuration parameters for a data loader, including the number of
+    workers and whether to enable pinned memory for data transfer.
+
+    Attributes:
+        num_workers: Number of worker threads to use for loading data.
+        pin_memory: Boolean indicating whether to enable pinned memory for faster host-to-device
+        data transfer.
+    """
     num_workers: int
     pin_memory: bool
 
 class MILModelBuilder:
-    """Centralized model construction from typed training config objects."""
+    """
+    Class responsible for building Multiple Instance Learning (MIL) models using a task-specific
+    Attention Mixer architecture with auxiliary configurations.
+
+    This class provides functionality to construct an MIL model based on the specified
+    hyperparameter optimization (HPO) configurations. The assembled model is suitable
+    for learning tasks involving molecular and instance-level embeddings, along with
+    auxiliary predictors and various optimization settings.
+
+    It supports static model configuration generation, leveraging input parameters and
+    predefined structural setups from the provided HPO configurations.
+
+    Static Methods:
+        build: Constructs an MIL model based on input configurations, dimensions, and
+               task-specific settings.
+
+    """
 
     @staticmethod
     def build(
@@ -87,7 +114,14 @@ class MILModelBuilder:
 
 
 class DataLoaderBuilder:
-    """Creates dataloaders with consistent worker/prefetch settings."""
+    """
+    A builder class for creating DataLoader instances.
+
+    This class simplifies the process of configuring and creating DataLoader
+    instances for training and evaluation datasets. It uses the provided
+    configuration to set up optimal DataLoader parameters and provides methods
+    to create DataLoaders for training and evaluation purposes.
+    """
 
     def __init__(self, cfg: LoaderConfig):
         self.cfg = cfg

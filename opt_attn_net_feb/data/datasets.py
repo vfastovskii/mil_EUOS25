@@ -8,7 +8,48 @@ from torch.utils.data import Dataset
 
 
 class MILTrainDataset(Dataset):
-    """One item = one molecule (bag)."""
+    """
+    MILTrainDataset is a Dataset class tailored for managing and serving batches of
+    data typically used for multiple-instance learning (MIL) tasks. It organizes
+    and prepares input data for downstream model training or evaluation.
+
+    The class is designed to handle data comprising multiple feature sets, labels,
+    and weights for classification, absorption, and fluorescence tasks. It provides
+    flexibility to manage instances, including grouping them into bags, limiting
+    instance counts per bag, and ensuring reproducibility through a random seed.
+
+    Attributes:
+        ids: List of unique molecule or sample identifiers.
+        X2d: Two-dimensional array of features, one row per molecule/sample [N, F2].
+        y_cls: Tensor of regression values for the main classification task.
+        w_cls: Tensor of weights for the main classification task.
+        y_abs: Tensor of regression values for the absorption task.
+        m_abs: Tensor of masks for missing absorption values.
+        w_abs: Tensor of weights for the absorption task.
+        y_fluo: Tensor of regression values for the fluorescence task.
+        m_fluo: Tensor of masks for missing fluorescence values.
+        w_fluo: Tensor of weights for the fluorescence task.
+        starts: Array of start indices for each molecule's instance bag.
+        counts: Array of instance counts for each molecule's bag.
+        id2pos: Dictionary mapping molecule IDs to positions in the instances dataset.
+        Xinst: Sorted instance-level features dataset [total_instances, F3].
+        max_instances: Maximum number of instances allowed in each bag.
+        rng: Random number generator initialized with the given seed.
+
+    Methods:
+        __len__:
+            Returns the number of unique molecules/samples in the dataset.
+
+        __getitem__:
+            Retrieves data for the molecule/sample at a given index. This includes
+            features, instance bags, corresponding labels, and weights for various
+            tasks.
+
+    Raises:
+        ValueError:
+            If the length of the ids list does not match the number of rows in the
+            X2d feature array.
+    """
 
     def __init__(
         self,
@@ -81,7 +122,35 @@ class MILTrainDataset(Dataset):
 
 
 class MILExportDataset(Dataset):
-    """Leaderboard export dataset: returns mol_id, conf_ids list, plus tensors inputs."""
+    """
+    MILExportDataset represents a multiple instance learning dataset for exporting purposes.
+
+    This class is designed to work with datasets where data is structured in a way compatible
+    with multiple-instance models. Each instance corresponds to a bag of data samples associated
+    with a unique identifier. The dataset supports operations for accessing individual bags
+    of instances, along with their related metadata such as confidence scores and 2D descriptors.
+
+    Attributes:
+        ids: A list of unique string identifiers for each bag in the dataset.
+        X2d: A NumPy array containing 2D descriptors, one for each bag.
+        starts: A NumPy array indicating the start index of each bag in the associated instance array.
+        counts: A NumPy array indicating the number of instances in each bag.
+        id2pos: A dictionary mapping each unique identifier in ids to its corresponding position.
+        Xinst: A sorted NumPy array containing individual instance data.
+        conf: A sorted NumPy array containing confidence values for all instances.
+        max_instances: An integer limiting the number of instances per bag when retrieving; defaults to 0, meaning no limit.
+        rng: A random number generator for sampling instances in bags exceeding the max_instances limit.
+
+    Methods:
+        __len__:
+            Returns the total number of bags in the dataset.
+
+        __getitem__:
+            Retrieves a specific bag and associated metadata by its index.
+
+    Raises:
+        ValueError: If there is a mismatch between the length of ids and the number of rows in X2d.
+    """
 
     def __init__(
         self,
