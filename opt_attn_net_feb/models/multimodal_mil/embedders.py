@@ -4,7 +4,7 @@ from typing import Callable, Dict
 
 import torch.nn as nn
 
-from ...utils.mlp import make_residual_mlp_embedder_v3
+from .embedder_mlp_v3_base import build_mlp_v3_embedder
 
 EmbedderBuilder = Callable[..., nn.Module]
 
@@ -12,23 +12,6 @@ _EMBEDDER_2D_REGISTRY: Dict[str, EmbedderBuilder] = {}
 _EMBEDDER_3D_REGISTRY: Dict[str, EmbedderBuilder] = {}
 _LEGACY_2D_ALIASES: Dict[str, str] = {"mlp_v3": "mlp_v3_2d"}
 _LEGACY_3D_ALIASES: Dict[str, str] = {"mlp_v3": "mlp_v3_3d"}
-
-
-def _build_mlp_v3_embedder(
-    *,
-    input_dim: int,
-    hidden_dim: int,
-    layers: int,
-    dropout: float,
-    activation: str,
-) -> nn.Module:
-    return make_residual_mlp_embedder_v3(
-        int(input_dim),
-        int(hidden_dim),
-        int(layers),
-        float(dropout),
-        activation=str(activation),
-    )
 
 
 def register_2d_embedder(name: str, builder: EmbedderBuilder) -> None:
@@ -110,8 +93,8 @@ def available_3d_embedders() -> list[str]:
 
 
 # Default implementations
-register_2d_embedder("mlp_v3_2d", _build_mlp_v3_embedder)
-register_3d_embedder("mlp_v3_3d", _build_mlp_v3_embedder)
+register_2d_embedder("mlp_v3_2d", build_mlp_v3_embedder)
+register_3d_embedder("mlp_v3_3d", build_mlp_v3_embedder)
 
 
 __all__ = [

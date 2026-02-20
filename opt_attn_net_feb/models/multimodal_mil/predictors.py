@@ -4,7 +4,7 @@ from typing import Callable, Dict
 
 import torch.nn as nn
 
-from .heads import make_predictor_heads
+from .head_mlp_v3 import make_predictor_heads
 
 PredictorBuilder = Callable[..., nn.ModuleList]
 

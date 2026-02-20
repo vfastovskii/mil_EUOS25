@@ -10,15 +10,13 @@ from torch.cuda.amp import autocast
 
 from ...losses.multi_task_focal import MultiTaskFocal
 from ...utils.metrics import ap_per_task
+from .aggregators import build_aggregator
 from .configs import MILModelConfig
 from .constants import NUM_ABS_HEADS, NUM_FLUO_HEADS, NUM_TASKS
-from .heads import apply_shared_heads, apply_task_heads, make_projection
-from .make_2d_embedder import make_2d_embedder
-from .make_3d_embedder import make_3d_embedder
-from .make_aggregator import make_aggregator
-from .make_aux_pred_head import make_aux_pred_head
-from .make_mixer import make_mixer
-from .make_pred_head import make_pred_head
+from .embedder_mlp_v3_base import build_mlp_v3_embedder
+from .embedders import build_2d_embedder, build_3d_embedder
+from .head_utils import apply_shared_heads, apply_task_heads, make_projection
+from .predictors import build_predictor_heads
 from .training import compute_training_losses
 
 
@@ -31,6 +29,29 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
     - cls logits from task-specific z_task
     - aux heads from mean(z_task)
     """
+
+    @staticmethod
+    def _build_head_group(
+        *,
+        predictor_name: str,
+        in_dim: int,
+        count: int,
+        activation: str,
+        num_layers: int,
+        dropout: float,
+        stochastic_depth: float,
+        fc2_gain_non_last: float,
+    ) -> nn.ModuleList:
+        return build_predictor_heads(
+            name=str(predictor_name),
+            in_dim=int(in_dim),
+            count=int(count),
+            activation=str(activation),
+            num_layers=int(num_layers),
+            dropout=float(dropout),
+            stochastic_depth=float(stochastic_depth),
+            fc2_gain_non_last=float(fc2_gain_non_last),
+        )
 
     @classmethod
     def from_config(
@@ -118,7 +139,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=["pos_weight", "gamma", "lam"])
 
-        self.mol_enc = make_2d_embedder(
+        self.mol_enc = build_2d_embedder(
             name=str(mol_embedder_name),
             input_dim=int(mol_dim),
             hidden_dim=int(mol_hidden),
@@ -126,7 +147,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             dropout=float(mol_dropout),
             activation=str(activation),
         )
-        self.inst_enc = make_3d_embedder(
+        self.inst_enc = build_3d_embedder(
             name=str(inst_embedder_name),
             input_dim=int(inst_dim),
             hidden_dim=int(inst_hidden),
@@ -137,20 +158,24 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self.mol_post_embed_norm = nn.LayerNorm(int(mol_hidden))
         self.inst_post_embed_norm = nn.LayerNorm(int(inst_hidden))
 
-        self.attn_pool = make_aggregator(
+        agg_kwargs = dict(aggregator_kwargs or {})
+        overlap = {"dim", "n_heads", "dropout", "n_tasks"}.intersection(agg_kwargs.keys())
+        if overlap:
+            raise ValueError(f"aggregator_kwargs cannot override reserved keys: {sorted(overlap)}")
+        self.attn_pool = build_aggregator(
             name=str(aggregator_name),
             dim=int(inst_hidden),
             n_heads=int(attn_heads),
             dropout=float(attn_dropout),
             n_tasks=NUM_TASKS,
-            aggregator_kwargs=aggregator_kwargs,
+            **agg_kwargs,
         )
         self.agg_post_norm = nn.LayerNorm(int(inst_hidden))
 
         self.proj2d = make_projection(int(mol_hidden), int(proj_dim))
         self.proj3d = make_projection(int(inst_hidden), int(proj_dim))
 
-        self.mixer = make_mixer(
+        self.mixer = build_mlp_v3_embedder(
             input_dim=int(2 * proj_dim),
             hidden_dim=int(mixer_hidden),
             layers=int(mixer_layers),
@@ -159,8 +184,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         )
         self.mixer_post_norm = nn.LayerNorm(int(mixer_hidden))
 
-        self.cls_heads = make_pred_head(
-            name=str(predictor_name),
+        self.cls_heads = self._build_head_group(
+            predictor_name=str(predictor_name),
             in_dim=int(mixer_hidden),
             count=NUM_TASKS,
             activation=str(activation),
@@ -169,8 +194,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             stochastic_depth=float(head_stochastic_depth),
             fc2_gain_non_last=float(head_fc2_gain_non_last),
         )
-        self.abs_heads = make_aux_pred_head(
-            name=str(predictor_name),
+        self.abs_heads = self._build_head_group(
+            predictor_name=str(predictor_name),
             in_dim=int(mixer_hidden),
             count=NUM_ABS_HEADS,
             activation=str(activation),
@@ -179,8 +204,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             stochastic_depth=float(head_stochastic_depth),
             fc2_gain_non_last=float(head_fc2_gain_non_last),
         )
-        self.fluo_heads = make_aux_pred_head(
-            name=str(predictor_name),
+        self.fluo_heads = self._build_head_group(
+            predictor_name=str(predictor_name),
             in_dim=int(mixer_hidden),
             count=NUM_FLUO_HEADS,
             activation=str(activation),
@@ -211,6 +236,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         key_padding_mask: torch.Tensor, # [B,N] True=PAD
         return_attn: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        self._validate_forward_inputs(x2d=x2d, x3d_pad=x3d_pad, key_padding_mask=key_padding_mask)
         pooled_tasks, attn = self._pool_task_tokens(x3d_pad=x3d_pad, key_padding_mask=key_padding_mask, return_attn=return_attn)
         z_tasks = self._build_task_representations(x2d=x2d, pooled_tasks=pooled_tasks)
 
@@ -223,6 +249,28 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         if return_attn:
             return logits, abs_out, fluo_out, attn
         return logits, abs_out, fluo_out
+
+    @staticmethod
+    def _validate_forward_inputs(
+        *,
+        x2d: torch.Tensor,
+        x3d_pad: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+    ) -> None:
+        if x2d.dim() != 2:
+            raise ValueError(f"x2d must be rank-2 [B,F2], got shape={tuple(x2d.shape)}")
+        if x3d_pad.dim() != 3:
+            raise ValueError(f"x3d_pad must be rank-3 [B,N,F3], got shape={tuple(x3d_pad.shape)}")
+        if key_padding_mask.dim() != 2:
+            raise ValueError(f"key_padding_mask must be rank-2 [B,N], got shape={tuple(key_padding_mask.shape)}")
+        if x2d.shape[0] != x3d_pad.shape[0]:
+            raise ValueError(
+                f"Batch mismatch: x2d batch={int(x2d.shape[0])} vs x3d_pad batch={int(x3d_pad.shape[0])}"
+            )
+        if x3d_pad.shape[:2] != key_padding_mask.shape:
+            raise ValueError(
+                f"Mask mismatch: x3d_pad[:2]={tuple(x3d_pad.shape[:2])} vs key_padding_mask={tuple(key_padding_mask.shape)}"
+            )
 
     def _pool_task_tokens(
         self,

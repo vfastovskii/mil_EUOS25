@@ -5,7 +5,7 @@ import torch.nn as nn
 from ...utils.mlp import make_residual_mlp_embedder_v3
 
 
-def make_mixer(
+def build_mlp_v3_embedder(
     *,
     input_dim: int,
     hidden_dim: int,
@@ -22,4 +22,4 @@ def make_mixer(
     )
 
 
-__all__ = ["make_mixer"]
+__all__ = ["build_mlp_v3_embedder"]

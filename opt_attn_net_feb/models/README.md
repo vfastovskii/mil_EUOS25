@@ -7,15 +7,12 @@ This folder is intentionally split by responsibility:
   - Contains:
     - `model.py`: `MILTaskAttnMixerWithAux`
     - `embedders.py`: 2D/3D embedder registries + builders
+    - `embedder_mlp_v3_base.py`: shared V3 residual MLP embedder implementation
     - `aggregators.py`: 3D aggregator registry + builders
     - `predictors.py`: predictor-head registry + builders
-    - `make_2d_embedder.py`: `make_2d_embedder`
-    - `make_3d_embedder.py`: `make_3d_embedder`
-    - `make_aggregator.py`: `make_aggregator`
-    - `make_mixer.py`: `make_mixer`
-    - `make_pred_head.py`: `make_pred_head`
-    - `make_aux_pred_head.py`: `make_aux_pred_head`
-    - `heads.py`, `training.py`, `constants.py`: model internals
+    - `head_mlp_v3.py`: V3-style predictor head implementation
+    - `head_utils.py`: head application/projection helpers
+    - `heads.py`, `training.py`, `constants.py`: model internals and compatibility re-exports
 
 - `models/attention_pooling/`
   - Reusable attention pooling primitives used by multimodal MIL.

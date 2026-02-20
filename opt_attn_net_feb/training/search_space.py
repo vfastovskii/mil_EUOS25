@@ -27,7 +27,7 @@ def search_space(trial: Trial) -> Dict[str, Any]:
         "aggregator_name": trial.suggest_categorical("aggregator_name", ["task_attention_pool"]),
         "predictor_name": trial.suggest_categorical("predictor_name", ["mlp_v3"]),
         # Shared predictor-head architecture knobs (applied to all heads)
-        "head_num_layers": trial.suggest_categorical("head_num_layers", [1, 2]),
+        "head_num_layers": trial.suggest_categorical("head_num_layers", [2, 4, 6]),
         "head_dropout": trial.suggest_float("head_dropout", 0.0, 0.2),
         "head_fc2_gain_non_last": trial.suggest_categorical("head_fc2_gain_non_last", [1e-3, 3e-3, 1e-2]),
         # Activation choice for encoders and mixer

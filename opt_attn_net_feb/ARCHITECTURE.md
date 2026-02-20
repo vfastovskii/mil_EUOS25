@@ -62,14 +62,11 @@ Primary implementation:
 - `models/multimodal_mil/model.py`
 - `models/multimodal_mil/configs.py`
 - `models/multimodal_mil/embedders.py`
+- `models/multimodal_mil/embedder_mlp_v3_base.py`
 - `models/multimodal_mil/aggregators.py`
 - `models/multimodal_mil/predictors.py`
-- `models/multimodal_mil/make_2d_embedder.py`
-- `models/multimodal_mil/make_3d_embedder.py`
-- `models/multimodal_mil/make_aggregator.py`
-- `models/multimodal_mil/make_mixer.py`
-- `models/multimodal_mil/make_pred_head.py`
-- `models/multimodal_mil/make_aux_pred_head.py`
+- `models/multimodal_mil/head_mlp_v3.py`
+- `models/multimodal_mil/head_utils.py`
 - `models/attention_pooling/pool.py`
 - `models/multimodal_mil/heads.py`
 
@@ -94,14 +91,22 @@ Selection is name-based in model config:
 - `aggregator_name`
 - `predictor_name`
 
-Factory entrypoints are split per concern:
+Canonical builder entrypoints:
 
-- `make_2d_embedder` -> `models/multimodal_mil/make_2d_embedder.py`
-- `make_3d_embedder` -> `models/multimodal_mil/make_3d_embedder.py`
-- `make_aggregator` -> `models/multimodal_mil/make_aggregator.py`
-- `make_mixer` -> `models/multimodal_mil/make_mixer.py`
-- `make_pred_head` -> `models/multimodal_mil/make_pred_head.py`
-- `make_aux_pred_head` -> `models/multimodal_mil/make_aux_pred_head.py`
+- `build_2d_embedder` / `build_3d_embedder` -> `models/multimodal_mil/embedders.py`
+- `build_aggregator` -> `models/multimodal_mil/aggregators.py`
+- `build_predictor_heads` -> `models/multimodal_mil/predictors.py`
+- mixer builder used by model -> `models/multimodal_mil/embedder_mlp_v3_base.py`
+
+Concrete default implementations are also split per concern:
+
+- shared V3 embedder implementation for both 2D and 3D -> `models/multimodal_mil/embedder_mlp_v3_base.py`
+- predictor-head implementation -> `models/multimodal_mil/head_mlp_v3.py`
+- head utilities (projection + apply helpers) -> `models/multimodal_mil/head_utils.py`
+
+Compatibility facade:
+
+- `models/multimodal_mil/heads.py` re-exports head symbols to keep import stability while implementation remains split.
 
 Current defaults preserve existing behavior:
 
