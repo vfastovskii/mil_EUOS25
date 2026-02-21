@@ -245,6 +245,8 @@ class MILFoldTrainer:
             devices=int(self.run_config.trainer.devices),
             precision=str(self.run_config.trainer.precision),
             accumulate_grad_batches=int(cfg.runtime.accumulate_grad_batches),
+            save_checkpoint=False,
+            save_weights_only=True,
         )
         trainer, ckpt_cb = LightningTrainerFactory(trainer_cfg).build(
             ckpt_dir=str(fold_ckpt_dir),
@@ -254,12 +256,13 @@ class MILFoldTrainer:
 
         epochs_trained = int(trainer.current_epoch) + 1
 
-        best_path = ckpt_cb.best_model_path
         best_epoch = None
-        if best_path and Path(best_path).exists():
-            ckpt = torch.load(best_path, map_location="cpu")
-            best_epoch = int(ckpt.get("epoch", -1))
-            model.load_state_dict(ckpt["state_dict"], strict=True)
+        if ckpt_cb is not None:
+            best_path = ckpt_cb.best_model_path
+            if best_path and Path(best_path).exists():
+                ckpt = torch.load(best_path, map_location="cpu")
+                best_epoch = int(ckpt.get("epoch", -1))
+                model.load_state_dict(ckpt["state_dict"], strict=True)
 
         evaluator = ModelEvaluator(device=self.eval_device)
         best_macro, best_aps = evaluator.eval_best_epoch(model, dl_va)
@@ -560,6 +563,9 @@ class MILFinalTrainer:
             devices=int(self.config.trainer.devices),
             precision=str(self.config.trainer.precision),
             accumulate_grad_batches=int(cfg.runtime.accumulate_grad_batches),
+            # Keep a single best checkpoint for the final run only.
+            save_checkpoint=True,
+            save_weights_only=True,
         )
         trainer, ckpt_cb = LightningTrainerFactory(trainer_cfg).build(
             ckpt_dir=str(final_dir),
@@ -567,11 +573,16 @@ class MILFinalTrainer:
         )
         trainer.fit(model, dl_tr, dl_val)
 
-        best_path = ckpt_cb.best_model_path
-        if best_path and Path(best_path).exists():
-            ckpt = torch.load(best_path, map_location="cpu")
-            model.load_state_dict(ckpt["state_dict"], strict=True)
-            print(f"[FINAL] loaded best ckpt: {best_path}")
+        best_epoch = None
+        best_ckpt_path = None
+        if ckpt_cb is not None:
+            best_path = ckpt_cb.best_model_path
+            if best_path and Path(best_path).exists():
+                ckpt = torch.load(best_path, map_location="cpu")
+                best_epoch = int(ckpt.get("epoch", -1))
+                best_ckpt_path = str(best_path)
+                model.load_state_dict(ckpt["state_dict"], strict=True)
+                print(f"[FINAL] loaded best ckpt: {best_path}")
 
         evaluator = ModelEvaluator(device=self.eval_device)
         macro_ap_lb, aps_lb = evaluator.eval_best_epoch(model, dl_val)
@@ -581,6 +592,8 @@ class MILFinalTrainer:
             "ap_task1": float(aps_lb[1]),
             "ap_task2": float(aps_lb[2]),
             "ap_task3": float(aps_lb[3]),
+            "best_epoch": best_epoch,
+            "best_ckpt_path": best_ckpt_path,
         }
         (final_dir / "leaderboard_eval.json").write_text(json.dumps(eval_json, indent=2))
         print(f"[FINAL] leaderboard eval: macro_ap={macro_ap_lb:.6f} aps={aps_lb}")

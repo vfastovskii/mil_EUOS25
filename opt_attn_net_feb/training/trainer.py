@@ -25,6 +25,8 @@ class LightningTrainerConfig:
     devices: int
     precision: str
     accumulate_grad_batches: int
+    save_checkpoint: bool = True
+    save_weights_only: bool = True
 
 
 class LightningTrainerFactory:
@@ -38,30 +40,33 @@ class LightningTrainerFactory:
         *,
         ckpt_dir: str,
         trial: Optional["optuna.trial.Trial"] = None,
-    ) -> Tuple[pl.Trainer, pl.callbacks.ModelCheckpoint]:
+    ) -> Tuple[pl.Trainer, Optional[pl.callbacks.ModelCheckpoint]]:
         es = pl.callbacks.EarlyStopping(
             monitor="val_macro_ap",
             mode="max",
             patience=int(self.config.patience),
         )
-        ckpt = pl.callbacks.ModelCheckpoint(
-            dirpath=ckpt_dir,
-            filename="best",
-            monitor="val_macro_ap",
-            mode="max",
-            save_top_k=1,
-            save_last=False,
-            auto_insert_metric_name=False,
-        )
-
-        callbacks: List[Callback] = [es, ckpt]
+        callbacks: List[Callback] = [es]
+        ckpt: Optional[pl.callbacks.ModelCheckpoint] = None
+        if bool(self.config.save_checkpoint):
+            ckpt = pl.callbacks.ModelCheckpoint(
+                dirpath=ckpt_dir,
+                filename="best",
+                monitor="val_macro_ap",
+                mode="max",
+                save_top_k=1,
+                save_last=False,
+                auto_insert_metric_name=False,
+                save_weights_only=bool(self.config.save_weights_only),
+            )
+            callbacks.append(ckpt)
         if trial is not None:
             callbacks.append(OptunaPruningCallbackLocal(trial, monitor="val_macro_ap"))
 
         trainer = pl.Trainer(
             max_epochs=int(self.config.max_epochs),
             logger=False,
-            enable_checkpointing=True,
+            enable_checkpointing=bool(self.config.save_checkpoint),
             enable_progress_bar=False,
             enable_model_summary=False,
             callbacks=callbacks,
@@ -113,7 +118,9 @@ def make_trainer_gpu(
     accumulate_grad_batches: int,
     ckpt_dir: str,
     trial: Optional["optuna.trial.Trial"] = None,
-) -> Tuple[pl.Trainer, pl.callbacks.ModelCheckpoint]:
+    save_checkpoint: bool = True,
+    save_weights_only: bool = True,
+) -> Tuple[pl.Trainer, Optional[pl.callbacks.ModelCheckpoint]]:
     """Compatibility wrapper around `LightningTrainerFactory`."""
     cfg = LightningTrainerConfig(
         max_epochs=int(max_epochs),
@@ -122,6 +129,8 @@ def make_trainer_gpu(
         devices=int(devices),
         precision=str(precision),
         accumulate_grad_batches=int(accumulate_grad_batches),
+        save_checkpoint=bool(save_checkpoint),
+        save_weights_only=bool(save_weights_only),
     )
     return LightningTrainerFactory(cfg).build(ckpt_dir=ckpt_dir, trial=trial)
 

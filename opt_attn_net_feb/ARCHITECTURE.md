@@ -313,16 +313,16 @@ HPO search space is defined in `training/search_space.py::search_space`.
 
 ### 4.1 Architecture capacity and regularization
 
-- `mol_hidden` (`{1024, 2048}`): Hidden width of the 2D molecule encoder MLP; larger values increase representational capacity and memory use.
+- `mol_hidden` (`{128, 256}`): Hidden width of the 2D molecule encoder MLP; capped so effective V3 FFN widths stay <= 1024.
 - `mol_layers` (`[2, 5]`): Depth of the 2D encoder; deeper models can learn richer nonlinear combinations but are more prone to optimization instability.
 - `mol_dropout` (`[0.10, 0.25]`): Dropout probability in each 2D encoder block; higher values increase regularization and reduce overfitting risk.
-- `inst_hidden` (`{256, 512, 1024}`): Hidden width of the 3D instance encoder; directly controls token embedding dimensionality entering attention.
+- `inst_hidden` (`{128, 256}`): Hidden width of the 3D instance encoder; directly controls token embedding dimensionality entering attention.
 - `inst_layers` (`[3, 5]`): Depth of the 3D encoder; affects expressiveness of conformation-level token features.
 - `inst_dropout` (`[0.05, 0.15]`): Dropout in 3D encoder blocks; regularizes token features before attention pooling.
-- `proj_dim` (`{512, 1024}`): Common projection dimension for 2D and pooled 3D representations before fusion.
-- `attn_heads` (`{8, 16}`): Number of heads in task-attention pooling; must divide `inst_hidden`.
+- `proj_dim` (`{256, 512}`): Common projection dimension for 2D and pooled 3D representations before fusion.
+- `attn_heads` (`{8, 16, 32}`): Number of heads in task-attention pooling; must divide `inst_hidden`.
 - `attn_dropout` (`[0.05, 0.2]`): Dropout inside multihead attention; regularizes per-task instance weighting.
-- `mixer_hidden` (`{512, 1024}`): Width of the fusion mixer MLP that maps concatenated 2D/3D task features to task embeddings.
+- `mixer_hidden` (`{128, 256}`): Width of the fusion mixer MLP that maps concatenated 2D/3D task features to task embeddings.
 - `mixer_layers` (`[3, 5]`): Depth of the fusion mixer; controls complexity of cross-modal feature interaction.
 - `mixer_dropout` (`[0.05, 0.2]`): Dropout in fusion mixer blocks; regularizes final task representations.
 - `mol_embedder_name` (fixed: `{mlp_v3_2d}`): 2D embedder implementation selected from registry.

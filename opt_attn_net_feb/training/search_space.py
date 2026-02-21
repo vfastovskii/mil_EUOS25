@@ -8,17 +8,18 @@ from optuna.trial import Trial
 
 def search_space(trial: Trial) -> Dict[str, Any]:
     p = {
-        # Narrowed around the first strong baseline run.
-        "mol_hidden": trial.suggest_categorical("mol_hidden", [1024, 2048]),
+        # Dimension-capped search: keep effective layer widths <= 1024.
+        # (With V3 gated FFNs, internal width is ~4x hidden_dim.)
+        "mol_hidden": trial.suggest_categorical("mol_hidden", [128, 256]),
         "mol_layers": trial.suggest_int("mol_layers", 2, 5),
         "mol_dropout": trial.suggest_float("mol_dropout", 0.10, 0.25),
-        "inst_hidden": trial.suggest_categorical("inst_hidden", [256, 512, 1024]),
+        "inst_hidden": trial.suggest_categorical("inst_hidden", [128, 256]),
         "inst_layers": trial.suggest_int("inst_layers", 3, 5),
         "inst_dropout": trial.suggest_float("inst_dropout", 0.05, 0.15),
-        "proj_dim": trial.suggest_categorical("proj_dim", [512, 1024]),
-        "attn_heads": trial.suggest_categorical("attn_heads", [8, 16]),
+        "proj_dim": trial.suggest_categorical("proj_dim", [256, 512]),
+        "attn_heads": trial.suggest_categorical("attn_heads", [8, 16, 32]),
         "attn_dropout": trial.suggest_float("attn_dropout", 0.05, 0.2),
-        "mixer_hidden": trial.suggest_categorical("mixer_hidden", [512, 1024]),
+        "mixer_hidden": trial.suggest_categorical("mixer_hidden", [128, 256]),
         "mixer_layers": trial.suggest_int("mixer_layers", 3, 5),
         "mixer_dropout": trial.suggest_float("mixer_dropout", 0.05, 0.2),
         # Component selection by name (extensible registries)

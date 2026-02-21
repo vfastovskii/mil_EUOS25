@@ -20,10 +20,13 @@ def export_leaderboard_attention(
     """
     Exports attention weights for leaderboard evaluation to a specified output path.
 
-    This function processes the attention weights from the model's predictions on a data
-    loader, filters and normalizes them, and writes the resulting data to a file in either
-    Parquet or CSV format. The output file includes molecule IDs, conformer IDs, tasks, and
-    attention weights.
+    This function processes model predictions and per-task attention weights, normalizes
+    attention per task over valid conformers, and writes one row per conformer:
+
+    - ID
+    - conf_id
+    - 4 endpoint predictions (probabilities from logits)
+    - 4 attention weights (one per endpoint)
 
     Parameters:
         model: Any
@@ -64,9 +67,13 @@ def export_leaderboard_attention(
         if attn is None:
             raise RuntimeError("Attention not returned; expected attn when return_attn=True")
 
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
+        probs_np = torch.sigmoid(logits).detach().cpu().numpy()  # [B,4]
         attn_np = attn.detach().cpu().numpy()          # [B,4,N]
         kpm_np = kpm.detach().cpu().numpy().astype(bool)
         B, T, N = attn_np.shape
+        if T != len(TASK_COLS):
+            raise RuntimeError(f"Unexpected attention task count: {T}, expected {len(TASK_COLS)}")
 
         for b in range(B):
             mid = str(mol_ids[b])
@@ -76,6 +83,8 @@ def export_leaderboard_attention(
                 continue
             confs = [str(x) for x in conf_pad[b, :L].tolist()]
 
+            # Normalize attention for each task over valid conformers.
+            attn_norm = np.zeros((T, L), dtype=np.float64)
             for t in range(T):
                 w = attn_np[b, t, :L].astype(np.float64)
                 s = float(w.sum())
@@ -83,9 +92,21 @@ def export_leaderboard_attention(
                     w[:] = 1.0 / float(L)
                 else:
                     w /= s  # enforce sum-to-1 (safety)
-                task_name = TASK_COLS[t]
-                for i in range(L):
-                    rows.append({"ID": mid, "conf_id": confs[i], "task": task_name, "attn_weight": float(w[i])})
+                attn_norm[t, :] = w
+
+            pred_cols = {
+                f"pred_{TASK_COLS[t]}": float(probs_np[b, t])
+                for t in range(T)
+            }
+            for i in range(L):
+                row: Dict[str, Any] = {
+                    "ID": mid,
+                    "conf_id": confs[i],
+                    **pred_cols,
+                }
+                for t in range(T):
+                    row[f"attn_{TASK_COLS[t]}"] = float(attn_norm[t, i])
+                rows.append(row)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df_out = pd.DataFrame(rows)
