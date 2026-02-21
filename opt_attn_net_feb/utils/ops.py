@@ -117,6 +117,128 @@ def lambda_from_prevalence(y: np.ndarray, power: float) -> np.ndarray:
     return lam.astype(np.float32)
 
 
+def bitmask_ids(y: np.ndarray) -> np.ndarray:
+    """Encode multitask binary labels into integer bitmasks."""
+    yb = (np.asarray(y) > 0).astype(np.int64)
+    if yb.ndim != 2:
+        raise ValueError(f"Expected y to have shape [N,T], got shape {yb.shape}")
+    bits = (1 << np.arange(yb.shape[1], dtype=np.int64)).reshape(1, -1)
+    return (yb * bits).sum(axis=1).astype(np.int64)
+
+
+def make_bitmask_sample_weights(
+    y: np.ndarray,
+    *,
+    alpha: float = 0.5,
+    cap: float = 3.0,
+) -> np.ndarray:
+    """
+    Build per-sample weights based on bitmask-frequency rarity.
+
+    Weight for sample i with bitmask m_i:
+      w_i = clip((median_nonzero_count / count(m_i)) ** alpha, 1, cap)
+    """
+    yb = (np.asarray(y) > 0).astype(np.int64)
+    if yb.ndim != 2:
+        raise ValueError(f"Expected y to have shape [N,T], got shape {yb.shape}")
+    if yb.shape[0] == 0:
+        return np.ones((0,), dtype=np.float32)
+
+    m = bitmask_ids(yb)
+    max_mask = int(1 << yb.shape[1])
+    cnt = np.bincount(m, minlength=max_mask).astype(np.float64)
+    nonzero = cnt[cnt > 0]
+    if nonzero.size == 0:
+        return np.ones((yb.shape[0],), dtype=np.float32)
+
+    ref = float(np.median(nonzero))
+    per_sample_cnt = cnt[m]
+    w = (ref / np.maximum(per_sample_cnt, 1.0)) ** max(0.0, float(alpha))
+    return np.clip(w, 1.0, max(1.0, float(cap))).astype(np.float32)
+
+
+def build_bitmask_group_definition(
+    y_train: np.ndarray,
+    *,
+    top_k: int = 6,
+    class_weight_alpha: float = 0.5,
+    class_weight_cap: float = 5.0,
+) -> Tuple[List[int], np.ndarray]:
+    """
+    Build bitmask grouping (top frequent masks + other) from train fold only.
+
+    Returns:
+        top_mask_ids: list of selected frequent mask IDs.
+        class_weight: np.ndarray of shape [len(top_mask_ids)+1] for CE weighting.
+    """
+    yb = (np.asarray(y_train) > 0).astype(np.int64)
+    if yb.ndim != 2:
+        raise ValueError(f"Expected y_train to have shape [N,T], got shape {yb.shape}")
+    if yb.shape[0] == 0:
+        return [], np.ones((1,), dtype=np.float32)
+
+    mask_ids = bitmask_ids(yb)
+    n_masks = int(1 << yb.shape[1])
+    counts = np.bincount(mask_ids, minlength=n_masks).astype(np.float64)
+
+    k = max(0, int(top_k))
+    if k == 0:
+        top_ids: List[int] = []
+    else:
+        ranked = [int(i) for i in np.argsort(-counts).tolist() if counts[int(i)] > 0.0]
+        top_ids = ranked[:k]
+
+    other_idx = len(top_ids)
+    mask_to_group = np.full((n_masks,), other_idx, dtype=np.int64)
+    for g, mid in enumerate(top_ids):
+        mask_to_group[int(mid)] = int(g)
+    groups = mask_to_group[mask_ids]
+    group_counts = np.bincount(groups, minlength=other_idx + 1).astype(np.float64)
+
+    nonzero = group_counts[group_counts > 0.0]
+    if nonzero.size == 0:
+        class_weight = np.ones((other_idx + 1,), dtype=np.float32)
+    else:
+        ref = float(np.median(nonzero))
+        cw = (ref / np.maximum(group_counts, 1.0)) ** max(0.0, float(class_weight_alpha))
+        class_weight = np.clip(
+            cw,
+            1.0,
+            max(1.0, float(class_weight_cap)),
+        ).astype(np.float32)
+
+    return top_ids, class_weight
+
+
+def _task_rarity_severity(
+    y: np.ndarray,
+    *,
+    rare_target_prev: float,
+    rare_prev_thr: Optional[float],
+) -> np.ndarray:
+    prev = y.mean(axis=0).astype(np.float64)
+    if rare_prev_thr is not None:
+        return (prev < float(rare_prev_thr)).astype(np.float64)
+    target = float(np.clip(float(rare_target_prev), 1e-6, 1.0))
+    return np.clip((target - prev) / target, 0.0, 1.0)
+
+
+def _sample_rarity(y: np.ndarray, severity: np.ndarray) -> np.ndarray:
+    if y.shape[0] == 0:
+        return np.zeros((0,), dtype=np.float64)
+    return np.max(y.astype(np.float64) * severity.reshape(1, -1), axis=1)
+
+
+def _normalize_probs(w: np.ndarray) -> np.ndarray:
+    w = np.asarray(w, dtype=np.float64).reshape(-1)
+    if w.size == 0:
+        return w
+    den = float(w.sum())
+    if den <= 0.0 or not np.isfinite(den):
+        return np.full((w.size,), 1.0 / float(w.size), dtype=np.float64)
+    return w / den
+
+
 def make_weighted_sampler(
     y: np.ndarray,
     rare_mult: float,
@@ -147,20 +269,13 @@ def make_weighted_sampler(
     if y.ndim != 2 or y.shape[1] == 0:
         w = np.ones((y.shape[0],), dtype=np.float64)
     else:
-        prev = y.mean(axis=0).astype(np.float64)
-
-        if rare_prev_thr is not None:
-            # Backward-compatible behavior for older configs.
-            severity = (prev < float(rare_prev_thr)).astype(np.float64)
-        else:
-            target = float(np.clip(float(rare_target_prev), 1e-6, 1.0))
-            severity = np.clip((target - prev) / target, 0.0, 1.0)
-
+        severity = _task_rarity_severity(
+            y,
+            rare_target_prev=float(rare_target_prev),
+            rare_prev_thr=rare_prev_thr,
+        )
         if np.any(severity > 0.0):
-            sample_rarity = np.max(
-                y.astype(np.float64) * severity.reshape(1, -1),
-                axis=1,
-            )
+            sample_rarity = _sample_rarity(y, severity)
             w = 1.0 + float(rare_mult) * sample_rarity
         else:
             w = np.ones((y.shape[0],), dtype=np.float64)
@@ -187,6 +302,10 @@ class MultitaskBalancedBatchSampler(Sampler[List[int]]):
         sample_weight_cap: float = 10.0,
         batch_pos_fraction: float = 0.35,
         min_pos_per_batch: int = 1,
+        enforce_bitmask_quota: bool = True,
+        quota_t450_per_256: int = 4,
+        quota_fgt480_per_256: int = 1,
+        quota_multi_per_256: int = 8,
         rare_prev_thr: Optional[float] = None,
         seed: int = 0,
         drop_last: bool = False,
@@ -204,6 +323,10 @@ class MultitaskBalancedBatchSampler(Sampler[List[int]]):
         self.sample_weight_cap = float(sample_weight_cap)
         self.batch_pos_fraction = float(np.clip(batch_pos_fraction, 0.0, 1.0))
         self.min_pos_per_batch = int(max(0, min_pos_per_batch))
+        self.enforce_bitmask_quota = bool(enforce_bitmask_quota)
+        self.quota_t450_per_256 = int(max(0, quota_t450_per_256))
+        self.quota_fgt480_per_256 = int(max(0, quota_fgt480_per_256))
+        self.quota_multi_per_256 = int(max(0, quota_multi_per_256))
         self.rare_prev_thr = rare_prev_thr
         self.seed = int(seed)
         self.drop_last = bool(drop_last)
@@ -218,25 +341,29 @@ class MultitaskBalancedBatchSampler(Sampler[List[int]]):
         any_pos = self.y.sum(axis=1) > 0
         self._pos_idx = np.flatnonzero(any_pos)
         self._neg_idx = np.flatnonzero(~any_pos)
+        self._t450_idx = np.flatnonzero(self.y[:, 1] > 0) if self.y.shape[1] > 1 else np.array([], dtype=np.int64)
+        self._fgt480_idx = np.flatnonzero(self.y[:, 3] > 0) if self.y.shape[1] > 3 else np.array([], dtype=np.int64)
+        self._multi_idx = np.flatnonzero(self.y.sum(axis=1) >= 2)
 
         if self._pos_idx.size > 0:
-            prev = self.y.mean(axis=0).astype(np.float64)
-            if self.rare_prev_thr is not None:
-                severity = (prev < float(self.rare_prev_thr)).astype(np.float64)
-            else:
-                target = float(np.clip(self.rare_target_prev, 1e-6, 1.0))
-                severity = np.clip((target - prev) / target, 0.0, 1.0)
-            sample_rarity = np.max(self.y.astype(np.float64) * severity.reshape(1, -1), axis=1)
-            pos_w = 1.0 + self.rare_mult * sample_rarity[self._pos_idx]
+            severity = _task_rarity_severity(
+                self.y,
+                rare_target_prev=self.rare_target_prev,
+                rare_prev_thr=self.rare_prev_thr,
+            )
+            sample_rarity = _sample_rarity(self.y, severity)
+            all_w = 1.0 + self.rare_mult * sample_rarity
             cap = max(1.0, self.sample_weight_cap)
-            pos_w = np.clip(pos_w, 1.0, cap)
-            den = float(pos_w.sum())
-            if den > 0.0:
-                self._pos_prob = pos_w / den
-            else:
-                self._pos_prob = np.full((self._pos_idx.size,), 1.0 / float(self._pos_idx.size))
+            self._all_w = np.clip(all_w, 1.0, cap)
+            self._pos_prob = _normalize_probs(self._all_w[self._pos_idx])
+            self._t450_prob = _normalize_probs(self._all_w[self._t450_idx]) if self._t450_idx.size > 0 else np.array([], dtype=np.float64)
+            self._fgt480_prob = _normalize_probs(self._all_w[self._fgt480_idx]) if self._fgt480_idx.size > 0 else np.array([], dtype=np.float64)
+            self._multi_prob = _normalize_probs(self._all_w[self._multi_idx]) if self._multi_idx.size > 0 else np.array([], dtype=np.float64)
         else:
             self._pos_prob = None
+            self._t450_prob = np.array([], dtype=np.float64)
+            self._fgt480_prob = np.array([], dtype=np.float64)
+            self._multi_prob = np.array([], dtype=np.float64)
 
     def __len__(self) -> int:
         return self._num_batches
@@ -263,7 +390,38 @@ class MultitaskBalancedBatchSampler(Sampler[List[int]]):
             n_pos = int(np.clip(n_pos, min_pos, max_pos))
             n_neg = self.batch_size - n_pos
 
-            pos_draw = rng.choice(self._pos_idx, size=n_pos, replace=True, p=self._pos_prob)
+            if self.enforce_bitmask_quota and n_pos > 0:
+                remaining = n_pos
+                pos_chunks: List[np.ndarray] = []
+
+                def _scaled_quota(per_256: int) -> int:
+                    if per_256 <= 0:
+                        return 0
+                    q = int(round(float(self.batch_size) * (float(per_256) / 256.0)))
+                    return max(1, q)
+
+                quota_specs = [
+                    # Prioritize rarest endpoint first.
+                    (self._fgt480_idx, self._fgt480_prob, _scaled_quota(self.quota_fgt480_per_256)),
+                    (self._t450_idx, self._t450_prob, _scaled_quota(self.quota_t450_per_256)),
+                    (self._multi_idx, self._multi_prob, _scaled_quota(self.quota_multi_per_256)),
+                ]
+
+                for pool_idx, pool_prob, q in quota_specs:
+                    if remaining <= 0 or q <= 0 or pool_idx.size == 0:
+                        continue
+                    take = min(q, remaining)
+                    if take > 0:
+                        pos_chunks.append(rng.choice(pool_idx, size=take, replace=True, p=pool_prob))
+                        remaining -= take
+
+                if remaining > 0:
+                    pos_chunks.append(
+                        rng.choice(self._pos_idx, size=remaining, replace=True, p=self._pos_prob)
+                    )
+                pos_draw = np.concatenate(pos_chunks, axis=0) if len(pos_chunks) > 0 else np.array([], dtype=np.int64)
+            else:
+                pos_draw = rng.choice(self._pos_idx, size=n_pos, replace=True, p=self._pos_prob)
             neg_draw = rng.choice(self._neg_idx, size=n_neg, replace=True)
             batch = np.concatenate([pos_draw, neg_draw], axis=0)
             rng.shuffle(batch)
@@ -279,6 +437,10 @@ def make_balanced_batch_sampler(
     sample_weight_cap: float = 10.0,
     batch_pos_fraction: float = 0.35,
     min_pos_per_batch: int = 1,
+    enforce_bitmask_quota: bool = True,
+    quota_t450_per_256: int = 4,
+    quota_fgt480_per_256: int = 1,
+    quota_multi_per_256: int = 8,
     rare_prev_thr: Optional[float] = None,
     seed: int = 0,
 ) -> MultitaskBalancedBatchSampler:
@@ -290,6 +452,10 @@ def make_balanced_batch_sampler(
         sample_weight_cap=float(sample_weight_cap),
         batch_pos_fraction=float(batch_pos_fraction),
         min_pos_per_batch=int(min_pos_per_batch),
+        enforce_bitmask_quota=bool(enforce_bitmask_quota),
+        quota_t450_per_256=int(quota_t450_per_256),
+        quota_fgt480_per_256=int(quota_fgt480_per_256),
+        quota_multi_per_256=int(quota_multi_per_256),
         rare_prev_thr=rare_prev_thr,
         seed=int(seed),
         drop_last=False,

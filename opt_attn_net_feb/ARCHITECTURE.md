@@ -248,6 +248,7 @@ Task counts:
 - Classification tasks: `4`
 - Auxiliary absorbance heads: `2`
 - Auxiliary fluorescence heads: `4`
+- Auxiliary bitmask-group head: `K+1` classes (`K` train-fold top masks + `other`)
 
 Classification task names (`utils.constants.TASK_COLS`):
 
@@ -269,6 +270,7 @@ Head architecture note:
 - Heads are selected by predictor name (current: V3-like residual MLP predictors; not plain linear layers)
 - Each head uses residual FFN blocks with SwiGLU, LayerNorm, DropPath, and learnable residual scaling
 - Final scalar output per head is produced by a small-gain linear output layer
+- Bitmask-group head (when enabled) uses the same V3 residual predictor style and outputs multi-class logits
 
 ## 3) Losses and Training Objective
 
@@ -299,7 +301,16 @@ For a batch:
 - `loss_cls = mean(lam * per_task_cls)`
 - `loss_abs = reg_loss_weighted(abs_out, y_abs, m_abs, w_abs, reg_loss_type)`
 - `loss_fluo = reg_loss_weighted(fluo_out, y_fluo, m_fluo, w_fluo, reg_loss_type)`
-- `loss_total = loss_cls + lambda_aux_abs * loss_abs + lambda_aux_fluo * loss_fluo`
+- `loss_bitmask = CE(bitmask_logits, bitmask_group_targets, class_weight=bitmask_group_class_weight)` (optional)
+- `loss_total = loss_cls + lambda_aux_abs * loss_abs + lambda_aux_fluo * loss_fluo + lambda_aux_bitmask * loss_bitmask`
+
+Bitmask grouping protocol (no leakage):
+
+- For each CV fold, grouping is built from train-fold labels only:
+  select `top_k` most frequent bitmask IDs, map all remaining masks to `other`.
+- The same train-derived mapping is used for that fold's train and validation steps.
+- For final training, grouping is built from final-train split only and reused on leaderboard split.
+- Group CE class weights are computed from train-fold grouped frequencies only.
 
 Validation metrics:
 
@@ -361,12 +372,23 @@ HPO search space is defined in `training/search_space.py::search_space`.
 - `use_balanced_batch_sampler` (default: `True`): Enables batch-level balancing so training batches are not dominated by all-negative samples.
 - `batch_pos_fraction` (default: `0.35`): Target fraction of positive samples per training batch (positives defined as any active endpoint).
 - `min_pos_per_batch` (default: `1`): Hard lower bound on number of positives per batch when both positive and negative pools exist.
+- `enforce_bitmask_quota` (default: `True`): Enables additional per-batch quotas for rare multitask patterns.
+- `quota_t450_per_256` (default: `4`): Target minimum count of `t1`-positive samples per batch, scaled linearly with batch size from anchor `256`.
+- `quota_fgt480_per_256` (default: `1`): Target minimum count of `t3`-positive samples per batch, scaled linearly with batch size from anchor `256`.
+- `quota_multi_per_256` (default: `8`): Target minimum count of multi-positive samples (`sum_t y_it >= 2`) per batch, scaled from anchor `256`.
+- `use_bitmask_loss_weight` (default: `True`): Enables train-fold bitmask-frequency weighting on `w_cls` to upweight rare endpoint combinations.
+- `bitmask_weight_alpha` (default: `0.5`): Exponent in bitmask rarity weighting (`0` disables effect, larger values increase emphasis on rare patterns).
+- `bitmask_weight_cap` (default: `3.0`): Upper bound for bitmask-frequency multiplier applied to `w_cls`.
 - `lam_t0` (`[0.6, 1.6]`, log): Raw classification-loss multiplier prior for `t0`.
 - `lam_t1` (`[1.0, 2.4]`, log): Raw classification-loss multiplier prior for `t1`.
 - `lam_t2` (`[0.25, 0.9]`, log): Raw classification-loss multiplier prior for `t2`.
 - `lam_t3` (`[1.8, 3.5]`, log): Raw classification-loss multiplier prior for `t3`.
-- `lam_floor` (`[0.25, 1.0]`): Lower bound for normalized per-task lambda weights.
-- `lam_ceil` (`[1.0, 3.5]`): Upper bound for normalized per-task lambda weights.
+- `lam_floor` (`[0.35, 0.85]`): Lower bound for normalized per-task lambda weights; prevents easier tasks from collapsing to near-zero weight but avoids forcing full uniformity.
+- `lam_ceil` (`[1.30, 2.20]`): Upper bound for normalized per-task lambda weights; keeps rare-task emphasis strong without allowing unstable domination.
+- `lambda_aux_bitmask` (`[0.02, 0.08]`): Weight of auxiliary bitmask-group CE loss.
+- `bitmask_group_top_k` (default: `6`): Number of frequent bitmask IDs kept as explicit classes; remaining masks are merged into `other`.
+- `bitmask_group_weight_alpha` (default: `0.5`): Exponent for grouped-class inverse-frequency weighting in bitmask CE.
+- `bitmask_group_weight_cap` (default: `5.0`): Cap for grouped-class CE weight multiplier.
 
 Lambda processing used in training:
 
@@ -409,13 +431,21 @@ Step 4: batch-level positive quota (anti-all-negative guard):
   `high = batch_size - 1` if `|N|>0` else `batch_size`.
 - `n_neg = batch_size - n_pos`.
 
-Step 5: stochastic drawing per batch:
+Step 5: optional bitmask-aware sub-quotas inside positive draw:
 
-- Draw `n_pos` indices from `P` with replacement, probability proportional to `w_i`.
+- If `enforce_bitmask_quota=True`, reserve positive slots (up to available `n_pos`) for:
+  `t3` positives (`quota_fgt480_per_256`), `t1` positives (`quota_t450_per_256`),
+  and multi-positive samples (`quota_multi_per_256`), with per-batch quotas scaled by `batch_size / 256`.
+- Priority order is rarest-first: `t3` -> `t1` -> multi-positive.
+- Quota draws are with replacement and keep rarity-aware probabilities from `w_i`.
+
+Step 6: stochastic drawing per batch:
+
+- Draw remaining positive slots from `P` with replacement, probability proportional to `w_i`.
 - Draw `n_neg` indices from `N` with replacement, uniformly.
 - Concatenate and shuffle.
 
-Step 6: repeat for each batch in epoch:
+Step 7: repeat for each batch in epoch:
 
 - Number of batches is `ceil(num_train_samples / batch_size)` (`drop_last=False`).
 - Because draws use replacement, both positive balancing and rarity oversampling persist throughout the epoch.
@@ -425,8 +455,19 @@ What this guarantees:
 - Batches are not dominated by all-negative samples when positives exist.
 - Oversampling is still active:
   first at batch composition level (`n_pos` quota),
-  then inside positive subset via rarity-aware probabilities (`w_i`).
+  then inside positive subset via rarity-aware probabilities (`w_i`) and optional bitmask quotas.
 - Rare tasks are emphasized without hard task cutoffs.
+
+Bitmask-frequency loss weighting (train fold only):
+
+- Let `m_i` be integer bitmask of sample `i` (e.g., `[1,0,1,0] -> 5`).
+- Let `count(m_i)` be train-fold frequency of bitmask `m_i`.
+- Let `ref = median({count(k) | count(k) > 0})`.
+- Additional sample multiplier:
+  `u_i = clip((ref / count(m_i)) ^ bitmask_weight_alpha, 1, bitmask_weight_cap)`.
+- Training classification weights become:
+  `w_cls_train[i, t] = base_w_cls_train[i, t] * u_i`.
+- Validation/leaderboard weights are not reweighted by bitmask frequency.
 
 Legacy mode:
 
@@ -444,10 +485,11 @@ Illustrative example for your prevalence profile:
   `T340: 3.64`, `T450: 6.10`, `F340450: 1.00`, `Fgt480: 6.86`.
 - So positives from `Fgt480` and `T450` are sampled much more often inside the positive quota.
 
-### 4.4 Auxiliary regression weighting
+### 4.4 Auxiliary weighting
 
 - `lambda_aux_abs` (`[0.05, 0.5]`): Weight of absorbance auxiliary regression loss in total objective.
 - `lambda_aux_fluo` (`[0.05, 0.5]`): Weight of fluorescence auxiliary regression loss in total objective.
+- `lambda_aux_bitmask` (`[0.02, 0.08]`): Weight of bitmask-group auxiliary classification loss in total objective.
 - `reg_loss_type` (fixed: `{mse}`): Regression criterion for auxiliary heads; currently constrained to MSE only in search space.
 
 ### 4.5 HPO objective control
@@ -466,6 +508,8 @@ Fold score formula:
 - Optuna pruning callback is integrated for CV trials
 - Auxiliary targets are standardized using train-fold statistics only
 - Train dataloaders use `MultitaskBalancedBatchSampler` by default (`use_balanced_batch_sampler=True`)
+- Train-fold `w_cls` can be bitmask-frequency reweighted (`use_bitmask_loss_weight=True` by default)
+- Bitmask-group mapping and bitmask-group class weights are computed from train fold only (CV) / train split only (final)
 - Final training stage retrains best config and can export leaderboard attention
 
 ## 6) Guardrails

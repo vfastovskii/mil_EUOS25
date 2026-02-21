@@ -58,6 +58,19 @@ def search_space(trial: Trial) -> Dict[str, Any]:
          "lr": trial.suggest_float("lr", 8e-5, 8e-4, log=True),
          "weight_decay": trial.suggest_float("weight_decay", 3e-6, 3e-4, log=True),
          "batch_size": trial.suggest_categorical("batch_size", [128, 256, 512]),
+
+         # Task mapping
+         # t0 -> Transmittance_340
+         # t1 -> Transmittance_450
+         # t2 -> Fluorescence_340_450
+         # t3 -> Fluorescence_more_than_480
+
+         # POsitive rate per task
+         # T340   : 0.05637 +/- 0.00010  (min 0.05625, max 0.05649)
+         # T450   : 0.01473 +/- 0.00009  (min 0.01462, max 0.01483)
+         # F340450: 0.16686 +/- 0.00006  (min 0.16680, max 0.16695)
+         # Fgt480 : 0.00238 +/- 0.00004  (min 0.00235, max 0.00244)
+
          "posw_clip_t0": trial.suggest_float("posw_clip_t0", 12.0, 28.0, log=True),
          "posw_clip_t1": trial.suggest_float("posw_clip_t1", 35.0, 90.0, log=True),
          "posw_clip_t2": trial.suggest_float("posw_clip_t2", 3.0, 10.0, log=True),
@@ -71,11 +84,13 @@ def search_space(trial: Trial) -> Dict[str, Any]:
          "lam_t1": trial.suggest_float("lam_t1", 1.0, 2.4, log=True),
          "lam_t2": trial.suggest_float("lam_t2", 0.25, 0.9, log=True),
          "lam_t3": trial.suggest_float("lam_t3", 1.8, 3.5, log=True),
-         "lam_floor": trial.suggest_float("lam_floor", 0.25, 1.0),
-         "lam_ceil": trial.suggest_float("lam_ceil", 1.0, 3.5),
-         "lambda_aux_abs": trial.suggest_float("lambda_aux_abs", 0.05, 0.5),
-         "lambda_aux_fluo": trial.suggest_float("lambda_aux_fluo", 0.05, 0.5),
-         "reg_loss_type": trial.suggest_categorical("reg_loss_type", ["mse"]),
+
+        "lam_floor": trial.suggest_float("lam_floor", 0.35, 0.85),
+        "lam_ceil": trial.suggest_float("lam_ceil", 1.30, 2.20),
+        "lambda_aux_abs": trial.suggest_float("lambda_aux_abs", 0.05, 0.5),
+        "lambda_aux_fluo": trial.suggest_float("lambda_aux_fluo", 0.05, 0.5),
+        "lambda_aux_bitmask": trial.suggest_float("lambda_aux_bitmask", 0.02, 0.08),
+        "reg_loss_type": trial.suggest_categorical("reg_loss_type", ["mse"]),
          "min_w": trial.suggest_float("min_w", 0.1, 0.6),
          "accumulate_grad_batches": trial.suggest_categorical("accumulate_grad_batches", [8, 16]),
          "head_stochastic_depth": trial.suggest_float("head_stochastic_depth", 0.0, 0.1)}

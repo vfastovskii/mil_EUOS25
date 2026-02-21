@@ -15,6 +15,7 @@ from .configs import MILModelConfig
 from .constants import NUM_ABS_HEADS, NUM_FLUO_HEADS, NUM_TASKS
 from .embedder_mlp_v3_base import build_mlp_v3_embedder
 from .embedders import build_2d_embedder, build_3d_embedder
+from .head_mlp_v3 import MLPPredictorV3Like
 from .head_utils import apply_shared_heads, apply_task_heads, make_projection
 from .predictors import build_predictor_heads
 from .training import compute_training_losses
@@ -88,7 +89,14 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             lam=lam,
             lambda_aux_abs=float(loss.lambda_aux_abs),
             lambda_aux_fluo=float(loss.lambda_aux_fluo),
+            lambda_aux_bitmask=float(loss.lambda_aux_bitmask),
             reg_loss_type=str(loss.reg_loss_type),
+            bitmask_group_top_ids=(
+                [int(x) for x in (loss.bitmask_group_top_ids or [])]
+            ),
+            bitmask_group_class_weight=(
+                [float(x) for x in (loss.bitmask_group_class_weight or [])]
+            ),
             activation=str(b.activation),
             mol_embedder_name=str(b.mol_embedder_name),
             inst_embedder_name=str(b.inst_embedder_name),
@@ -124,7 +132,10 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         lam: np.ndarray,
         lambda_aux_abs: float,
         lambda_aux_fluo: float,
+        lambda_aux_bitmask: float,
         reg_loss_type: str,
+        bitmask_group_top_ids: Optional[List[int]] = None,
+        bitmask_group_class_weight: Optional[List[float]] = None,
         activation: str = "GELU",
         mol_embedder_name: str = "mlp_v3_2d",
         inst_embedder_name: str = "mlp_v3_3d",
@@ -215,6 +226,64 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             fc2_gain_non_last=float(head_fc2_gain_non_last),
         )
 
+        self.lambda_aux_bitmask = float(lambda_aux_bitmask)
+        top_ids = [int(x) for x in (bitmask_group_top_ids or [])]
+        n_masks = int(1 << NUM_TASKS)
+        top_ids = [m for m in top_ids if 0 <= m < n_masks]
+        # Keep unique order and reserve one "other" group.
+        seen = set()
+        top_ids = [m for m in top_ids if not (m in seen or seen.add(m))]
+        top_ids = top_ids[: max(0, n_masks - 1)]
+        self.bitmask_group_top_ids = top_ids
+        self.bitmask_num_groups = int(len(top_ids) + 1)
+
+        if self.lambda_aux_bitmask > 0.0 and self.bitmask_num_groups >= 2:
+            self.bitmask_head = MLPPredictorV3Like(
+                input_dim=int(mixer_hidden),
+                hidden_dim=int(mixer_hidden),
+                num_layers=int(head_num_layers),
+                expansion=2.0,
+                activation=str(activation),
+                use_glu=True,
+                dropout=float(head_dropout),
+                stochastic_depth=float(head_stochastic_depth),
+                use_layernorm=True,
+                pre_layer_norm=True,
+                output_dim=int(self.bitmask_num_groups),
+                input_layernorm=True,
+                final_layernorm=False,
+                res_scale_init=0.1,
+                inner_multiple=64,
+                head_dropout=0.0,
+                output_bias=None,
+                fc2_gain_non_last=float(head_fc2_gain_non_last),
+                proj_gain=0.5,
+            )
+            mask_to_group = torch.full(
+                (n_masks,),
+                fill_value=int(self.bitmask_num_groups - 1),
+                dtype=torch.long,
+            )
+            for g, mid in enumerate(top_ids):
+                mask_to_group[int(mid)] = int(g)
+            self.register_buffer("bitmask_mask_to_group", mask_to_group)
+
+            cw = (
+                torch.tensor([float(x) for x in bitmask_group_class_weight], dtype=torch.float32)
+                if bitmask_group_class_weight is not None
+                else torch.ones((self.bitmask_num_groups,), dtype=torch.float32)
+            )
+            if cw.numel() != self.bitmask_num_groups:
+                cw = torch.ones((self.bitmask_num_groups,), dtype=torch.float32)
+            self.register_buffer("bitmask_group_class_weight", cw)
+        else:
+            self.bitmask_head = None
+            self.register_buffer(
+                "bitmask_mask_to_group",
+                torch.zeros((n_masks,), dtype=torch.long),
+            )
+            self.register_buffer("bitmask_group_class_weight", torch.ones((1,), dtype=torch.float32))
+
         self.cls_loss = MultiTaskFocal(pos_weight=pos_weight, gamma=gamma)
         self.register_buffer("lam", torch.tensor(lam, dtype=torch.float32))
 
@@ -235,7 +304,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         x3d_pad: torch.Tensor,          # [B,N,F3]
         key_padding_mask: torch.Tensor, # [B,N] True=PAD
         return_attn: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        return_bitmask: bool = False,
+    ):
         self._validate_forward_inputs(x2d=x2d, x3d_pad=x3d_pad, key_padding_mask=key_padding_mask)
         pooled_tasks, attn = self._pool_task_tokens(x3d_pad=x3d_pad, key_padding_mask=key_padding_mask, return_attn=return_attn)
         z_tasks = self._build_task_representations(x2d=x2d, pooled_tasks=pooled_tasks)
@@ -245,10 +315,23 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         z_aux = z_tasks.mean(dim=1)  # [B,mixer_hidden]
         abs_out = apply_shared_heads(z_aux, self.abs_heads)    # [B,2]
         fluo_out = apply_shared_heads(z_aux, self.fluo_heads)  # [B,4]
+        bitmask_logits = self.bitmask_head(z_aux) if self.bitmask_head is not None else None
 
+        if return_attn and return_bitmask:
+            return logits, abs_out, fluo_out, bitmask_logits, attn
         if return_attn:
             return logits, abs_out, fluo_out, attn
+        if return_bitmask:
+            return logits, abs_out, fluo_out, bitmask_logits
         return logits, abs_out, fluo_out
+
+    def _bitmask_group_targets(self, y_cls: torch.Tensor) -> Optional[torch.Tensor]:
+        if self.bitmask_head is None:
+            return None
+        yb = (y_cls > 0.5).long()
+        bits = (1 << torch.arange(NUM_TASKS, device=yb.device, dtype=torch.long)).reshape(1, -1)
+        mask_ids = (yb * bits).sum(dim=1).clamp(min=0, max=int((1 << NUM_TASKS) - 1))
+        return self.bitmask_mask_to_group[mask_ids]
 
     @staticmethod
     def _validate_forward_inputs(
@@ -299,7 +382,14 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x2d, x3d, kpm, y_cls, w_cls, y_abs, m_abs, w_abs, y_fluo, m_fluo, w_fluo = batch
-        logits, abs_out, fluo_out = self(x2d, x3d, kpm, return_attn=False)
+        logits, abs_out, fluo_out, bitmask_logits = self(
+            x2d,
+            x3d,
+            kpm,
+            return_attn=False,
+            return_bitmask=True,
+        )
+        bitmask_targets = self._bitmask_group_targets(y_cls)
 
         with autocast(enabled=False):
             losses = compute_training_losses(
@@ -316,14 +406,23 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 y_fluo=y_fluo,
                 m_fluo=m_fluo,
                 w_fluo=w_fluo,
+                bitmask_logits=bitmask_logits,
+                bitmask_targets=bitmask_targets,
+                bitmask_class_weight=(
+                    self.bitmask_group_class_weight
+                    if self.bitmask_head is not None
+                    else None
+                ),
                 reg_loss_type=self.reg_loss_type,
                 lambda_aux_abs=self.lambda_aux_abs,
                 lambda_aux_fluo=self.lambda_aux_fluo,
+                lambda_aux_bitmask=self.lambda_aux_bitmask,
             )
 
         bs = int(y_cls.shape[0])
         self.log("train_loss", losses.total, on_step=False, on_epoch=True, batch_size=bs)
         self.log("train_cls_loss", losses.cls, on_step=False, on_epoch=True, batch_size=bs)
+        self.log("train_bitmask_loss", losses.bitmask, on_step=False, on_epoch=True, batch_size=bs)
         self.log("train_per_task_loss_mean", losses.per_task.mean(), on_step=False, on_epoch=True, batch_size=bs)
         self.log(
             "train_weighted_per_task_loss_mean",

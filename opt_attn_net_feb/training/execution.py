@@ -19,12 +19,14 @@ from ..data.exports import export_leaderboard_attention
 from ..utils.data_io import align_by_id
 from ..utils.ops import (
     apply_standardizer,
+    build_bitmask_group_definition,
     build_aux_targets_and_masks,
     build_aux_weights,
     build_task_weights,
     coerce_binary_labels,
     fit_standardizer,
     make_balanced_batch_sampler,
+    make_bitmask_sample_weights,
     make_weighted_sampler,
     pos_weight_per_task,
     set_all_seeds,
@@ -168,6 +170,15 @@ class MILFoldTrainer:
         y_abs_sc = apply_standardizer(self.data.y_abs, mu_abs, sd_abs)
         y_fluo_sc = apply_standardizer(self.data.y_fluo, mu_f, sd_f)
 
+        w_cls_tr = np.asarray(self.data.w_cls[train_idx], dtype=np.float32).copy()
+        if bool(cfg.sampler.use_bitmask_loss_weight):
+            bitmask_w = make_bitmask_sample_weights(
+                self.data.y_cls[train_idx],
+                alpha=float(cfg.sampler.bitmask_weight_alpha),
+                cap=float(cfg.sampler.bitmask_weight_cap),
+            )
+            w_cls_tr = (w_cls_tr * bitmask_w.reshape(-1, 1)).astype(np.float32)
+
         ids_tr = [self.data.ids[i] for i in train_idx]
         ids_va = [self.data.ids[i] for i in val_idx]
 
@@ -175,7 +186,7 @@ class MILFoldTrainer:
             ids_tr,
             self.data.X2d_scaled[train_idx],
             self.data.y_cls[train_idx],
-            self.data.w_cls[train_idx],
+            w_cls_tr,
             y_abs_sc[train_idx],
             self.data.m_abs[train_idx],
             self.data.w_abs[train_idx],
@@ -217,6 +228,10 @@ class MILFoldTrainer:
                 sample_weight_cap=float(cfg.sampler.sample_weight_cap),
                 batch_pos_fraction=float(cfg.sampler.batch_pos_fraction),
                 min_pos_per_batch=int(cfg.sampler.min_pos_per_batch),
+                enforce_bitmask_quota=bool(cfg.sampler.enforce_bitmask_quota),
+                quota_t450_per_256=int(cfg.sampler.quota_t450_per_256),
+                quota_fgt480_per_256=int(cfg.sampler.quota_fgt480_per_256),
+                quota_multi_per_256=int(cfg.sampler.quota_multi_per_256),
                 rare_prev_thr=cfg.sampler.rare_prev_thr,
                 seed=int(self.run_config.seed) + 1000 * int(fold_id) + int(self.trial.number),
             )
@@ -247,6 +262,13 @@ class MILFoldTrainer:
             collate_fn=collate_train,
         )
 
+        bitmask_group_top_ids, bitmask_group_class_weight = build_bitmask_group_definition(
+            self.data.y_cls[train_idx],
+            top_k=int(cfg.loss.bitmask_group_top_k),
+            class_weight_alpha=float(cfg.loss.bitmask_group_weight_alpha),
+            class_weight_cap=float(cfg.loss.bitmask_group_weight_cap),
+        )
+
         model = MILModelBuilder.build(
             config=cfg,
             mol_dim=int(self.data.X2d_scaled.shape[1]),
@@ -254,6 +276,8 @@ class MILFoldTrainer:
             pos_weight=posw,
             gamma=gamma_t,
             lam=lam,
+            bitmask_group_top_ids=bitmask_group_top_ids,
+            bitmask_group_class_weight=bitmask_group_class_weight,
         )
 
         fold_ckpt_dir = self.run_config.ckpt_root / f"mil_trial{self.trial.number}_fold{fold_id}"
@@ -509,6 +533,23 @@ class MILFinalTrainer:
         posw = pos_weight_per_task(y_tr, clip=compute_posw_clips(cfg.loss, fallback_clip=50.0))
         gamma_t = compute_gamma(cfg.loss)
 
+        if bool(cfg.sampler.use_bitmask_loss_weight):
+            bitmask_w_tr = make_bitmask_sample_weights(
+                y_tr,
+                alpha=float(cfg.sampler.bitmask_weight_alpha),
+                cap=float(cfg.sampler.bitmask_weight_cap),
+            )
+            w_tr = (np.asarray(w_tr, dtype=np.float32) * bitmask_w_tr.reshape(-1, 1)).astype(
+                np.float32
+            )
+
+        bitmask_group_top_ids, bitmask_group_class_weight = build_bitmask_group_definition(
+            y_tr,
+            top_k=int(cfg.loss.bitmask_group_top_k),
+            class_weight_alpha=float(cfg.loss.bitmask_group_weight_alpha),
+            class_weight_cap=float(cfg.loss.bitmask_group_weight_cap),
+        )
+
         ds_tr = MILTrainDataset(
             ids_tr,
             X2d_tr,
@@ -555,6 +596,10 @@ class MILFinalTrainer:
                 sample_weight_cap=float(cfg.sampler.sample_weight_cap),
                 batch_pos_fraction=float(cfg.sampler.batch_pos_fraction),
                 min_pos_per_batch=int(cfg.sampler.min_pos_per_batch),
+                enforce_bitmask_quota=bool(cfg.sampler.enforce_bitmask_quota),
+                quota_t450_per_256=int(cfg.sampler.quota_t450_per_256),
+                quota_fgt480_per_256=int(cfg.sampler.quota_fgt480_per_256),
+                quota_multi_per_256=int(cfg.sampler.quota_multi_per_256),
                 rare_prev_thr=cfg.sampler.rare_prev_thr,
                 seed=int(self.config.seed) + 4242,
             )
@@ -591,6 +636,8 @@ class MILFinalTrainer:
             pos_weight=posw,
             gamma=gamma_t,
             lam=lam,
+            bitmask_group_top_ids=bitmask_group_top_ids,
+            bitmask_group_class_weight=bitmask_group_class_weight,
         )
 
         final_dir = outdir / "final_best_train_vs_leaderboard"

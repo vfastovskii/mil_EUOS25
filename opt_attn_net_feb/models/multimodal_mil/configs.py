@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass(frozen=True)
@@ -46,7 +46,10 @@ class MILOptimizationConfig:
 class MILLossConfig:
     lambda_aux_abs: float = 0.05
     lambda_aux_fluo: float = 0.05
+    lambda_aux_bitmask: float = 0.05
     reg_loss_type: str = "mse"
+    bitmask_group_top_ids: Optional[List[int]] = None
+    bitmask_group_class_weight: Optional[List[float]] = None
 
 
 @dataclass(frozen=True)

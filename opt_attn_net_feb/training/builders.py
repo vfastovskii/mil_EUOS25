@@ -62,6 +62,8 @@ class MILModelBuilder:
         pos_weight: torch.Tensor,
         gamma: torch.Tensor,
         lam: np.ndarray,
+        bitmask_group_top_ids: list[int] | None = None,
+        bitmask_group_class_weight: np.ndarray | None = None,
     ) -> MILTaskAttnMixerWithAux:
         b = config.backbone
         h = config.heads
@@ -102,7 +104,18 @@ class MILModelBuilder:
             loss=MILLossConfig(
                 lambda_aux_abs=float(loss.lambda_aux_abs),
                 lambda_aux_fluo=float(loss.lambda_aux_fluo),
+                lambda_aux_bitmask=float(loss.lambda_aux_bitmask),
                 reg_loss_type=str(loss.reg_loss_type),
+                bitmask_group_top_ids=(
+                    [int(x) for x in bitmask_group_top_ids]
+                    if bitmask_group_top_ids is not None
+                    else None
+                ),
+                bitmask_group_class_weight=(
+                    [float(x) for x in bitmask_group_class_weight.tolist()]
+                    if bitmask_group_class_weight is not None
+                    else None
+                ),
             ),
         )
         return MILTaskAttnMixerWithAux.from_config(

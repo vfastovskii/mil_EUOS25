@@ -132,6 +132,13 @@ class SamplerConfig:
     use_balanced_batch_sampler: bool = True
     batch_pos_fraction: float = 0.35
     min_pos_per_batch: int = 1
+    enforce_bitmask_quota: bool = True
+    quota_t450_per_256: int = 4
+    quota_fgt480_per_256: int = 1
+    quota_multi_per_256: int = 8
+    use_bitmask_loss_weight: bool = True
+    bitmask_weight_alpha: float = 0.5
+    bitmask_weight_cap: float = 3.0
 
 
 @dataclass(frozen=True)
@@ -202,6 +209,10 @@ class LossWeightingConfig:
     gamma_t3: float = 0.0
     lambda_aux_abs: float = 0.05
     lambda_aux_fluo: float = 0.05
+    lambda_aux_bitmask: float = 0.05
+    bitmask_group_top_k: int = 6
+    bitmask_group_weight_alpha: float = 0.5
+    bitmask_group_weight_cap: float = 5.0
     reg_loss_type: str = "mse"
 
     def per_task_lam(self) -> tuple[float, float, float, float] | None:
@@ -245,6 +256,10 @@ class LossWeightingConfig:
             gamma_t3=float(params.get("gamma_t3", 0.0)),
             lambda_aux_abs=float(params.get("lambda_aux_abs", 0.05)),
             lambda_aux_fluo=float(params.get("lambda_aux_fluo", 0.05)),
+            lambda_aux_bitmask=float(params.get("lambda_aux_bitmask", 0.05)),
+            bitmask_group_top_k=int(params.get("bitmask_group_top_k", 6)),
+            bitmask_group_weight_alpha=float(params.get("bitmask_group_weight_alpha", 0.5)),
+            bitmask_group_weight_cap=float(params.get("bitmask_group_weight_cap", 5.0)),
             reg_loss_type=str(params.get("reg_loss_type", "mse")),
         )
 
@@ -371,6 +386,13 @@ class HPOConfig:
             use_balanced_batch_sampler=bool(params.get("use_balanced_batch_sampler", True)),
             batch_pos_fraction=float(params.get("batch_pos_fraction", 0.35)),
             min_pos_per_batch=int(params.get("min_pos_per_batch", 1)),
+            enforce_bitmask_quota=bool(params.get("enforce_bitmask_quota", True)),
+            quota_t450_per_256=int(params.get("quota_t450_per_256", 4)),
+            quota_fgt480_per_256=int(params.get("quota_fgt480_per_256", 1)),
+            quota_multi_per_256=int(params.get("quota_multi_per_256", 8)),
+            use_bitmask_loss_weight=bool(params.get("use_bitmask_loss_weight", True)),
+            bitmask_weight_alpha=float(params.get("bitmask_weight_alpha", 0.5)),
+            bitmask_weight_cap=float(params.get("bitmask_weight_cap", 3.0)),
         )
 
         loss = LossWeightingConfig.from_params(
