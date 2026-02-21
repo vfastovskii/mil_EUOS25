@@ -39,6 +39,18 @@ from .trainer import LightningTrainerConfig, LightningTrainerFactory, ModelEvalu
 
 
 def _resolve_device(accelerator: str) -> torch.device:
+    """
+    Resolves the device to be used for computation based on the availability of CUDA
+    and the specified accelerator type.
+
+    Parameters:
+    accelerator (str): The desired accelerator type. It can be 'gpu', 'cuda', or other
+                       strings indicating the accelerator preference.
+
+    Returns:
+    torch.device: The resolved computation device, either 'cuda' if available and
+                  requested, or 'cpu' otherwise.
+    """
     return torch.device(
         "cuda" if torch.cuda.is_available() and str(accelerator) in ("gpu", "cuda") else "cpu"
     )
@@ -46,6 +58,25 @@ def _resolve_device(accelerator: str) -> torch.device:
 
 @dataclass(frozen=True)
 class TrainerSystemConfig:
+    """
+    A configuration class for defining system parameters for a trainer.
+
+    This class provides a structured way to define and store configuration settings
+    for training systems. The configuration settings include values for controlling
+    training duration, hardware utilization, and computational precision.
+
+    Attributes:
+        max_epochs: int
+            The maximum number of epochs allowed for training.
+        patience: int
+            The number of epochs to wait for improvement before applying early stopping.
+        accelerator: str
+            The type of hardware accelerator to use for training, such as 'cpu' or 'gpu'.
+        devices: int
+            The number of devices available for distributed training.
+        precision: str
+            The precision to use during training, typically 'float32', 'bfloat16', etc.
+    """
     max_epochs: int
     patience: int
     accelerator: str
@@ -55,6 +86,20 @@ class TrainerSystemConfig:
 
 @dataclass(frozen=True)
 class CVRunConfig:
+    """
+    Configuration for a cross-validation run.
+
+    Encapsulates the settings required for executing a single run of a
+    cross-validation process, including random seed for reproducibility,
+    training system configurations, data loading specifications, and the
+    root path for storing checkpoints.
+
+    Attributes:
+    seed: Random seed for ensuring reproducibility of experiments. Type: int.
+    trainer: Configuration for the training system. Type: TrainerSystemConfig.
+    loader: Configuration for the data loader. Type: LoaderConfig.
+    ckpt_root: Path to the root directory for storing checkpoints. Type: Path.
+    """
     seed: int
     trainer: TrainerSystemConfig
     loader: LoaderConfig
@@ -63,6 +108,24 @@ class CVRunConfig:
 
 @dataclass(frozen=True)
 class StudyConfig:
+    """
+    Represents configuration for a study.
+
+    This class defines the parameters required to configure and execute a study. It
+    includes details such as the output directory, study name, number of trials,
+    direction of optimization, random seed, and pruner warmup steps. The dataclass
+    is immutable to ensure the configuration cannot be altered once initialized.
+
+    Attributes:
+    outdir (Path): The output directory where study results will be stored.
+    study_name (str): The name of the study.
+    n_trials (int): The number of trials to execute in the study.
+    seed (int): The random seed for reproducibility.
+    direction (str, optional): The optimization direction, either "maximize" or
+    "minimize". Defaults to "maximize".
+    pruner_warmup_steps (int, optional): The number of warmup steps before pruning
+    trials. Defaults to 1.
+    """
     outdir: Path
     study_name: str
     n_trials: int
@@ -73,6 +136,13 @@ class StudyConfig:
 
 @dataclass(frozen=True)
 class FinalTrainConfig:
+    """
+    Configuration data class for the final training setup.
+
+    Represents the configuration needed for initiating the final training process,
+    including parameters for seeding, trainer configuration, data loader setup, and
+    optional attention output management.
+    """
     seed: int
     trainer: TrainerSystemConfig
     loader: LoaderConfig
@@ -81,6 +151,36 @@ class FinalTrainConfig:
 
 @dataclass(frozen=True)
 class MILCVData:
+    """
+    MILCVData serves as a container for data related to Multiple Instance Learning (MIL)
+    with cross-validation support. The class aggregates data components including features,
+    labels, weights, IDs, fold information, and metadata for handling MIL-specific datasets.
+
+    The class is designed to hold and organize scaled features, classification and regression
+    labels, sample weights, and additional attributes required for MIL analysis. It also
+    includes fold-specific information and mappings that facilitate the corresponding
+    cross-validation workflows.
+
+    Attributes:
+        X2d_scaled (np.ndarray): Scaled 2D feature array.
+        y_cls (np.ndarray): Classification labels.
+        w_cls (np.ndarray): Weights associated with classification labels.
+        y_abs (np.ndarray): Absolute regression labels.
+        m_abs (np.ndarray): Mask for absolute regression.
+        w_abs (np.ndarray): Weights associated with absolute regression labels.
+        y_fluo (np.ndarray): Fluorescence-related regression labels.
+        m_fluo (np.ndarray): Mask for fluorescence-related regression.
+        w_fluo (np.ndarray): Weights associated with fluorescence-related regression labels.
+        ids (List[str]): Instance or observation identifiers.
+        folds_info (Sequence[Tuple[np.ndarray, np.ndarray, int]]): Cross-validation fold
+            information consisting of training indices, validation indices, and the fold
+            integer identifier.
+        starts (np.ndarray): Start indices for MIL bag-level data.
+        counts (np.ndarray): Instance counts corresponding to MIL bags.
+        id2pos (Dict[str, int]): Mapping from instance/ID to positional index.
+        Xinst_sorted (np.ndarray): Instance-level feature array sorted for efficient
+            processing.
+    """
     X2d_scaled: np.ndarray
     y_cls: np.ndarray
     w_cls: np.ndarray
@@ -100,6 +200,37 @@ class MILCVData:
 
 @dataclass(frozen=True)
 class MILFinalData:
+    """
+    Represents a container for finalized multi-instance learning (MIL) input data.
+
+    This class is designed to organize, store, and maintain information about
+    processed data required for multi-instance learning tasks. The attributes
+    define the structure of input data and metadata, which are critical for
+    handling and processing MIL-specific datasets.
+
+    Attributes:
+        df_full (pd.DataFrame): Full dataset DataFrame, including all data points.
+        id_col (str): Column name in `df_full` representing unique IDs for
+            instances or bags.
+        split_col (str): Column name in `df_full` defining data splits (e.g.,
+            train/test/validation).
+        leaderboard_split (str): Identifier for a specific split designated for
+            leaderboard or evaluation purposes.
+        X2d_file_ids (List[str]): List of file IDs corresponding to 2D features,
+            intended for MIL-specific feature representation.
+        X2d_file (np.ndarray): 2D features in the form of a NumPy array, typically
+            used for MIL representation.
+        starts (np.ndarray): Array of start indices for instances or bags within
+            the dataset, mapping to their corresponding positions.
+        counts (np.ndarray): Array of counts or lengths indicating how many
+            instances are associated with each bag or unique ID.
+        id2pos (Dict[str, int]): Dictionary mapping unique IDs to their positions
+            within the dataset for fast access and lookup.
+        Xinst_sorted (np.ndarray): NumPy array of sorted instance-level features,
+            ensuring organized MIL feature representation.
+        conf_sorted (np.ndarray): NumPy array of sorted confidences, aligning with
+            `Xinst_sorted` for consistent ordering.
+    """
     df_full: pd.DataFrame
     id_col: str
     split_col: str
@@ -121,6 +252,35 @@ def drop_ids_without_bags(
     id2pos: Dict[str, int],
     id_col: str,
 ) -> Tuple[List[str], np.ndarray, pd.DataFrame]:
+    """
+    Filters out IDs that do not have corresponding bags (positions) in the id2pos mapping.
+
+    This function takes a list of IDs, a 2D array, a DataFrame, and a mapping of IDs to
+    positions. It filters the input data to retain only those entries in the list of IDs
+    that are present in the id2pos dictionary. If all IDs are present in the id2pos
+    mapping, the input data is returned as-is.
+
+    Parameters:
+    ids: List[str]
+        A list of IDs to be filtered.
+    X2d: np.ndarray
+        A 2D numpy array corresponding to the provided IDs. The array will be filtered
+        based on the IDs that have corresponding positions in the id2pos mapping.
+    df_part: pd.DataFrame
+        A DataFrame containing data corresponding to the IDs. Rows in the DataFrame
+        will be filtered based on the IDs that have corresponding positions in id2pos.
+    id2pos: Dict[str, int]
+        A dictionary mapping IDs to positions. Only IDs present in this dictionary will
+        be retained in the filtered output.
+    id_col: str
+        The name of the column in the DataFrame that contains the IDs.
+
+    Returns:
+    Tuple[List[str], np.ndarray, pd.DataFrame]
+        A tuple containing the filtered list of IDs, the filtered 2D numpy array, and
+        the filtered DataFrame. Rows and elements in the outputs correspond only to
+        IDs that exist in the id2pos mapping.
+    """
     mask = np.array([(i in id2pos) for i in ids], dtype=bool)
     if mask.all():
         return ids, X2d, df_part
@@ -130,7 +290,26 @@ def drop_ids_without_bags(
 
 
 class MILFoldTrainer:
-    """Runs one CV fold end-to-end with typed config and data contracts."""
+    """
+    Manages training over multiple Instance Learning (MIL) data folds.
+
+    This class orchestrates the MIL training process for a given fold of data
+    evaluation under a trial-specific hyperparameter optimization (HPO) configuration
+    and cross-validation setup. The main goal is to tune the model using relevant
+    parameters and obtain optimized scores while evaluating for each data fold.
+    The fold-specific results and configurations can subsequently be used for
+    model comparison and selection.
+
+    Attributes:
+        trial: Specific trial being executed during HPO search.
+        hpo_config: Configuration instance containing hyperparameters for the training.
+        data: MILCVData instance encapsulating training data and metadata.
+        run_config: Configuration for the runtime setup, including training parameters.
+
+    Methods:
+        run_fold:
+            Executes the training and evaluation for a specific fold of the data.
+    """
 
     def __init__(
         self,
@@ -351,7 +530,20 @@ class MILFoldTrainer:
 
 
 class MILCrossValidator:
-    """Optuna objective implementation with explicit cross-validation class flow."""
+    """
+    Provides functionality for multi-instance learning cross-validation.
+
+    This class is designed to handle the cross-validation process for multi-instance
+    learning (MIL) tasks. It takes in a dataset and configuration details, and
+    performs the necessary evaluation by dividing the dataset into folds, training
+    and validating on these folds, and computing performance scores. It integrates
+    hyperparameter optimization (HPO) and mode selection for evaluating different
+    configurations.
+
+    Attributes:
+        data (MILCVData): The dataset and cross-validation folding information.
+        run_config (CVRunConfig): Configuration details for running the cross-validation.
+    """
 
     def __init__(self, *, data: MILCVData, run_config: CVRunConfig):
         self.data = data
@@ -392,6 +584,13 @@ class MILCrossValidator:
 
 
 class StudyArtifactsWriter:
+    """
+    Provides methods for saving study artifacts and metrics.
+
+    This class defines static methods to save Optuna study artifacts such as trials
+    information and best parameters in structured formats, along with capabilities
+    to save fold-specific metrics in a consistent manner.
+    """
     @staticmethod
     def save_study_artifacts(*, outdir: Path, study: optuna.Study, prefix: str) -> None:
         df_trials = study.trials_dataframe(
@@ -415,7 +614,19 @@ class StudyArtifactsWriter:
 
 
 class MILStudyRunner:
-    """Owns Optuna study creation, optimization, and artifact persistence."""
+    """
+    MILStudyRunner is a class for managing and executing hyperparameter optimization
+    (HPO) studies using the Optuna framework.
+
+    This class is designed to facilitate the creation and execution of machine
+    learning cross-validation studies. It handles study storage, sampler and pruner
+    configuration, and manages the optimization trials and results storage. Users can
+    apply this to systematically tune hyperparameters for machine learning models.
+
+    Attributes:
+        config (StudyConfig): Configuration for the study.
+        cross_validator (MILCrossValidator): Object that evaluates individual trials.
+    """
 
     def __init__(self, *, config: StudyConfig, cross_validator: MILCrossValidator):
         self.config = config
@@ -459,7 +670,31 @@ class MILStudyRunner:
 
 
 class MILFinalTrainer:
-    """Trains best HPO config and exports leaderboard attention outputs."""
+    """
+    Represents a MIL (Multiple Instance Learning) final trainer.
+
+    This class is responsible for configuring, constructing datasets, initializing models,
+    and managing the training process for MIL tasks. It uses the provided configurations
+    and data to execute a training pipeline, including data preparation, loader creation,
+    model building, and trainer setup. The class handles auxiliary target creation,
+    standardization, and sampling strategies to improve the robustness of training.
+    It ensures resources such as data loaders, model instances, and trainer configurations
+    are optimally utilized for evaluation and comparison between training and leaderboard
+    datasets.
+
+    Attributes:
+        config (FinalTrainConfig): Configuration object containing parameters for training,
+            including dataset loader settings, trainer behavior, and other necessary options.
+        loader_builder (DataLoaderBuilder): Builder instance used to create train and
+            evaluation loaders based on the specified data configuration.
+        eval_device: The device resolved for evaluation tasks, based on trainer configuration.
+
+    Methods:
+        run(outdir: Path, best_params: Dict[str, Any], data: MILFinalData) -> None:
+            Executes the full training pipeline. Prepares datasets, applies auxiliary data
+            transformations, builds data loaders, initializes the model, and trains it using
+            a configured trainer. Saves the best model checkpoint for further evaluation.
+    """
 
     def __init__(self, *, config: FinalTrainConfig):
         self.config = config

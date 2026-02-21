@@ -19,6 +19,32 @@ from ..utils.metrics import ap_per_task
 
 @dataclass(frozen=True)
 class LightningTrainerConfig:
+    """
+    Configuration class for LightningTrainer.
+
+    This class serves as a data container for configuring a LightningTrainer.
+    It provides essential properties related to model training, such as the
+    number of epochs, early stopping patience, hardware configuration,
+    gradient accumulation, and checkpoint settings.
+
+    Attributes:
+        max_epochs: int
+            The maximum number of training epochs to run.
+        patience: int
+            The patience value for early stopping in terms of epochs.
+        accelerator: str
+            Backend to use for training, e.g., 'cpu', 'gpu', 'tpu'.
+        devices: int
+            Number of devices to use for training.
+        precision: str
+            Floating-point precision type, e.g., '32', '16', or 'bf16'.
+        accumulate_grad_batches: int
+            Number of batches before performing a gradient update.
+        save_checkpoint: bool
+            Whether to save model checkpoint files during training. Defaults to True.
+        save_weights_only: bool
+            Whether to save only model weights when saving the checkpoint. Defaults to True.
+    """
     max_epochs: int
     patience: int
     accelerator: str
@@ -30,7 +56,18 @@ class LightningTrainerConfig:
 
 
 class LightningTrainerFactory:
-    """Builds deterministic Lightning trainers with project-standard callbacks."""
+    """
+    Factory class responsible for creating and configuring a PyTorch Lightning Trainer instance
+    and optional ModelCheckpoint callback.
+
+    This class provides a method to construct a PyTorch Lightning Trainer with specific configurations
+    determined by the provided LightningTrainerConfig. It also includes functionality for adding
+    callbacks such as early stopping, checkpointing, and Optuna pruning for hyperparameter optimization.
+
+    Attributes:
+        config (LightningTrainerConfig): Configuration object that holds all necessary trainer
+            parameters such as training epochs, checkpoint settings, and acceleration options.
+    """
 
     def __init__(self, config: LightningTrainerConfig):
         self.config = config
@@ -81,7 +118,23 @@ class LightningTrainerFactory:
 
 
 class ModelEvaluator:
-    """Evaluation helper for validation AP metrics at a chosen checkpoint."""
+    """
+    The ModelEvaluator class is responsible for evaluating machine learning models by calculating performance
+    metrics on validation datasets. Its primary purpose is to streamline the process of evaluating a model's
+    effectiveness across various tasks, using provided validation data.
+
+    This utility class operates entirely on a specified computational device and works in a no-grad computation
+    context to optimize performance during evaluation. Its main method processes batches of validation data,
+    applies the model, and aggregates predictions and labels to compute task-based metrics.
+
+    Attributes:
+        device (torch.device): The device on which the evaluation computations will be performed. This could be a CPU
+            or a GPU, depending on the system configuration and model requirements.
+
+    Methods:
+        eval_best_epoch (model, dl_va): Evaluates the provided model on the given validation data loader and returns
+            the computed average precision per task along with its mean.
+    """
 
     def __init__(self, *, device: torch.device):
         self.device = device
@@ -121,7 +174,44 @@ def make_trainer_gpu(
     save_checkpoint: bool = True,
     save_weights_only: bool = True,
 ) -> Tuple[pl.Trainer, Optional[pl.callbacks.ModelCheckpoint]]:
-    """Compatibility wrapper around `LightningTrainerFactory`."""
+    """
+    Creates and returns a PyTorch Lightning Trainer instance configured for GPU
+    training, as well as an optional checkpoint callback. The trainer is configured
+    based on the provided parameters using `LightningTrainerConfig` and
+    `LightningTrainerFactory`.
+
+    Parameters:
+    max_epochs: int
+        The maximum number of epochs to train the model.
+    patience: int
+        The number of epochs to wait for improvement before early stopping.
+    accelerator: str
+        The type of accelerator to use for training (e.g., "gpu").
+    devices: int
+        The number of devices to use for training.
+    precision: str
+        The precision to use during training (e.g., "16", "32").
+    accumulate_grad_batches: int
+        The number of steps to accumulate gradients before performing a backward
+        pass.
+    ckpt_dir: str
+        The directory where the model checkpoints will be saved.
+    trial: Optional[optuna.trial.Trial]
+        An optional Optuna trial instance to perform hyperparameter optimization.
+    save_checkpoint: bool
+        Whether to save checkpoints during training.
+    save_weights_only: bool
+        Whether to save only the model weights, excluding the optimizer state.
+
+    Returns:
+    Tuple[pl.Trainer, Optional[pl.callbacks.ModelCheckpoint]]
+        A tuple containing the initialized PyTorch Lightning Trainer and an
+        optional checkpoint callback.
+
+    Raises:
+        This function does not raise explicit exceptions but may propagate exceptions
+        from `LightningTrainerConfig` or `LightningTrainerFactory`.
+    """
     cfg = LightningTrainerConfig(
         max_epochs=int(max_epochs),
         patience=int(patience),
@@ -137,7 +227,23 @@ def make_trainer_gpu(
 
 @torch.no_grad()
 def eval_best_epoch(model, dl_va: DataLoader, device: torch.device) -> Tuple[float, List[float]]:
-    """Compatibility wrapper around `ModelEvaluator`."""
+    """
+    Evaluates the best epoch for a given model on a validation dataset without computing gradients.
+
+    This method uses a ModelEvaluator instance to evaluate the model's performance
+    on a given DataLoader for the validation set. The evaluation is carried out in
+    a no-grad context to improve memory efficiency and speed during inference. The
+    resulting loss and additional metrics are returned.
+
+    Arguments:
+        model (torch.nn.Module): The PyTorch model to evaluate.
+        dl_va (DataLoader): The DataLoader for the validation dataset.
+        device (torch.device): The device on which the evaluation will be performed.
+
+    Returns:
+        Tuple[float, List[float]]: A tuple containing the average loss (float) and a list
+        of additional metric scores (List[float]).
+    """
     return ModelEvaluator(device=device).eval_best_epoch(model, dl_va)
 
 
