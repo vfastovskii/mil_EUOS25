@@ -510,6 +510,8 @@ Fold score formula:
 - Train dataloaders use `MultitaskBalancedBatchSampler` by default (`use_balanced_batch_sampler=True`)
 - Train-fold `w_cls` can be bitmask-frequency reweighted (`use_bitmask_loss_weight=True` by default)
 - Bitmask-group mapping and bitmask-group class weights are computed from train fold only (CV) / train split only (final)
+- HPO runs only when CLI flag `--run_hpo` is provided
+- Without `--run_hpo`, pipeline loads params from `--best_params_json`; if omitted, defaults to `<study_dir>/multimodal_mil_aux_gpu_best_params.json`
 - Final training stage retrains best config and can export leaderboard attention
 
 ## 6) Guardrails

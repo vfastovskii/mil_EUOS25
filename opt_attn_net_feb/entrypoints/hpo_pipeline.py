@@ -165,6 +165,20 @@ class CLIExportConfig:
 
 
 @dataclass(frozen=True)
+class CLIHPOControlConfig:
+    """
+    Controls whether HPO is executed or precomputed params are loaded.
+
+    Attributes:
+        run_hpo: If True, run Optuna CV optimization.
+        best_params_json: Optional path to JSON file with best params in the
+            same format as `<study_name>_best_params.json`.
+    """
+    run_hpo: bool
+    best_params_json: str | None
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     """
     Represents configuration for a processing pipeline.
@@ -182,12 +196,14 @@ class PipelineConfig:
         splits: Configuration for data splitting (e.g., training/testing splits).
         runtime: Configuration for runtime behaviors and settings.
         export: Configuration for exporting the results of the pipeline.
+        hpo: Controls if optimization is run or loaded from file.
     """
     data_paths: CLIDataPathsConfig
     columns: CLIColumnsConfig
     splits: CLISplitsConfig
     runtime: CLIRuntimeConfig
     export: CLIExportConfig
+    hpo: CLIHPOControlConfig
 
 
 @dataclass(frozen=True)
@@ -289,6 +305,12 @@ class PipelineConfigFactory:
             export=CLIExportConfig(
                 attn_out=args.attn_out,
             ),
+            hpo=CLIHPOControlConfig(
+                run_hpo=bool(args.run_hpo),
+                best_params_json=(
+                    None if args.best_params_json is None else str(args.best_params_json)
+                ),
+            ),
         )
 
 
@@ -322,6 +344,8 @@ class PipelineEnvironmentFactory:
             "nn_devices": int(self.config.runtime.nn_devices),
             "precision": str(self.config.runtime.precision),
             "patience": int(self.config.runtime.patience),
+            "run_hpo": bool(self.config.hpo.run_hpo),
+            "best_params_json": self.config.hpo.best_params_json,
             "argv": " ".join([str(x) for x in (argv if argv is not None else os.sys.argv)]),
             "weight_cols": WEIGHT_COLS,
             "model": "MILTaskAttnMixerWithAux (task-specific attention queries)",
@@ -496,16 +520,23 @@ class MILPipelineOrchestrator:
             f"num_workers={env.num_workers} pin_memory={env.pin_memory} "
             f"precision={self.config.runtime.precision}"
         )
-        ckpt_root = env.outdir / "_tmp_best_ckpts"
-        ckpt_root.mkdir(parents=True, exist_ok=True)
+        ckpt_root: Path | None = None
 
-        study = self._run_hpo(env=env, hpo_data=hpo_data, ckpt_root=ckpt_root)
-        self._run_final(env=env, hpo_data=hpo_data, study=study)
+        if bool(self.config.hpo.run_hpo):
+            ckpt_root = env.outdir / "_tmp_best_ckpts"
+            ckpt_root.mkdir(parents=True, exist_ok=True)
+            study = self._run_hpo(env=env, hpo_data=hpo_data, ckpt_root=ckpt_root)
+            best_params = dict(study.best_params)
+        else:
+            best_params = self._load_best_params(outdir=env.outdir)
 
-        try:
-            shutil.rmtree(ckpt_root, ignore_errors=True)
-        except Exception:
-            pass
+        self._run_final(env=env, hpo_data=hpo_data, best_params=best_params)
+
+        if ckpt_root is not None:
+            try:
+                shutil.rmtree(ckpt_root, ignore_errors=True)
+            except Exception:
+                pass
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
@@ -538,7 +569,24 @@ class MILPipelineOrchestrator:
         )
         return study_runner.run()
 
-    def _run_final(self, *, env: PipelineEnvironment, hpo_data: PreparedHPOData, study):
+    def _load_best_params(self, *, outdir: Path) -> dict[str, Any]:
+        explicit = self.config.hpo.best_params_json
+        if explicit is not None:
+            path = Path(explicit)
+        else:
+            path = outdir / "multimodal_mil_aux_gpu_best_params.json"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Best-params file not found: {path}. "
+                "Run with --run_hpo or provide --best_params_json <file>."
+            )
+        payload = json.loads(path.read_text())
+        if not isinstance(payload, dict):
+            raise ValueError(f"Expected JSON object in {path}, got {type(payload).__name__}")
+        print(f"[HPO] using precomputed params from: {path}")
+        return dict(payload)
+
+    def _run_final(self, *, env: PipelineEnvironment, hpo_data: PreparedHPOData, best_params: dict[str, Any]):
         c = self.config.columns
         p = self.config.data_paths
         split = self.config.splits
@@ -592,7 +640,7 @@ class MILPipelineOrchestrator:
         )
         MILFinalTrainer(config=final_cfg).run(
             outdir=env.outdir,
-            best_params=dict(study.best_params),
+            best_params=dict(best_params),
             data=final_data,
         )
 
@@ -637,6 +685,19 @@ def _parse_args(argv: Any | None = None):
     ap.add_argument("--patience", type=int, default=20)
     ap.add_argument("--trials", type=int, default=50)
     ap.add_argument("--trials_mil", type=int, default=None)
+    ap.add_argument(
+        "--run_hpo",
+        action="store_true",
+        help="Run Optuna CV optimization before final train.",
+    )
+    ap.add_argument(
+        "--best_params_json",
+        default=None,
+        help=(
+            "Path to precomputed best params JSON (pipeline format). "
+            "Used when --run_hpo is not set."
+        ),
+    )
 
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--nn_accelerator", default="gpu")
