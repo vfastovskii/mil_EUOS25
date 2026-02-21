@@ -7,6 +7,34 @@ from optuna.trial import Trial
 
 
 def search_space(trial: Trial) -> Dict[str, Any]:
+    """
+    Generates a dictionary defining a hyperparameter search space for optimization.
+
+    This function specifies a comprehensive set of hyperparameters to be tuned for
+    training a machine learning model using an optimization library, such as Optuna.
+    These parameters include network architecture settings (e.g., layer dimensions,
+    dropout rates, activation functions), optimization parameters (e.g., learning
+    rate, weight decay), regularization settings, and other training-specific
+    configurations. It also applies specific constraints to ensure validity,
+    such as aligning certain parameter relationships, e.g., divisibility
+    requirements. The returned dictionary is tailored for dimensionality
+    restrictions, extensible component selection, and specific tasks.
+
+    Parameters:
+    trial : Trial
+        The trial object representing the current parameter configuration being
+        tested within the search space.
+
+    Raises:
+    optuna.TrialPruned
+        If specific constraints between parameters are not satisfied, such as the
+        `inst_hidden` size not being divisible by the number of attention heads.
+
+    Returns:
+    Dict[str, Any]
+        A dictionary containing the suggested values for each parameter within the
+        specified hyperparameter search space.
+    """
     p = {
         # Dimension-capped search: keep effective layer widths <= 1024.
         # (With V3 gated FFNs, internal width is ~4x hidden_dim.)
@@ -28,7 +56,7 @@ def search_space(trial: Trial) -> Dict[str, Any]:
         "aggregator_name": trial.suggest_categorical("aggregator_name", ["task_attention_pool"]),
         "predictor_name": trial.suggest_categorical("predictor_name", ["mlp_v3"]),
         # Shared predictor-head architecture knobs (applied to all heads)
-        "head_num_layers": trial.suggest_categorical("head_num_layers", [2, 4, 6]),
+        "head_num_layers": trial.suggest_categorical("head_num_layers", [2, 3, 4, 6]),
         "head_dropout": trial.suggest_float("head_dropout", 0.0, 0.2),
         "head_fc2_gain_non_last": trial.suggest_categorical("head_fc2_gain_non_last", [1e-3, 3e-3, 1e-2]),
         # Activation choice for encoders and mixer
@@ -44,9 +72,9 @@ def search_space(trial: Trial) -> Dict[str, Any]:
         "gamma_t1": trial.suggest_float("gamma_t1", 0.0, 4.0),
         "gamma_t2": trial.suggest_float("gamma_t2", 0.0, 4.0),
         "gamma_t3": trial.suggest_float("gamma_t3", 0.0, 4.0),
-        "rare_oversample_mult": trial.suggest_float("rare_oversample_mult", 0.0, 200.0),
-        "rare_prev_thr": trial.suggest_float("rare_prev_thr", 0.005, 0.05),
-        "sample_weight_cap": trial.suggest_float("sample_weight_cap", 2.0, 20.0),
+        "rare_oversample_mult": trial.suggest_float("rare_oversample_mult", 0.0, 20.0),
+        "rare_target_prev": trial.suggest_float("rare_target_prev", 0.03, 0.30),
+        "sample_weight_cap": trial.suggest_float("sample_weight_cap", 5.0, 10.0),
         # Prior lambda_power was low; keep per-task lambda search close to neutral.
         "lam_t0": trial.suggest_float("lam_t0", 0.25, 3.0, log=True),
         "lam_t1": trial.suggest_float("lam_t1", 0.25, 3.0, log=True),
@@ -61,11 +89,7 @@ def search_space(trial: Trial) -> Dict[str, Any]:
         "min_w": trial.suggest_float("min_w", 0.1, 0.6),
         "accumulate_grad_batches": trial.suggest_categorical("accumulate_grad_batches", [8, 16]),
     }
-    if int(p["head_num_layers"]) == 1:
-        # No depth schedule when only one block is present.
-        p["head_stochastic_depth"] = 0.0
-    else:
-        p["head_stochastic_depth"] = trial.suggest_float("head_stochastic_depth", 0.0, 0.1)
+    p["head_stochastic_depth"] = trial.suggest_float("head_stochastic_depth", 0.0, 0.1)
     if int(p["inst_hidden"]) % int(p["attn_heads"]) != 0:
         raise optuna.TrialPruned("inst_hidden must be divisible by attn_heads")
     return p

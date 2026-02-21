@@ -137,13 +137,30 @@ class DataLoaderBuilder:
             kw["prefetch_factor"] = 2
         return kw
 
-    def train_loader(self, dataset, *, batch_size: int, sampler, collate_fn):
+    def train_loader(
+        self,
+        dataset,
+        *,
+        batch_size: int,
+        sampler=None,
+        batch_sampler=None,
+        collate_fn=None,
+    ):
+        kw = self._loader_kwargs()
+        if batch_sampler is not None:
+            return DataLoader(
+                dataset,
+                batch_sampler=batch_sampler,
+                collate_fn=collate_fn,
+                **kw,
+            )
         return DataLoader(
             dataset,
             batch_size=int(batch_size),
             sampler=sampler,
+            shuffle=(sampler is None),
             collate_fn=collate_fn,
-            **self._loader_kwargs(),
+            **kw,
         )
 
     def eval_loader(self, dataset, *, batch_size: int, collate_fn):

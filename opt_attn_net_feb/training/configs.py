@@ -126,8 +126,12 @@ class SamplerConfig:
     It is designed to be immutable due to the `frozen` attribute.
     """
     rare_oversample_mult: float = 0.0
-    rare_prev_thr: float = 0.02
+    rare_target_prev: float = 0.10
+    rare_prev_thr: float | None = None
     sample_weight_cap: float = 10.0
+    use_balanced_batch_sampler: bool = True
+    batch_pos_fraction: float = 0.35
+    min_pos_per_batch: int = 1
 
 
 @dataclass(frozen=True)
@@ -359,8 +363,14 @@ class HPOConfig:
 
         sampler = SamplerConfig(
             rare_oversample_mult=float(params.get("rare_oversample_mult", 0.0)),
-            rare_prev_thr=float(params.get("rare_prev_thr", 0.02)),
+            rare_target_prev=float(params.get("rare_target_prev", 0.10)),
+            rare_prev_thr=(
+                float(params["rare_prev_thr"]) if "rare_prev_thr" in params else None
+            ),
             sample_weight_cap=float(params.get("sample_weight_cap", 10.0)),
+            use_balanced_batch_sampler=bool(params.get("use_balanced_batch_sampler", True)),
+            batch_pos_fraction=float(params.get("batch_pos_fraction", 0.35)),
+            min_pos_per_batch=int(params.get("min_pos_per_batch", 1)),
         )
 
         loss = LossWeightingConfig.from_params(

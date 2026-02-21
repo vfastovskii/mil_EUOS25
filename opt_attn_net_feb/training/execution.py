@@ -24,6 +24,7 @@ from ..utils.ops import (
     build_task_weights,
     coerce_binary_labels,
     fit_standardizer,
+    make_balanced_batch_sampler,
     make_weighted_sampler,
     pos_weight_per_task,
     set_all_seeds,
@@ -207,19 +208,39 @@ class MILFoldTrainer:
             seed=int(self.run_config.seed) + 999 + int(fold_id),
         )
 
-        sampler = make_weighted_sampler(
-            self.data.y_cls[train_idx],
-            rare_mult=float(cfg.sampler.rare_oversample_mult),
-            rare_prev_thr=float(cfg.sampler.rare_prev_thr),
-            sample_weight_cap=float(cfg.sampler.sample_weight_cap),
-        )
-
-        dl_tr = self.loader_builder.train_loader(
-            ds_tr,
-            batch_size=int(cfg.runtime.batch_size),
-            sampler=sampler,
-            collate_fn=collate_train,
-        )
+        if bool(cfg.sampler.use_balanced_batch_sampler):
+            batch_sampler = make_balanced_batch_sampler(
+                self.data.y_cls[train_idx],
+                batch_size=int(cfg.runtime.batch_size),
+                rare_mult=float(cfg.sampler.rare_oversample_mult),
+                rare_target_prev=float(cfg.sampler.rare_target_prev),
+                sample_weight_cap=float(cfg.sampler.sample_weight_cap),
+                batch_pos_fraction=float(cfg.sampler.batch_pos_fraction),
+                min_pos_per_batch=int(cfg.sampler.min_pos_per_batch),
+                rare_prev_thr=cfg.sampler.rare_prev_thr,
+                seed=int(self.run_config.seed) + 1000 * int(fold_id) + int(self.trial.number),
+            )
+            dl_tr = self.loader_builder.train_loader(
+                ds_tr,
+                batch_size=int(cfg.runtime.batch_size),
+                batch_sampler=batch_sampler,
+                collate_fn=collate_train,
+            )
+            sampler = batch_sampler
+        else:
+            sampler = make_weighted_sampler(
+                self.data.y_cls[train_idx],
+                rare_mult=float(cfg.sampler.rare_oversample_mult),
+                rare_target_prev=float(cfg.sampler.rare_target_prev),
+                sample_weight_cap=float(cfg.sampler.sample_weight_cap),
+                rare_prev_thr=cfg.sampler.rare_prev_thr,
+            )
+            dl_tr = self.loader_builder.train_loader(
+                ds_tr,
+                batch_size=int(cfg.runtime.batch_size),
+                sampler=sampler,
+                collate_fn=collate_train,
+            )
         dl_va = self.loader_builder.eval_loader(
             ds_va,
             batch_size=min(128, int(cfg.runtime.batch_size)),
@@ -525,19 +546,38 @@ class MILFinalTrainer:
             seed=int(self.config.seed) + 999,
         )
 
-        sampler_tr = make_weighted_sampler(
-            y_tr,
-            rare_mult=float(cfg.sampler.rare_oversample_mult),
-            rare_prev_thr=float(cfg.sampler.rare_prev_thr),
-            sample_weight_cap=float(cfg.sampler.sample_weight_cap),
-        )
-
-        dl_tr = self.loader_builder.train_loader(
-            ds_tr,
-            batch_size=int(cfg.runtime.batch_size),
-            sampler=sampler_tr,
-            collate_fn=collate_train,
-        )
+        if bool(cfg.sampler.use_balanced_batch_sampler):
+            sampler_tr = make_balanced_batch_sampler(
+                y_tr,
+                batch_size=int(cfg.runtime.batch_size),
+                rare_mult=float(cfg.sampler.rare_oversample_mult),
+                rare_target_prev=float(cfg.sampler.rare_target_prev),
+                sample_weight_cap=float(cfg.sampler.sample_weight_cap),
+                batch_pos_fraction=float(cfg.sampler.batch_pos_fraction),
+                min_pos_per_batch=int(cfg.sampler.min_pos_per_batch),
+                rare_prev_thr=cfg.sampler.rare_prev_thr,
+                seed=int(self.config.seed) + 4242,
+            )
+            dl_tr = self.loader_builder.train_loader(
+                ds_tr,
+                batch_size=int(cfg.runtime.batch_size),
+                batch_sampler=sampler_tr,
+                collate_fn=collate_train,
+            )
+        else:
+            sampler_tr = make_weighted_sampler(
+                y_tr,
+                rare_mult=float(cfg.sampler.rare_oversample_mult),
+                rare_target_prev=float(cfg.sampler.rare_target_prev),
+                sample_weight_cap=float(cfg.sampler.sample_weight_cap),
+                rare_prev_thr=cfg.sampler.rare_prev_thr,
+            )
+            dl_tr = self.loader_builder.train_loader(
+                ds_tr,
+                batch_size=int(cfg.runtime.batch_size),
+                sampler=sampler_tr,
+                collate_fn=collate_train,
+            )
         dl_val = self.loader_builder.eval_loader(
             ds_lb,
             batch_size=min(128, int(cfg.runtime.batch_size)),

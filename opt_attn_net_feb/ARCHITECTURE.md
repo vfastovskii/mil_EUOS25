@@ -329,9 +329,9 @@ HPO search space is defined in `training/search_space.py::search_space`.
 - `inst_embedder_name` (fixed: `{mlp_v3_3d}`): 3D instance embedder implementation selected from registry.
 - `aggregator_name` (fixed: `{task_attention_pool}`): 3D token aggregator selected from registry.
 - `predictor_name` (fixed: `{mlp_v3}`): Predictor head family selected from registry.
-- `head_num_layers` (`{1, 2}`): Shared residual predictor depth for all classification/aux heads.
+- `head_num_layers` (`{2, 3, 4, 6}`): Shared residual predictor depth for all classification/aux heads.
 - `head_dropout` (`[0.0, 0.2]`): Shared dropout inside residual predictor blocks across all heads.
-- `head_stochastic_depth` (`[0.0, 0.1]`, conditional): Shared DropPath rate for heads; fixed to `0.0` when `head_num_layers=1`.
+- `head_stochastic_depth` (`[0.0, 0.1]`): Shared DropPath rate for residual predictor blocks in all heads.
 - `head_fc2_gain_non_last` (`{1e-3, 3e-3, 1e-2}`): Shared non-last residual block `fc2` init gain in all heads (controls early optimization speed).
 - `activation` (`{GELU, SiLU, Mish, ReLU, LeakyReLU}`): Nonlinearity selection passed to embedder and mixer blocks.
 
@@ -346,9 +346,12 @@ HPO search space is defined in `training/search_space.py::search_space`.
 
 - `posw_clip_t0..t3` (each `[10, 200]`, log): Upper bound for per-task positive class weights used by BCE; prevents extreme rare-class amplification.
 - `gamma_t0..t3` (each `[0, 4]`): Focal exponents per task; higher gamma increases focus on hard examples and downweights easy ones.
-- `rare_oversample_mult` (`[0, 200]`): Multiplier for sampler weights on samples positive for rare tasks.
-- `rare_prev_thr` (`[0.005, 0.05]`): Prevalence threshold defining which tasks are considered rare for oversampling.
-- `sample_weight_cap` (`[2.0, 20.0]`): Maximum per-sample sampler weight; limits oversampling aggressiveness.
+- `rare_oversample_mult` (`[0, 20]`): Multiplier for dynamic rarity score in sampler weights (`w = 1 + rare_oversample_mult * rarity` before clipping).
+- `rare_target_prev` (`[0.03, 0.30]`): Task prevalence target used for smooth multitask rarity; tasks below target get proportionally stronger oversampling.
+- `sample_weight_cap` (`[5.0, 10.0]`): Maximum per-sample sampler weight; limits oversampling aggressiveness.
+- `use_balanced_batch_sampler` (default: `True`): Enables batch-level balancing so training batches are not dominated by all-negative samples.
+- `batch_pos_fraction` (default: `0.35`): Target fraction of positive samples per training batch (positives defined as any active endpoint).
+- `min_pos_per_batch` (default: `1`): Hard lower bound on number of positives per batch when both positive and negative pools exist.
 - `lam_t0..t3` (each `[0.25, 3.0]`, log): Raw per-task classification loss multipliers before normalization.
 - `lam_floor` (`[0.25, 1.0]`): Lower bound for normalized per-task lambda weights.
 - `lam_ceil` (`[1.0, 3.5]`): Upper bound for normalized per-task lambda weights.
@@ -359,6 +362,75 @@ Lambda processing used in training:
 - Values are clipped by `lam_floor/lam_ceil`.
 - Weights are renormalized by mean again.
 - Final `lam` scales per-task focal loss before averaging.
+
+Sampler rarity processing used in training:
+
+Definitions:
+
+- Let `y_it in {0,1}` be label of sample `i` for task `t` (`t=0..3`).
+- Let `p_t = mean_i(y_it)` be task prevalence in the current train fold.
+- Let `P = {i : sum_t y_it > 0}` be samples positive for at least one task.
+- Let `N = {i : sum_t y_it = 0}` be all-negative samples.
+
+Step 1: task rarity (auto mode):
+
+- `r_t = clip((rare_target_prev - p_t) / rare_target_prev, 0, 1)`.
+- Interpretation:
+  `r_t = 0` means task is not rare w.r.t. the target.
+  `r_t -> 1` means task is much rarer than target.
+
+Step 2: per-sample rarity:
+
+- `r_i = max_t(y_it * r_t)`.
+- A sample is considered "more rare" if it is positive on a rarer task.
+
+Step 3: rarity-aware sample weight:
+
+- `w_i = clip(1 + rare_oversample_mult * r_i, 1, sample_weight_cap)`.
+- This weight controls preference among positives during batch construction.
+
+Step 4: batch-level positive quota (anti-all-negative guard):
+
+- `target_pos = round(batch_size * batch_pos_fraction)`.
+- `n_pos = clip(max(min_pos_per_batch, target_pos), low, high)`, where:
+  `low = 1` if `|P|>0` else `0`;
+  `high = batch_size - 1` if `|N|>0` else `batch_size`.
+- `n_neg = batch_size - n_pos`.
+
+Step 5: stochastic drawing per batch:
+
+- Draw `n_pos` indices from `P` with replacement, probability proportional to `w_i`.
+- Draw `n_neg` indices from `N` with replacement, uniformly.
+- Concatenate and shuffle.
+
+Step 6: repeat for each batch in epoch:
+
+- Number of batches is `ceil(num_train_samples / batch_size)` (`drop_last=False`).
+- Because draws use replacement, both positive balancing and rarity oversampling persist throughout the epoch.
+
+What this guarantees:
+
+- Batches are not dominated by all-negative samples when positives exist.
+- Oversampling is still active:
+  first at batch composition level (`n_pos` quota),
+  then inside positive subset via rarity-aware probabilities (`w_i`).
+- Rare tasks are emphasized without hard task cutoffs.
+
+Legacy mode:
+
+- If old params contain `rare_prev_thr`, sampler uses hard-threshold task rarity:
+  task is rare iff `p_t < rare_prev_thr`.
+  This is kept only for backward compatibility with previous studies.
+
+Illustrative example for your prevalence profile:
+
+- If fold prevalences are approximately
+  `T340=0.056`, `T450=0.0147`, `F340450=0.1669`, `Fgt480=0.0024`
+  and `rare_target_prev=0.10`, then:
+  `r ~= [0.44, 0.85, 0.00, 0.98]`.
+- With `rare_oversample_mult=6`, pre-cap weights for positives are roughly:
+  `T340: 3.64`, `T450: 6.10`, `F340450: 1.00`, `Fgt480: 6.86`.
+- So positives from `Fgt480` and `T450` are sampled much more often inside the positive quota.
 
 ### 4.4 Auxiliary regression weighting
 
@@ -381,6 +453,7 @@ Fold score formula:
 - Deterministic trainer setup is enabled
 - Optuna pruning callback is integrated for CV trials
 - Auxiliary targets are standardized using train-fold statistics only
+- Train dataloaders use `MultitaskBalancedBatchSampler` by default (`use_balanced_batch_sampler=True`)
 - Final training stage retrains best config and can export leaderboard attention
 
 ## 6) Guardrails

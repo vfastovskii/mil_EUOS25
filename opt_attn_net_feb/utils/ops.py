@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from typing import List, Optional, Set, Tuple, Dict
+import math
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 import pytorch_lightning as pl
-from torch.utils.data import WeightedRandomSampler
+from torch.utils.data import Sampler, WeightedRandomSampler
 
 from .constants import (
     TASK_COLS,
@@ -119,38 +120,180 @@ def lambda_from_prevalence(y: np.ndarray, power: float) -> np.ndarray:
 def make_weighted_sampler(
     y: np.ndarray,
     rare_mult: float,
-    rare_prev_thr: float = 0.02,
+    rare_target_prev: float = 0.10,
     sample_weight_cap: float = 10.0,
+    rare_prev_thr: Optional[float] = None,
 ) -> WeightedRandomSampler:
     """
-    Build a data-driven oversampling sampler.
+    Build a multitask oversampling sampler.
 
     - Compute per-task prevalence p_t = mean(y[:, t]).
-    - Mark tasks rare if p_t < rare_prev_thr.
-    - Per-sample weight: 1 + rare_mult * I(sample is positive for ANY rare task).
+    - Preferred mode (default): task rarity is a smooth deficiency score based on
+      `rare_target_prev`: deficiency_t = clip((target - p_t) / target, 0, 1).
+      Per-sample rarity = max_t(y_it * deficiency_t).
+      Weight: 1 + rare_mult * rarity_i.
+    - Legacy fallback mode: if `rare_prev_thr` is provided, use hard thresholding
+      (rare if p_t < rare_prev_thr) and binary per-sample rarity.
     - Clamp weights to [1, sample_weight_cap] to avoid extreme oversampling.
 
     Args:
         y: Binary labels array of shape (N, T).
         rare_mult: Oversampling multiplier applied to positives of rare tasks.
-        rare_prev_thr: Prevalence threshold to define rare tasks.
+        rare_target_prev: Target prevalence used to compute smooth rarity in auto mode.
         sample_weight_cap: Upper cap for per-sample weight.
+        rare_prev_thr: Optional legacy hard threshold. If provided, overrides auto mode.
     """
     y = (y > 0).astype(np.int64)
     if y.ndim != 2 or y.shape[1] == 0:
         w = np.ones((y.shape[0],), dtype=np.float64)
     else:
-        prev = y.mean(axis=0)
-        rare_tasks = prev < float(rare_prev_thr)
-        if rare_tasks.any():
-            rare_pos = (y[:, rare_tasks].sum(axis=1) > 0).astype(np.float64)
-            w = 1.0 + float(rare_mult) * rare_pos
+        prev = y.mean(axis=0).astype(np.float64)
+
+        if rare_prev_thr is not None:
+            # Backward-compatible behavior for older configs.
+            severity = (prev < float(rare_prev_thr)).astype(np.float64)
+        else:
+            target = float(np.clip(float(rare_target_prev), 1e-6, 1.0))
+            severity = np.clip((target - prev) / target, 0.0, 1.0)
+
+        if np.any(severity > 0.0):
+            sample_rarity = np.max(
+                y.astype(np.float64) * severity.reshape(1, -1),
+                axis=1,
+            )
+            w = 1.0 + float(rare_mult) * sample_rarity
         else:
             w = np.ones((y.shape[0],), dtype=np.float64)
     cap = max(1.0, float(sample_weight_cap))
     w = np.clip(w, 1.0, cap)
     w_t = torch.tensor(w, dtype=torch.double)
     return WeightedRandomSampler(weights=w_t, num_samples=len(w_t), replacement=True)
+
+
+class MultitaskBalancedBatchSampler(Sampler[List[int]]):
+    """
+    Batch sampler that enforces a positive quota per batch for multitask training.
+
+    Positives are sampled with rarity-aware weights, negatives uniformly.
+    """
+
+    def __init__(
+        self,
+        *,
+        y: np.ndarray,
+        batch_size: int,
+        rare_mult: float,
+        rare_target_prev: float = 0.10,
+        sample_weight_cap: float = 10.0,
+        batch_pos_fraction: float = 0.35,
+        min_pos_per_batch: int = 1,
+        rare_prev_thr: Optional[float] = None,
+        seed: int = 0,
+        drop_last: bool = False,
+    ):
+        yb = (np.asarray(y) > 0).astype(np.int64)
+        if yb.ndim != 2:
+            raise ValueError(f"Expected y to have shape [N,T], got shape {yb.shape}")
+        if yb.shape[0] == 0:
+            raise ValueError("Cannot build batch sampler with empty dataset.")
+
+        self.y = yb
+        self.batch_size = int(max(1, batch_size))
+        self.rare_mult = float(rare_mult)
+        self.rare_target_prev = float(rare_target_prev)
+        self.sample_weight_cap = float(sample_weight_cap)
+        self.batch_pos_fraction = float(np.clip(batch_pos_fraction, 0.0, 1.0))
+        self.min_pos_per_batch = int(max(0, min_pos_per_batch))
+        self.rare_prev_thr = rare_prev_thr
+        self.seed = int(seed)
+        self.drop_last = bool(drop_last)
+        self._epoch = 0
+
+        n = int(self.y.shape[0])
+        self._num_batches = (
+            n // self.batch_size if self.drop_last else int(math.ceil(n / self.batch_size))
+        )
+        self._all_idx = np.arange(n, dtype=np.int64)
+
+        any_pos = self.y.sum(axis=1) > 0
+        self._pos_idx = np.flatnonzero(any_pos)
+        self._neg_idx = np.flatnonzero(~any_pos)
+
+        if self._pos_idx.size > 0:
+            prev = self.y.mean(axis=0).astype(np.float64)
+            if self.rare_prev_thr is not None:
+                severity = (prev < float(self.rare_prev_thr)).astype(np.float64)
+            else:
+                target = float(np.clip(self.rare_target_prev, 1e-6, 1.0))
+                severity = np.clip((target - prev) / target, 0.0, 1.0)
+            sample_rarity = np.max(self.y.astype(np.float64) * severity.reshape(1, -1), axis=1)
+            pos_w = 1.0 + self.rare_mult * sample_rarity[self._pos_idx]
+            cap = max(1.0, self.sample_weight_cap)
+            pos_w = np.clip(pos_w, 1.0, cap)
+            den = float(pos_w.sum())
+            if den > 0.0:
+                self._pos_prob = pos_w / den
+            else:
+                self._pos_prob = np.full((self._pos_idx.size,), 1.0 / float(self._pos_idx.size))
+        else:
+            self._pos_prob = None
+
+    def __len__(self) -> int:
+        return self._num_batches
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self._epoch)
+        self._epoch += 1
+
+        has_pos = self._pos_idx.size > 0
+        has_neg = self._neg_idx.size > 0
+
+        for _ in range(self._num_batches):
+            if not has_pos or not has_neg:
+                batch = rng.choice(self._all_idx, size=self.batch_size, replace=True)
+                yield batch.tolist()
+                continue
+
+            target_pos = int(round(self.batch_size * self.batch_pos_fraction))
+            n_pos = max(self.min_pos_per_batch, target_pos)
+            min_pos = 1 if has_pos else 0
+            max_pos = self.batch_size - 1 if has_neg else self.batch_size
+            if max_pos < min_pos:
+                max_pos = min_pos
+            n_pos = int(np.clip(n_pos, min_pos, max_pos))
+            n_neg = self.batch_size - n_pos
+
+            pos_draw = rng.choice(self._pos_idx, size=n_pos, replace=True, p=self._pos_prob)
+            neg_draw = rng.choice(self._neg_idx, size=n_neg, replace=True)
+            batch = np.concatenate([pos_draw, neg_draw], axis=0)
+            rng.shuffle(batch)
+            yield batch.tolist()
+
+
+def make_balanced_batch_sampler(
+    y: np.ndarray,
+    *,
+    batch_size: int,
+    rare_mult: float,
+    rare_target_prev: float = 0.10,
+    sample_weight_cap: float = 10.0,
+    batch_pos_fraction: float = 0.35,
+    min_pos_per_batch: int = 1,
+    rare_prev_thr: Optional[float] = None,
+    seed: int = 0,
+) -> MultitaskBalancedBatchSampler:
+    return MultitaskBalancedBatchSampler(
+        y=y,
+        batch_size=int(batch_size),
+        rare_mult=float(rare_mult),
+        rare_target_prev=float(rare_target_prev),
+        sample_weight_cap=float(sample_weight_cap),
+        batch_pos_fraction=float(batch_pos_fraction),
+        min_pos_per_batch=int(min_pos_per_batch),
+        rare_prev_thr=rare_prev_thr,
+        seed=int(seed),
+        drop_last=False,
+    )
 
 
 def fit_standardizer(y: np.ndarray, m: np.ndarray, tr_idx: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
