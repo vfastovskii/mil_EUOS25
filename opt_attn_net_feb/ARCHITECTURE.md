@@ -344,15 +344,27 @@ HPO search space is defined in `training/search_space.py::search_space`.
 
 ### 4.3 Class imbalance and task balancing
 
-- `posw_clip_t0..t3` (each `[10, 200]`, log): Upper bound for per-task positive class weights used by BCE; prevents extreme rare-class amplification.
-- `gamma_t0..t3` (each `[0, 4]`): Focal exponents per task; higher gamma increases focus on hard examples and downweights easy ones.
-- `rare_oversample_mult` (`[0, 20]`): Multiplier for dynamic rarity score in sampler weights (`w = 1 + rare_oversample_mult * rarity` before clipping).
-- `rare_target_prev` (`[0.03, 0.30]`): Task prevalence target used for smooth multitask rarity; tasks below target get proportionally stronger oversampling.
-- `sample_weight_cap` (`[5.0, 10.0]`): Maximum per-sample sampler weight; limits oversampling aggressiveness.
+- Task index mapping for `t0..t3`:
+  `t0=Transmittance_340`, `t1=Transmittance_450`,
+  `t2=Fluorescence_340_450`, `t3=Fluorescence_more_than_480`.
+- `posw_clip_t0` (`[12, 28]`, log): BCE positive-weight clip for `t0` (moderate imbalance, ~5.6% positives).
+- `posw_clip_t1` (`[35, 90]`, log): BCE positive-weight clip for `t1` (strong imbalance, ~1.5% positives).
+- `posw_clip_t2` (`[3, 10]`, log): BCE positive-weight clip for `t2` (least imbalanced task, ~16.7% positives).
+- `posw_clip_t3` (`[90, 220]`, log): BCE positive-weight clip for `t3` (extreme rarity, ~0.24% positives), bounded for stability.
+- `gamma_t0` (`[0.5, 2.0]`): Focal gamma for `t0`; moderate hard-example emphasis.
+- `gamma_t1` (`[1.0, 3.0]`): Focal gamma for `t1`; stronger focus on rare positives.
+- `gamma_t2` (`[0.0, 1.5]`): Focal gamma for `t2`; lighter focusing due to higher prevalence.
+- `gamma_t3` (`[1.5, 4.0]`): Focal gamma for `t3`; strongest hard-example focus.
+- `rare_oversample_mult` (`[2.0, 10.0]`): Multiplier for dynamic rarity score in sampler weights (`w = 1 + rare_oversample_mult * rarity` before clipping).
+- `rare_target_prev` (`[0.06, 0.12]`): Target prevalence for rarity scoring; centered to boost rare endpoints without forcing oversampling of the ~16.7% task.
+- `sample_weight_cap` (`[6.0, 9.0]`): Maximum per-sample sampler weight; tighter cap to avoid runaway repetition of very rare positives.
 - `use_balanced_batch_sampler` (default: `True`): Enables batch-level balancing so training batches are not dominated by all-negative samples.
 - `batch_pos_fraction` (default: `0.35`): Target fraction of positive samples per training batch (positives defined as any active endpoint).
 - `min_pos_per_batch` (default: `1`): Hard lower bound on number of positives per batch when both positive and negative pools exist.
-- `lam_t0..t3` (each `[0.25, 3.0]`, log): Raw per-task classification loss multipliers before normalization.
+- `lam_t0` (`[0.6, 1.6]`, log): Raw classification-loss multiplier prior for `t0`.
+- `lam_t1` (`[1.0, 2.4]`, log): Raw classification-loss multiplier prior for `t1`.
+- `lam_t2` (`[0.25, 0.9]`, log): Raw classification-loss multiplier prior for `t2`.
+- `lam_t3` (`[1.8, 3.5]`, log): Raw classification-loss multiplier prior for `t3`.
 - `lam_floor` (`[0.25, 1.0]`): Lower bound for normalized per-task lambda weights.
 - `lam_ceil` (`[1.0, 3.5]`): Upper bound for normalized per-task lambda weights.
 
