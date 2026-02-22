@@ -14,7 +14,7 @@ except Exception:  # pragma: no cover
     from lightning.pytorch.callbacks import Callback  # type: ignore
 
 from ..callbacks.optuna_pruning import OptunaPruningCallbackLocal
-from ..utils.metrics import ap_per_task
+from ..utils.metrics import ap_per_task, roc_auc_per_task
 
 
 @dataclass(frozen=True)
@@ -140,7 +140,7 @@ class ModelEvaluator:
         self.device = device
 
     @torch.no_grad()
-    def eval_best_epoch(self, model, dl_va: DataLoader) -> Tuple[float, List[float]]:
+    def eval_best_epoch(self, model, dl_va: DataLoader) -> Tuple[float, List[float], float, List[float]]:
         model.eval()
         model.to(self.device)
         ps, ys, ws = [], [], []
@@ -159,7 +159,8 @@ class ModelEvaluator:
         Y = np.concatenate(ys, axis=0).astype(int)
         W = np.concatenate(ws, axis=0).astype(np.float32)
         aps = ap_per_task(Y, P, w_cls=W, weighted_tasks=(0, 1))
-        return float(np.mean(aps)), aps
+        aucs = roc_auc_per_task(Y, P, w_cls=W, weighted_tasks=(0, 1))
+        return float(np.mean(aps)), aps, float(np.mean(aucs)), aucs
 
 
 def make_trainer_gpu(
@@ -226,7 +227,11 @@ def make_trainer_gpu(
 
 
 @torch.no_grad()
-def eval_best_epoch(model, dl_va: DataLoader, device: torch.device) -> Tuple[float, List[float]]:
+def eval_best_epoch(
+    model,
+    dl_va: DataLoader,
+    device: torch.device,
+) -> Tuple[float, List[float], float, List[float]]:
     """
     Evaluates the best epoch for a given model on a validation dataset without computing gradients.
 

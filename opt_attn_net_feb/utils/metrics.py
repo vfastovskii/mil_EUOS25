@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import List, Optional, Tuple
 
 import numpy as np
-from sklearn.metrics import average_precision_score
+from sklearn.metrics import average_precision_score, roc_auc_score
 
 
 def ap_per_task(
@@ -35,4 +35,35 @@ def ap_per_task(
             out.append(float(average_precision_score(y_true[:, t], p_pred[:, t], sample_weight=sw)))
         except ValueError:
             out.append(0.0)
+    return out
+
+
+def roc_auc_per_task(
+    y_true: np.ndarray,
+    p_pred: np.ndarray,
+    w_cls: Optional[np.ndarray] = None,
+    weighted_tasks: Tuple[int, ...] = (0, 1),
+) -> List[float]:
+    """Compute ROC-AUC per task with optional sample weights.
+
+    For tasks where ROC-AUC is undefined (all positives or all negatives),
+    returns 0.5 as a neutral fallback.
+    """
+    y_true = y_true.astype(int)
+    p_pred = np.nan_to_num(p_pred, nan=0.0, posinf=1.0, neginf=0.0)
+    p_pred = np.clip(p_pred, 0.0, 1.0)
+
+    out: List[float] = []
+    for t in range(4):
+        yt = y_true[:, t]
+        if yt.min() == yt.max():
+            out.append(0.5)
+            continue
+        sw = None
+        if w_cls is not None and t in weighted_tasks:
+            sw = np.asarray(w_cls[:, t], dtype=float)
+        try:
+            out.append(float(roc_auc_score(yt, p_pred[:, t], sample_weight=sw)))
+        except ValueError:
+            out.append(0.5)
     return out

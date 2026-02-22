@@ -516,6 +516,27 @@ Notes:
 - `fold_score` is what you see as `score=...` in fold logs.
 - Printed `min_w` is rounded for display, while objective computation uses full precision.
 
+### 4.6 Optuna pruning strategy
+
+The CV-HPO stage uses delayed, less aggressive pruning by default:
+
+- `pruner_kind` (default: `percentile`): selects Optuna pruner type.
+- `pruner_warmup_steps` (default: `8`): no pruning decisions before this many reported steps.
+- `pruner_startup_trials` (default: `10`): first trials run without pruning-based elimination.
+- `pruner_percentile` (default: `25.0`): threshold for `PercentilePruner` (lower percentile = less aggressive pruning).
+
+Behavior:
+
+- If `pruner_kind == "percentile"`:
+  use `optuna.pruners.PercentilePruner(percentile=25.0, n_startup_trials=10, n_warmup_steps=8)`.
+- If `pruner_kind == "median"`:
+  use `optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=8)`.
+
+Rationale:
+
+- Rare-task AP often stabilizes later, so earlier defaults could prune promising trials too soon.
+- Longer warmup and startup windows reduce premature pruning while still controlling HPO cost.
+
 ## 5) Training Behavior (non-search)
 
 - Early stopping + checkpoint monitor: `val_macro_ap`

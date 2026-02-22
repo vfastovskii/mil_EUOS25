@@ -16,6 +16,7 @@ from optuna.trial import Trial
 from ..data.collate import collate_export, collate_train
 from ..data.datasets import MILExportDataset, MILTrainDataset
 from ..data.exports import export_leaderboard_attention
+from ..utils.constants import TASK_COLS
 from ..utils.data_io import align_by_id
 from ..utils.ops import (
     apply_standardizer,
@@ -498,7 +499,7 @@ class MILFoldTrainer:
                 model.load_state_dict(ckpt["state_dict"], strict=True)
 
         evaluator = ModelEvaluator(device=self.eval_device)
-        best_macro, best_aps = evaluator.eval_best_epoch(model, dl_va)
+        best_macro, best_aps, best_macro_auc, best_aucs = evaluator.eval_best_epoch(model, dl_va)
         best_min = float(np.min(best_aps))
 
         min_w = float(cfg.objective.min_w)
@@ -506,15 +507,19 @@ class MILFoldTrainer:
 
         print(
             f"[MIL-TASK-ATTN] trial={self.trial.number} fold={fold_id} trained_epochs={epochs_trained} "
-            f"best_epoch={best_epoch} best_macro_ap={best_macro:.6f} min_ap={best_min:.6f} "
-            f"aps={best_aps} score={fold_score:.6f} mode={cfg.objective.mode} min_w={min_w:.2f}"
+            f"best_epoch={best_epoch} best_macro_pr_auc={best_macro:.6f} min_pr_auc={best_min:.6f} "
+            f"best_macro_roc_auc={best_macro_auc:.6f} pr_aucs={best_aps} roc_aucs={best_aucs} "
+            f"score={fold_score:.6f} mode={cfg.objective.mode} min_w={min_w:.2f}"
         )
 
         detail = {
             "trained_epochs": epochs_trained,
             "best_epoch": best_epoch,
             "macro_ap_best_epoch": float(best_macro),
+            "macro_pr_auc_best_epoch": float(best_macro),
+            "macro_auc_best_epoch": float(best_macro_auc),
             "min_ap_best_epoch": best_min,
+            "min_pr_auc_best_epoch": best_min,
             "score": fold_score,
             "objective_mode": str(cfg.objective.mode),
             "min_w": min_w,
@@ -522,6 +527,14 @@ class MILFoldTrainer:
             "ap_task1": float(best_aps[1]),
             "ap_task2": float(best_aps[2]),
             "ap_task3": float(best_aps[3]),
+            "pr_auc_task0": float(best_aps[0]),
+            "pr_auc_task1": float(best_aps[1]),
+            "pr_auc_task2": float(best_aps[2]),
+            "pr_auc_task3": float(best_aps[3]),
+            "auc_task0": float(best_aucs[0]),
+            "auc_task1": float(best_aucs[1]),
+            "auc_task2": float(best_aucs[2]),
+            "auc_task3": float(best_aucs[3]),
             "accumulate_grad_batches": int(cfg.runtime.accumulate_grad_batches),
         }
 
@@ -925,18 +938,38 @@ class MILFinalTrainer:
                 print(f"[FINAL] loaded best ckpt: {best_path}")
 
         evaluator = ModelEvaluator(device=self.eval_device)
-        macro_ap_lb, aps_lb = evaluator.eval_best_epoch(model, dl_val)
+        macro_ap_lb, aps_lb, macro_auc_lb, aucs_lb = evaluator.eval_best_epoch(model, dl_val)
         eval_json = {
             "macro_ap": float(macro_ap_lb),
+            "macro_pr_auc": float(macro_ap_lb),
+            "macro_auc": float(macro_auc_lb),
             "ap_task0": float(aps_lb[0]),
             "ap_task1": float(aps_lb[1]),
             "ap_task2": float(aps_lb[2]),
             "ap_task3": float(aps_lb[3]),
+            "pr_auc_task0": float(aps_lb[0]),
+            "pr_auc_task1": float(aps_lb[1]),
+            "pr_auc_task2": float(aps_lb[2]),
+            "pr_auc_task3": float(aps_lb[3]),
+            "auc_task0": float(aucs_lb[0]),
+            "auc_task1": float(aucs_lb[1]),
+            "auc_task2": float(aucs_lb[2]),
+            "auc_task3": float(aucs_lb[3]),
             "best_epoch": best_epoch,
             "best_ckpt_path": best_ckpt_path,
         }
         (final_dir / "leaderboard_eval.json").write_text(json.dumps(eval_json, indent=2))
-        print(f"[FINAL] leaderboard eval: macro_ap={macro_ap_lb:.6f} aps={aps_lb}")
+        print(
+            f"[FINAL] leaderboard eval: macro_pr_auc={macro_ap_lb:.6f} macro_roc_auc={macro_auc_lb:.6f} "
+            f"pr_aucs={aps_lb} roc_aucs={aucs_lb}"
+        )
+
+        pd.DataFrame(
+            {
+                "task": list(TASK_COLS),
+                "auc": [float(x) for x in aucs_lb],
+            }
+        ).to_csv(final_dir / "leaderboard_auc_per_task.csv", index=False)
 
         export_ds = MILExportDataset(
             ids_lb,
