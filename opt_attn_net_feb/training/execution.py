@@ -113,7 +113,7 @@ class StudyConfig:
 
     This class defines the parameters required to configure and execute a study. It
     includes details such as the output directory, study name, number of trials,
-    direction of optimization, random seed, and pruner warmup steps. The dataclass
+    direction of optimization, random seed, and pruning configuration. The dataclass
     is immutable to ensure the configuration cannot be altered once initialized.
 
     Attributes:
@@ -123,15 +123,24 @@ class StudyConfig:
     seed (int): The random seed for reproducibility.
     direction (str, optional): The optimization direction, either "maximize" or
     "minimize". Defaults to "maximize".
+    pruner_kind (str, optional): Pruner type, either "percentile" or "median".
+        Defaults to "percentile".
     pruner_warmup_steps (int, optional): The number of warmup steps before pruning
-    trials. Defaults to 1.
+        trials. Defaults to 8.
+    pruner_startup_trials (int, optional): Number of full trials to run before
+        enabling pruning decisions. Defaults to 10.
+    pruner_percentile (float, optional): Percentile threshold used by
+        PercentilePruner. Lower values are less aggressive. Defaults to 25.0.
     """
     outdir: Path
     study_name: str
     n_trials: int
     seed: int
     direction: str = "maximize"
-    pruner_warmup_steps: int = 1
+    pruner_kind: str = "percentile"
+    pruner_warmup_steps: int = 8
+    pruner_startup_trials: int = 10
+    pruner_percentile: float = 25.0
 
 
 @dataclass(frozen=True)
@@ -638,9 +647,18 @@ class MILStudyRunner:
     def run(self) -> optuna.Study:
         self.config.outdir.mkdir(parents=True, exist_ok=True)
         sampler = optuna.samplers.TPESampler(seed=int(self.config.seed))
-        pruner = optuna.pruners.MedianPruner(
-            n_warmup_steps=int(self.config.pruner_warmup_steps)
-        )
+        if str(self.config.pruner_kind).lower() == "median":
+            pruner = optuna.pruners.MedianPruner(
+                n_startup_trials=int(self.config.pruner_startup_trials),
+                n_warmup_steps=int(self.config.pruner_warmup_steps),
+            )
+        else:
+            # Default: less aggressive than median pruning for sparse multitask AP.
+            pruner = optuna.pruners.PercentilePruner(
+                percentile=float(self.config.pruner_percentile),
+                n_startup_trials=int(self.config.pruner_startup_trials),
+                n_warmup_steps=int(self.config.pruner_warmup_steps),
+            )
         study = optuna.create_study(
             direction=str(self.config.direction),
             sampler=sampler,

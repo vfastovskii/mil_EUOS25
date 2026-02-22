@@ -497,9 +497,24 @@ Illustrative example for your prevalence profile:
 - `objective_mode` (fixed: `macro_plus_min`): Trial score combines overall AP and worst-task AP to discourage neglecting harder tasks.
 - `min_w` (`[0.1, 0.6]`): Weight of `min_ap` in score.
 
-Fold score formula:
+Per-fold metric definitions:
 
-- `score = (1 - min_w) * macro_ap + min_w * min_ap`
+- `aps = [ap_task0, ap_task1, ap_task2, ap_task3]`
+- `macro_ap = mean(aps)`
+- `min_ap = min(aps)`
+
+Per-fold objective:
+
+- `fold_score = (1 - min_w) * macro_ap + min_w * min_ap`
+
+Optuna trial objective across CV folds:
+
+- `trial_value = mean(fold_score_fold0, fold_score_fold1, ..., fold_score_foldK)`
+
+Notes:
+
+- `fold_score` is what you see as `score=...` in fold logs.
+- Printed `min_w` is rounded for display, while objective computation uses full precision.
 
 ## 5) Training Behavior (non-search)
 
