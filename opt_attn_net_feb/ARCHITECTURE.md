@@ -555,3 +555,33 @@ Rationale:
 - No compatibility alias modules for removed paths
 - No duplicated implementations across layers
 - No wildcard exports (`import *`) in package surfaces
+
+## 7) Chem-ACE Explainability
+
+Chem-ACE implementation lives in:
+
+- `explainability/chem_ace/config.py`
+- `explainability/chem_ace/types.py`
+- `explainability/chem_ace/patches/*`
+- `explainability/chem_ace/embedding/*`
+- `explainability/chem_ace/concepts/*`
+- `explainability/chem_ace/semantics/*`
+- `explainability/chem_ace/cav/*`
+- `explainability/chem_ace/db/*`
+- `explainability/chem_ace/analytics/*`
+- `entrypoints/chem_ace_demo.py`
+
+Flow:
+
+1. Patch generation:
+   local subgraphs, BRICS, Murcko, optional Pharm3D features.
+2. Patch embeddings:
+   activation-layer embeddings via masked input or node-pooling strategy.
+3. Concept discovery:
+   k-means / hierarchical / optional HDBSCAN, with support/coherence filtering and centroid deduplication.
+4. Semantic tagging:
+   charge, conjugation/aromaticity, geometry, pharmacophore role tags + `label_auto`.
+5. CAV/TCAV:
+   repeated random counterexample sets, per-task sign-rate and mean directional derivative.
+6. Persistence and analytics:
+   SQLAlchemy/SQLite concept DB with immutable concept-set snapshots and query API for trend/collapse analysis.

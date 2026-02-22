@@ -1,0 +1,20 @@
+{
+  "rules": [
+    {
+      "label": "carboxylate-like anion",
+      "required_tags": ["anionic", "HBA"]
+    },
+    {
+      "label": "cationic amine",
+      "required_tags": ["cationic", "HBD"]
+    },
+    {
+      "label": "planar aromatic pi-system",
+      "required_tags": ["planar", "aromatic pi-system"]
+    },
+    {
+      "label": "HBD/HBA pair",
+      "required_tags": ["HBD/HBA pair"]
+    }
+  ]
+}
