@@ -13,6 +13,7 @@ from .configs import (  # noqa: F401
 )
 from .execution import (  # noqa: F401
     CVRunConfig,
+    FinalExplainabilityConfig,
     FinalTrainConfig,
     MILCVData,
     MILCrossValidator,
@@ -47,6 +48,7 @@ __all__ = [
     "TrainerSystemConfig",
     "CVRunConfig",
     "StudyConfig",
+    "FinalExplainabilityConfig",
     "FinalTrainConfig",
     "MILCVData",
     "MILFinalData",

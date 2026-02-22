@@ -585,3 +585,57 @@ Flow:
    repeated random counterexample sets, per-task sign-rate and mean directional derivative.
 6. Persistence and analytics:
    SQLAlchemy/SQLite concept DB with immutable concept-set snapshots and query API for trend/collapse analysis.
+
+## 8) Integrated Explainability In Final Pipeline
+
+Final MIL training (`MILFinalTrainer`) now supports integrated Chem-ACE and Lambda-Vol with CLI flags:
+
+- `--run_chem_ace`
+- `--run_lambda_vol` (auto-enables Chem-ACE)
+
+### 8.1 Chem-ACE in pipeline
+
+During final optimized run, Chem-ACE concept preparation uses:
+
+- `ID` + `curated_SMILES` from labels table
+- per-`ID` 2D vectors
+- per-(`ID`,`conf_id`) merged 3D+QM vectors
+
+Implementation entry:
+
+- `training/explainability_runtime.py::prepare_chem_ace_bundle`
+
+Design:
+
+- patch generation runs per molecule and per selected conformer ID (configurable cap)
+- Pharm3D patch generation is disabled in integrated mode by default for scale stability
+- each patch gets a fused embedding: `2D slice + 3D/QM slice + patch descriptors + patch-type one-hot`
+- concept discovery + semantic tagging are persisted in Chem-ACE SQLite DB
+- concept-to-molecule and concept-to-(ID,conf_id) membership maps are produced for monitoring
+
+### 8.2 Lambda-Vol during training
+
+Lambda-Vol is attached as a Lightning callback in final training:
+
+- `training/explainability_runtime.py::build_lambda_vol_callback`
+- callback class: `explainability/lambda_vol/integrations/lightning.py::LambdaVolLightningCallback`
+
+Per validation epoch, provider collects:
+
+- task/concept attention support and prevalence using conformer-level attention weights
+- attention entropy and witness rate per task
+- TCAV per task/concept from current model layer activations + gradients (`collect_gradients_for_layer`, `run_tcav_from_arrays`)
+- task metrics from trainer callback metrics
+
+These frames feed `LambdaVolMonitor`, which computes pressure dynamics, regime labels, alerts, and recommendations, then exports artifacts on fit end.
+
+### 8.3 Output artifacts
+
+Final run writes:
+
+- `final_best_train_vs_leaderboard/explainability_artifacts.json`
+
+This file points to:
+
+- Chem-ACE DB/artifacts directory
+- Lambda-Vol tensor/log/HTML outputs (3D manifold/lattice, alerts, recommendations)

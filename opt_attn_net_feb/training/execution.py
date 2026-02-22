@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 import gc
@@ -34,6 +34,12 @@ from ..utils.ops import (
 )
 from .builders import DataLoaderBuilder, LoaderConfig, MILModelBuilder
 from .configs import HPOConfig
+from .explainability_runtime import (
+    FinalExplainabilityConfig,
+    build_lambda_vol_callback,
+    make_monitor_loader,
+    prepare_chem_ace_bundle,
+)
 from .loss_config import compute_gamma, compute_lam, compute_posw_clips
 from .search_space import search_space
 from .trainer import LightningTrainerConfig, LightningTrainerFactory, ModelEvaluator
@@ -157,6 +163,7 @@ class FinalTrainConfig:
     trainer: TrainerSystemConfig
     loader: LoaderConfig
     attn_out: str | None = None
+    explainability: FinalExplainabilityConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -853,6 +860,29 @@ class MILFinalTrainer:
             seed=int(self.config.seed) + 999,
         )
 
+        explain_cfg = self.config.explainability
+        if explain_cfg is not None and bool(explain_cfg.run_lambda_vol) and not bool(explain_cfg.run_chem_ace):
+            explain_cfg = replace(explain_cfg, run_chem_ace=True)
+
+        chem_bundle = None
+        if explain_cfg is not None and bool(explain_cfg.run_chem_ace):
+            ids_scope = sorted(set(ids_tr).union(set(ids_lb)))
+            chem_bundle = prepare_chem_ace_bundle(
+                config=explain_cfg,
+                outdir=outdir,
+                seed=int(self.config.seed),
+                df_full=data.df_full,
+                id_col=data.id_col,
+                ids_scope=ids_scope,
+                ids_2d_file=data.X2d_file_ids,
+                X2d_file=data.X2d_file,
+                starts=data.starts,
+                counts=data.counts,
+                id2pos=data.id2pos,
+                conf_sorted=data.conf_sorted,
+                Xinst_sorted=data.Xinst_sorted,
+            )
+
         if bool(cfg.sampler.use_balanced_batch_sampler):
             sampler_tr = make_balanced_batch_sampler(
                 y_tr,
@@ -895,6 +925,28 @@ class MILFinalTrainer:
             collate_fn=collate_train,
         )
 
+        lambda_vol_cb = None
+        if explain_cfg is not None and bool(explain_cfg.run_lambda_vol) and (chem_bundle is not None):
+            monitor_loader = make_monitor_loader(
+                ids=ids_lb,
+                x2d=X2d_lb,
+                starts=data.starts,
+                counts=data.counts,
+                id2pos=data.id2pos,
+                xinst_sorted=data.Xinst_sorted,
+                conf_sorted=data.conf_sorted,
+                batch_size=min(64, int(cfg.runtime.batch_size)),
+                seed=int(self.config.seed) + 707,
+                loader_cfg=self.config.loader,
+            )
+            lambda_vol_cb = build_lambda_vol_callback(
+                config=explain_cfg,
+                outdir=outdir,
+                seed=int(self.config.seed),
+                monitor_loader=monitor_loader,
+                chem_bundle=chem_bundle,
+            )
+
         model = MILModelBuilder.build(
             config=cfg,
             mol_dim=int(X2d_tr.shape[1]),
@@ -923,6 +975,7 @@ class MILFinalTrainer:
         trainer, ckpt_cb = LightningTrainerFactory(trainer_cfg).build(
             ckpt_dir=str(final_dir),
             trial=None,
+            extra_callbacks=([lambda_vol_cb] if lambda_vol_cb is not None else None),
         )
         trainer.fit(model, dl_tr, dl_val)
 
@@ -990,12 +1043,41 @@ class MILFinalTrainer:
         out_path = Path(self.config.attn_out) if self.config.attn_out else (outdir / "leaderboard_attn.csv")
         export_leaderboard_attention(model, export_dl, device=self.eval_device, out_path=out_path)
 
+        explainability_payload: dict[str, Any] = {}
+        if chem_bundle is not None:
+            explainability_payload["chem_ace"] = {
+                "output_dir": str(chem_bundle.output_dir),
+                "db_uri": str(chem_bundle.db_uri),
+                "run_id": str(chem_bundle.run_id),
+                "concept_set_id": str(chem_bundle.concept_set_id),
+                "n_concepts": int(len(chem_bundle.concept_ids)),
+                "concept_ids": [str(x) for x in chem_bundle.concept_ids],
+            }
+        if lambda_vol_cb is not None:
+            lv_art = getattr(lambda_vol_cb, "last_artifacts", None)
+            if lv_art is not None:
+                explainability_payload["lambda_vol"] = {
+                    "tensor_npz": str(lv_art.tensor_npz),
+                    "long_csv": str(lv_art.long_csv),
+                    "metadata_json": str(lv_art.metadata_json),
+                    "lattice_html": str(lv_art.lattice_html),
+                    "alerts_json": str(lv_art.alerts_json),
+                    "recommendations_json": str(lv_art.recommendations_json),
+                    "manifold_html_by_task": dict(lv_art.manifold_html_by_task),
+                }
+
+        if explainability_payload:
+            (final_dir / "explainability_artifacts.json").write_text(
+                json.dumps(explainability_payload, indent=2)
+            )
+
 
 __all__ = [
     "TrainerSystemConfig",
     "CVRunConfig",
     "StudyConfig",
     "FinalTrainConfig",
+    "FinalExplainabilityConfig",
     "MILCVData",
     "MILFinalData",
     "MILFoldTrainer",

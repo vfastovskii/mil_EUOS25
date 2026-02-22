@@ -7,6 +7,7 @@ from typing import Any, Mapping, Optional, Protocol
 import pandas as pd
 
 from ..monitor import EpochStepResult, LambdaVolMonitor
+from ..types import PressureRunArtifacts
 
 try:
     from pytorch_lightning.callbacks import Callback
@@ -51,6 +52,7 @@ class LambdaVolLightningCallback(Callback):
     monitor: LambdaVolMonitor
     frame_provider: LightningFrameProvider
     export_on_fit_end: bool = True
+    last_artifacts: Optional[PressureRunArtifacts] = None
 
     def on_validation_epoch_end(self, trainer: Any, pl_module: Any) -> None:  # noqa: D401
         epoch = int(getattr(trainer, "current_epoch", 0))
@@ -78,7 +80,7 @@ class LambdaVolLightningCallback(Callback):
 
     def on_fit_end(self, trainer: Any, pl_module: Any) -> None:  # noqa: D401
         if bool(self.export_on_fit_end):
-            self.monitor.finalize()
+            self.last_artifacts = self.monitor.finalize()
 
 
 __all__ = ["LambdaVolLightningCallback", "LightningEpochFrames", "LightningFrameProvider"]

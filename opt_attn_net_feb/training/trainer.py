@@ -77,6 +77,7 @@ class LightningTrainerFactory:
         *,
         ckpt_dir: str,
         trial: Optional["optuna.trial.Trial"] = None,
+        extra_callbacks: Optional[List[Callback]] = None,
     ) -> Tuple[pl.Trainer, Optional[pl.callbacks.ModelCheckpoint]]:
         es = pl.callbacks.EarlyStopping(
             monitor="val_macro_ap",
@@ -99,6 +100,8 @@ class LightningTrainerFactory:
             callbacks.append(ckpt)
         if trial is not None:
             callbacks.append(OptunaPruningCallbackLocal(trial, monitor="val_macro_ap"))
+        if extra_callbacks:
+            callbacks.extend(list(extra_callbacks))
 
         trainer = pl.Trainer(
             max_epochs=int(self.config.max_epochs),
@@ -174,6 +177,7 @@ def make_trainer_gpu(
     trial: Optional["optuna.trial.Trial"] = None,
     save_checkpoint: bool = True,
     save_weights_only: bool = True,
+    extra_callbacks: Optional[List[Callback]] = None,
 ) -> Tuple[pl.Trainer, Optional[pl.callbacks.ModelCheckpoint]]:
     """
     Creates and returns a PyTorch Lightning Trainer instance configured for GPU
@@ -223,7 +227,11 @@ def make_trainer_gpu(
         save_checkpoint=bool(save_checkpoint),
         save_weights_only=bool(save_weights_only),
     )
-    return LightningTrainerFactory(cfg).build(ckpt_dir=ckpt_dir, trial=trial)
+    return LightningTrainerFactory(cfg).build(
+        ckpt_dir=ckpt_dir,
+        trial=trial,
+        extra_callbacks=extra_callbacks,
+    )
 
 
 @torch.no_grad()

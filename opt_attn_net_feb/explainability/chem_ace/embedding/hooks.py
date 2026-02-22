@@ -38,7 +38,8 @@ class LayerActivationHook(AbstractContextManager["LayerActivationHook"]):
             if isinstance(output, (tuple, list)) and len(output) > 0:
                 output = output[0]
             if torch.is_tensor(output):
-                self.last_activation = output.detach()
+                # Keep graph connection for gradient-based TCAV collection.
+                self.last_activation = output
             else:
                 logger.debug(
                     "Non-tensor hook output encountered",

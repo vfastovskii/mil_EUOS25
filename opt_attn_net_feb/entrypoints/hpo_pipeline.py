@@ -22,6 +22,7 @@ import torch
 from ..training.builders import LoaderConfig
 from ..training.execution import (
     CVRunConfig,
+    FinalExplainabilityConfig,
     FinalTrainConfig,
     MILCVData,
     MILCrossValidator,
@@ -179,6 +180,30 @@ class CLIHPOControlConfig:
 
 
 @dataclass(frozen=True)
+class CLIExplainabilityConfig:
+    """CLI controls for Chem-ACE and Lambda-Vol integration."""
+
+    run_chem_ace: bool
+    run_lambda_vol: bool
+    curated_smiles_col: str
+    chem_ace_output_dir: str | None
+    chem_ace_db_uri: str | None
+    chem_ace_max_ids: int
+    chem_ace_max_confs_per_id: int
+    chem_ace_max_2d_dim: int
+    chem_ace_max_3dqm_dim: int
+    chem_ace_top_concepts: int
+    lambda_vol_output_dir: str | None
+    lambda_vol_db_uri: str | None
+    lambda_vol_layer_name: str
+    lambda_vol_top_concepts: int
+    lambda_vol_monitor_max_samples: int
+    lambda_vol_tcav_repeats: int
+    lambda_vol_random_counterexamples: int
+    lambda_vol_min_concept_samples: int
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     """
     Represents configuration for a processing pipeline.
@@ -195,7 +220,7 @@ class PipelineConfig:
         columns: Configuration for data column usage and behavior.
         splits: Configuration for data splitting (e.g., training/testing splits).
         runtime: Configuration for runtime behaviors and settings.
-        export: Configuration for exporting the results of the pipeline.
+    export: Configuration for exporting the results of the pipeline.
         hpo: Controls if optimization is run or loaded from file.
     """
     data_paths: CLIDataPathsConfig
@@ -204,6 +229,7 @@ class PipelineConfig:
     runtime: CLIRuntimeConfig
     export: CLIExportConfig
     hpo: CLIHPOControlConfig
+    explainability: CLIExplainabilityConfig
 
 
 @dataclass(frozen=True)
@@ -311,6 +337,34 @@ class PipelineConfigFactory:
                     None if args.best_params_json is None else str(args.best_params_json)
                 ),
             ),
+            explainability=CLIExplainabilityConfig(
+                run_chem_ace=bool(args.run_chem_ace),
+                run_lambda_vol=bool(args.run_lambda_vol),
+                curated_smiles_col=str(args.curated_smiles_col),
+                chem_ace_output_dir=(
+                    None if args.chem_ace_output_dir is None else str(args.chem_ace_output_dir)
+                ),
+                chem_ace_db_uri=(
+                    None if args.chem_ace_db_uri is None else str(args.chem_ace_db_uri)
+                ),
+                chem_ace_max_ids=int(args.chem_ace_max_ids),
+                chem_ace_max_confs_per_id=int(args.chem_ace_max_confs_per_id),
+                chem_ace_max_2d_dim=int(args.chem_ace_max_2d_dim),
+                chem_ace_max_3dqm_dim=int(args.chem_ace_max_3dqm_dim),
+                chem_ace_top_concepts=int(args.chem_ace_top_concepts),
+                lambda_vol_output_dir=(
+                    None if args.lambda_vol_output_dir is None else str(args.lambda_vol_output_dir)
+                ),
+                lambda_vol_db_uri=(
+                    None if args.lambda_vol_db_uri is None else str(args.lambda_vol_db_uri)
+                ),
+                lambda_vol_layer_name=str(args.lambda_vol_layer_name),
+                lambda_vol_top_concepts=int(args.lambda_vol_top_concepts),
+                lambda_vol_monitor_max_samples=int(args.lambda_vol_monitor_max_samples),
+                lambda_vol_tcav_repeats=int(args.lambda_vol_tcav_repeats),
+                lambda_vol_random_counterexamples=int(args.lambda_vol_random_counterexamples),
+                lambda_vol_min_concept_samples=int(args.lambda_vol_min_concept_samples),
+            ),
         )
 
 
@@ -346,6 +400,9 @@ class PipelineEnvironmentFactory:
             "patience": int(self.config.runtime.patience),
             "run_hpo": bool(self.config.hpo.run_hpo),
             "best_params_json": self.config.hpo.best_params_json,
+            "run_chem_ace": bool(self.config.explainability.run_chem_ace),
+            "run_lambda_vol": bool(self.config.explainability.run_lambda_vol),
+            "curated_smiles_col": str(self.config.explainability.curated_smiles_col),
             "argv": " ".join([str(x) for x in (argv if argv is not None else os.sys.argv)]),
             "weight_cols": WEIGHT_COLS,
             "model": "MILTaskAttnMixerWithAux (task-specific attention queries)",
@@ -637,6 +694,26 @@ class MILPipelineOrchestrator:
                 pin_memory=bool(env.pin_memory),
             ),
             attn_out=self.config.export.attn_out,
+            explainability=FinalExplainabilityConfig(
+                run_chem_ace=bool(self.config.explainability.run_chem_ace),
+                run_lambda_vol=bool(self.config.explainability.run_lambda_vol),
+                curated_smiles_col=str(self.config.explainability.curated_smiles_col),
+                chem_ace_output_dir=self.config.explainability.chem_ace_output_dir,
+                chem_ace_db_uri=self.config.explainability.chem_ace_db_uri,
+                chem_ace_max_ids=int(self.config.explainability.chem_ace_max_ids),
+                chem_ace_max_confs_per_id=int(self.config.explainability.chem_ace_max_confs_per_id),
+                chem_ace_max_2d_dim=int(self.config.explainability.chem_ace_max_2d_dim),
+                chem_ace_max_3dqm_dim=int(self.config.explainability.chem_ace_max_3dqm_dim),
+                chem_ace_top_concepts=int(self.config.explainability.chem_ace_top_concepts),
+                lambda_vol_output_dir=self.config.explainability.lambda_vol_output_dir,
+                lambda_vol_db_uri=self.config.explainability.lambda_vol_db_uri,
+                lambda_vol_layer_name=str(self.config.explainability.lambda_vol_layer_name),
+                lambda_vol_top_concepts=int(self.config.explainability.lambda_vol_top_concepts),
+                lambda_vol_monitor_max_samples=int(self.config.explainability.lambda_vol_monitor_max_samples),
+                lambda_vol_tcav_repeats=int(self.config.explainability.lambda_vol_tcav_repeats),
+                lambda_vol_random_counterexamples=int(self.config.explainability.lambda_vol_random_counterexamples),
+                lambda_vol_min_concept_samples=int(self.config.explainability.lambda_vol_min_concept_samples),
+            ),
         )
         MILFinalTrainer(config=final_cfg).run(
             outdir=env.outdir,
@@ -714,6 +791,26 @@ def _parse_args(argv: Any | None = None):
     # Accepted for compatibility; pipeline is MIL-only now.
     ap.add_argument("--do_mil", action="store_true")
 
+    # Explainability integrations: Chem-ACE + Lambda-Vol
+    ap.add_argument("--run_chem_ace", action="store_true")
+    ap.add_argument("--run_lambda_vol", action="store_true")
+    ap.add_argument("--curated_smiles_col", default="curated_SMILES")
+    ap.add_argument("--chem_ace_output_dir", default=None)
+    ap.add_argument("--chem_ace_db_uri", default=None)
+    ap.add_argument("--chem_ace_max_ids", type=int, default=10000)
+    ap.add_argument("--chem_ace_max_confs_per_id", type=int, default=4)
+    ap.add_argument("--chem_ace_max_2d_dim", type=int, default=256)
+    ap.add_argument("--chem_ace_max_3dqm_dim", type=int, default=256)
+    ap.add_argument("--chem_ace_top_concepts", type=int, default=64)
+    ap.add_argument("--lambda_vol_output_dir", default=None)
+    ap.add_argument("--lambda_vol_db_uri", default=None)
+    ap.add_argument("--lambda_vol_layer_name", default="mixer_post_norm")
+    ap.add_argument("--lambda_vol_top_concepts", type=int, default=24)
+    ap.add_argument("--lambda_vol_monitor_max_samples", type=int, default=512)
+    ap.add_argument("--lambda_vol_tcav_repeats", type=int, default=2)
+    ap.add_argument("--lambda_vol_random_counterexamples", type=int, default=96)
+    ap.add_argument("--lambda_vol_min_concept_samples", type=int, default=8)
+
     return ap.parse_args(argv)
 
 
@@ -734,6 +831,9 @@ def _normalize_compat_args(args) -> None:
     """
     if args.trials_mil is not None:
         args.trials = int(args.trials_mil)
+    if bool(args.run_lambda_vol):
+        # Lambda-Vol relies on concept families from Chem-ACE.
+        args.run_chem_ace = True
 
 
 def main(argv: Any | None = None) -> None:
