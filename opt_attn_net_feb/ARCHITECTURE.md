@@ -1,641 +1,1400 @@
-# Package Architecture
+# Architecture Specification
 
-This document describes both code layering and model design for the current
-MIL attention system.
+This document is the authoritative, code-aligned architecture spec for the current repository state.
 
-## 1) Code Layers
+Scope:
+- Package: `opt_attn_net_feb/`
+- Root wrapper entrypoint: `../opt_net_fast.py`
+- Main pipeline entrypoint implementation: `entrypoints/hpo_pipeline.py`
+
+Everything below is synchronized to the current code, including constants, defaults, heuristics, and fallback behavior.
+
+---
+
+## 1. System Overview
+
+The system is a multimodal MIL (Multiple Instance Learning) pipeline for 4-task classification with auxiliary regression heads, plus integrated explainability:
+- Core model: `MILTaskAttnMixerWithAux`
+- HPO: Optuna over CV on predefined train folds
+- Final stage: train on split `train`, validate on split `leaderboard` (or custom `--leaderboard_split`)
+- Explainability (optional):
+  - Chem-ACE (concept discovery + semantic tagging)
+  - Lambda-Vol (concept-pressure dynamics across epochs)
+
+High-level flow:
+1. Parse CLI + build typed config objects.
+2. Load labels + 2D + 3D/QM features.
+3. Build HPO dataset from `--use_splits` and predefined fold column.
+4. Optional HPO (`--run_hpo`): optimize CV objective.
+5. Final run always executes:
+   - train on split `train`
+   - evaluate on split `leaderboard`
+   - export leaderboard attention/predictions CSV
+   - optional explainability outputs.
+
+---
+
+## 2. Code Layering and Dependency Direction
+
+Repository layering:
 
 ```text
+../opt_net_fast.py                   # root wrapper entrypoint
 opt_attn_net_feb/
-  callbacks/        # Training callbacks
-  data/             # Datasets, collate functions, export helpers
-  entrypoints/      # CLI/orchestration
-  losses/           # Loss implementations
-  models/           # Neural architecture
-  training/         # HPO, trainer construction, final training/export
-  utils/            # Data/metrics/ops/constants helpers
-  __init__.py       # Stable package-level public API exports
-  opt_net_fast.py   # Single project CLI entrypoint (root)
+  callbacks/                         # Lightning callbacks (Optuna pruning)
+  data/                              # Datasets, collate, export utilities
+  entrypoints/                       # CLI + orchestration
+  explainability/                    # Chem-ACE + Lambda-Vol
+  losses/                            # focal + regression loss functions
+  models/                            # multimodal MIL model + attention pooling
+  training/                          # builders, configs, execution, trainer
+  utils/                             # constants, IO, metrics, samplers, ops
+  __init__.py                        # stable package-level API exports
 ```
 
-Dependency direction:
+Dependency direction (enforced by structure):
+- `entrypoints -> training, data, models, utils, explainability`
+- `training -> models, data, losses, utils, explainability`
+- `models/losses/data/utils` do not depend on `entrypoints`
+- `explainability` is modular and can be used independently or from training
 
-- `entrypoints` -> `training`, `data`, `models`, `utils`
-- `training` -> `models`, `data`, `losses`, `utils`
-- `models`, `losses`, `data`, `utils` do not depend on `entrypoints`
+Public API:
+- Package-level exports in `__init__.py` are stable API surface for external users.
+- The CLI wrapper `../opt_net_fast.py` delegates to `opt_attn_net_feb.entrypoints.hpo_pipeline.main`.
 
-Canonical imports:
+---
 
-- `opt_attn_net_feb.training`
-- `opt_attn_net_feb.models`
-- `opt_attn_net_feb`
+## 3. Configuration Architecture (Typed Contracts)
 
-### 1.1 Configuration contracts
+### 3.1 Training-level typed configs (`training/configs.py`)
 
-Large parameter groups are passed as typed dataclasses instead of ad-hoc dicts:
+`HPOConfig` groups:
+- `BackboneConfig`
+- `HeadConfig`
+- `OptimizationConfig`
+- `RuntimeConfig`
+- `SamplerConfig`
+- `LossWeightingConfig`
+- `ObjectiveConfig`
 
-- Training-level config (`training/configs.py`):
-  - `HPOConfig` with grouped sub-configs:
-    - `BackboneConfig`
-    - `HeadConfig`
-    - `OptimizationConfig`
-    - `RuntimeConfig`
-    - `SamplerConfig`
-    - `LossWeightingConfig`
-    - `ObjectiveConfig`
-- Model-level config (`models/multimodal_mil/configs.py`):
-  - `MILModelConfig` with grouped sub-configs:
-    - `MILBackboneConfig`
-    - `MILPredictorConfig`
-    - `MILOptimizationConfig`
-    - `MILLossConfig`
+Important defaults:
+- Objective mode is fixed to `"macro_plus_min"`.
+- Sampler defaults enable balanced batch sampling + bitmask weighting.
+- Embedder names are explicit by modality:
+  - 2D default: `mlp_v3_2d`
+  - 3D default: `mlp_v3_3d`
 
-Flow:
+### 3.2 Model-level typed configs (`models/multimodal_mil/configs.py`)
 
-- `search_space` (flat Optuna dict) -> `HPOConfig.from_params(...)`
-- `MILModelBuilder.build(config=HPOConfig, ...)` maps to `MILModelConfig`
-- `MILTaskAttnMixerWithAux.from_config(...)` constructs the model from one structured object + loss tensors (`pos_weight`, `gamma`, `lam`)
+`MILModelConfig` groups:
+- `MILBackboneConfig`
+- `MILPredictorConfig`
+- `MILOptimizationConfig`
+- `MILLossConfig`
 
-### 1.2 Class-based training orchestration
+Conversion chain:
+1. Flat Optuna params -> `HPOConfig.from_params(...)`
+2. `MILModelBuilder.build(...)` maps `HPOConfig` -> `MILModelConfig`
+3. `MILTaskAttnMixerWithAux.from_config(...)` builds Lightning module
 
-Core orchestration now follows explicit classes and typed handoff objects:
+Hard validation:
+- `inst_hidden % attn_heads == 0` enforced in both search space pruning and config validation.
 
-- Entry pipeline (`entrypoints/hpo_pipeline.py`)
-  - `PipelineConfigFactory` parses CLI args into `PipelineConfig`
-  - `PipelineEnvironmentFactory` resolves output/runtime environment
-  - `HPODataBuilder` builds `PreparedHPOData` and `MILCVData`
-  - `MILPipelineOrchestrator` runs HPO and final export stages
-- Execution layer (`training/execution.py`)
-  - `MILCrossValidator` owns Optuna objective flow
-  - `MILFoldTrainer` handles one CV fold train/eval cycle
-  - `MILStudyRunner` owns Optuna study lifecycle + artifact writes
-  - `MILFinalTrainer` runs best-config train and leaderboard export
-- Trainer/eval infrastructure (`training/trainer.py`)
-  - `LightningTrainerFactory` builds deterministic Lightning trainers
-  - `ModelEvaluator` computes AP metrics from checkpoints
+---
 
-Config handoff chain:
+## 4. Data Contracts and Preprocessing
 
-- CLI args -> `PipelineConfig`
-- `PipelineConfig` + prepared arrays -> `MILCVData`
-- `MILCVData` + `CVRunConfig` -> `MILCrossValidator`
-- Best params + `MILFinalData` + `FinalTrainConfig` -> `MILFinalTrainer`
+### 4.1 Required input files
 
-## 2) Model Architecture (`MILTaskAttnMixerWithAux`)
+CLI required:
+- `--labels`
+- `--feat2d_scaled`
+- `--feat3d_scaled`
+- `--feat3d_qm_scaled`
+- `--study_dir`
 
-Primary implementation:
+### 4.2 Required columns
 
+Label table (`utils/constants.py`):
+- Task columns (`TASK_COLS`):
+  - `Transmittance_340`
+  - `Transmittance_450`
+  - `Fluorescence_340_450`
+  - `Fluorescence_more_than_480`
+- Aux absorbance columns (`AUX_ABS_COLS`):
+  - `Transmittance_340_quantitative`
+  - `Transmittance_450_quantitative`
+- Aux fluorescence base columns (`AUX_FLUO_BASE_COLS`):
+  - `wl_pred_nm`
+  - `qy_pred`
+- Weight columns mapping (`WEIGHT_COLS`):
+  - task0 -> `sample_weight_340`
+  - task1 -> `sample_weight_450`
+  - task2 -> `w_ad`
+  - task3 -> `w_ad`
+
+Default ID/split/fold columns:
+- `--id_col ID`
+- `--conf_col conf_id`
+- `--split_col split`
+- `--fold_col cv_fold`
+
+### 4.3 Split semantics
+
+- `--use_splits` controls which rows are used for HPO CV dataset construction.
+- Final stage is independent of `--use_splits` and always uses:
+  - train split: `split == "train"`
+  - validation split: `split == --leaderboard_split` (default `leaderboard`)
+
+### 4.4 Label and weight transforms
+
+- Classification labels:
+  - `coerce_binary_labels(df)`:
+    - fill NaN with 0
+    - cast to int
+    - threshold `(y > 0)` -> `0/1`
+- Task weights:
+  - `build_task_weights(df)` loads mapped columns if present, else ones
+  - clipped to `[0, +inf)`
+
+### 4.5 Auxiliary target construction
+
+`build_aux_targets_and_masks(df)`:
+- `y_abs`: stacked 2 absorbance quantitative targets
+- `m_abs`: finite mask
+- `y_fbase`: stacked 2 fluorescence base targets (`wl_pred_nm`, `qy_pred`)
+- `y_fluo4`: **constructed by duplication** `concat([y_fbase, y_fbase])` -> shape `(N,4)`
+- `m_fluo4`: same duplication for masks
+
+This duplication is a deliberate approximation to match 4 fluorescence auxiliary outputs.
+
+`build_aux_weights(df)`:
+- `w_abs = [sample_weight_340, sample_weight_450]`
+- `w_fluo4 = repeat(w_ad, 4)`
+- clipped to `[0, +inf)`
+
+### 4.6 2D feature loading/alignment
+
+`load_2d`:
+- Reads CSV, validates ID column, logs duplicate-ID statistics.
+- Feature columns = all columns except `NONFEAT_2D = {ID, curated_SMILES, split}`.
+
+`align_by_id`:
+- Exact ID lookup; raises on missing IDs.
+
+### 4.7 3D+QM instance merge
+
+`load_and_merge_instances`:
+1. Load geometry and QM CSVs.
+2. Optional ID filtering to allowed set.
+3. QM cleanup:
+   - drop rows with non-empty `error`
+   - keep `status` in `{ok, success, 0, 1, true}` or NaN
+4. Deduplicate repeated `(ID, conf_id)` rows by mean per feature block.
+5. Inner join geometry and QM on `(ID, conf_id)` with `validate="one_to_one"`.
+6. Final instance feature = horizontal concat `[geom_features, qm_features]`.
+
+### 4.8 Bag index construction
+
+`build_instance_index`:
+- Stable sort by ID (`mergesort`) so bag slices are contiguous.
+- Returns:
+  - unique IDs
+  - starts, counts per ID
+  - `id2pos` lookup
+  - sorted instance feature matrix
+  - sorted conformer IDs
+
+### 4.9 IDs without bags
+
+Two safeguards:
+- HPO stage: IDs with no conformers after merge are dropped; folds recomputed.
+- Final stage: `drop_ids_without_bags` applied to both train and leaderboard sets.
+
+---
+
+## 5. Datasets, Collate, and Tensor Shapes
+
+### 5.1 `MILTrainDataset`
+
+Per item:
+- `x2d`: `[F2]`
+- `bag`: `[Ni, F3]`
+- `y_cls`: `[4]`
+- `w_cls`: `[4]`
+- `y_abs`: `[2]`
+- `m_abs`: `[2]` bool
+- `w_abs`: `[2]`
+- `y_fluo`: `[4]`
+- `m_fluo`: `[4]` bool
+- `w_fluo`: `[4]`
+
+`max_instances=0` in pipeline means no bag truncation.
+
+### 5.2 `collate_train`
+
+Batch output:
+- `x2d`: `[B, F2]`
+- `x3d_pad`: `[B, Nmax, F3]`
+- `kpm`: `[B, Nmax]` bool, `True` = padding
+- labels/weights stacked across batch
+
+### 5.3 `MILExportDataset` + `collate_export`
+
+Export batch output:
+- `mol_ids` list length `B`
+- `conf_pad`: `[B, Nmax]` object (conformer IDs)
+- `x2d`: `[B, F2]`
+- `x3d_pad`: `[B, Nmax, F3]`
+- `kpm`: `[B, Nmax]`
+
+---
+
+## 6. Model Architecture (`MILTaskAttnMixerWithAux`)
+
+Implementation files:
 - `models/multimodal_mil/model.py`
-- `models/multimodal_mil/configs.py`
 - `models/multimodal_mil/embedders.py`
-- `models/multimodal_mil/embedder_mlp_v3_base.py`
 - `models/multimodal_mil/aggregators.py`
 - `models/multimodal_mil/predictors.py`
 - `models/multimodal_mil/head_mlp_v3.py`
 - `models/multimodal_mil/head_utils.py`
 - `models/attention_pooling/pool.py`
-- `models/multimodal_mil/heads.py`
 
-### 2.0 Componentized structure (extensible by name)
+### 6.1 Extensible component registries
 
-Model assembly is now explicit and layered:
+- 2D embedder registry: `build_2d_embedder(name=...)`
+- 3D embedder registry: `build_3d_embedder(name=...)`
+- Aggregator registry: `build_aggregator(name=...)`
+- Predictor registry: `build_predictor_heads(name=...)`
 
-- `embedder`:
-  - `2D` embedder registry in `models/multimodal_mil/embedders.py`
-  - `3D` embedder registry in `models/multimodal_mil/embedders.py`
-- `aggregator`:
-  - registry in `models/multimodal_mil/aggregators.py`
-  - current default: `task_attention_pool`
-- `predictor`:
-  - head-builder registry in `models/multimodal_mil/predictors.py`
-  - current default: `mlp_v3`
-
-Selection is name-based in model config:
-
-- `mol_embedder_name`
-- `inst_embedder_name`
-- `aggregator_name`
-- `predictor_name`
-
-Canonical builder entrypoints:
-
-- `build_2d_embedder` / `build_3d_embedder` -> `models/multimodal_mil/embedders.py`
-- `build_aggregator` -> `models/multimodal_mil/aggregators.py`
-- `build_predictor_heads` -> `models/multimodal_mil/predictors.py`
-- mixer builder used by model -> `models/multimodal_mil/embedder_mlp_v3_base.py`
-
-Concrete default implementations are also split per concern:
-
-- shared V3 embedder implementation for both 2D and 3D -> `models/multimodal_mil/embedder_mlp_v3_base.py`
-- predictor-head implementation -> `models/multimodal_mil/head_mlp_v3.py`
-- head utilities (projection + apply helpers) -> `models/multimodal_mil/head_utils.py`
-
-Compatibility facade:
-
-- `models/multimodal_mil/heads.py` re-exports head symbols to keep import stability while implementation remains split.
-
-Current defaults preserve existing behavior:
-
+Default names:
 - `mol_embedder_name="mlp_v3_2d"`
 - `inst_embedder_name="mlp_v3_3d"`
 - `aggregator_name="task_attention_pool"`
 - `predictor_name="mlp_v3"`
 
-Design rule:
+Legacy aliases:
+- 2D: `mlp_v3 -> mlp_v3_2d`
+- 3D: `mlp_v3 -> mlp_v3_3d`
 
-- 2D modality is molecule-level (`[B, F2]`) and does not use an aggregator.
-- 3D modality is instance-level (`[B, N, F3]`) and must pass through an aggregator to produce per-task pooled representation.
+### 6.2 Forward pipeline and shapes
 
-Extension workflow:
+Inputs:
+- `x2d`: `[B, F2]`
+- `x3d_pad`: `[B, N, F3]`
+- `key_padding_mask`: `[B, N]`, `True=PAD`
 
-- Add new 2D embedder:
-  - implement a builder with signature `(input_dim, hidden_dim, layers, dropout, activation)`
-  - register it via `register_2d_embedder("name", builder)`
-- Add new 3D embedder:
-  - implement a builder with the same signature
-  - register it via `register_3d_embedder("name", builder)`
-- Add new aggregator:
-  - implement a builder with signature `(dim, n_heads, dropout, n_tasks, **kwargs)`
-  - register it via `register_aggregator("name", builder)`
-- Add new predictor family:
-  - implement a builder with signature `(in_dim, count, activation, num_layers, dropout, stochastic_depth, fc2_gain_non_last)`
-  - register it via `register_predictor("name", builder)`
+Branch A (2D molecule-level):
+1. `mol_enc(x2d)` -> `[B, mol_hidden]`
+2. `mol_post_embed_norm` (`LayerNorm(mol_hidden)`)
+3. `proj2d = Linear(mol_hidden->proj_dim) + LayerNorm(proj_dim)` -> `e2d [B, proj_dim]`
+4. Repeat per task: `e2d_rep = e2d.unsqueeze(1).expand(-1,4,-1)` -> `[B,4,proj_dim]`
 
-Compatibility note:
+Branch B (3D instance-level):
+1. Flatten instances: `[B*N, F3]`
+2. `inst_enc` -> `[B*N, inst_hidden]`
+3. Reshape `[B,N,inst_hidden]`
+4. `inst_post_embed_norm` (`LayerNorm(inst_hidden)`)
+5. `attn_pool(tokens, kpm)` -> `pooled_tasks [B,4,inst_hidden]`, optional `attn [B,4,N]`
+6. `agg_post_norm` (`LayerNorm(inst_hidden)`)
+7. `proj3d` (`Linear+LayerNorm`) per task -> `e3d [B,4,proj_dim]`
 
-- Legacy embedder value `mlp_v3` is accepted and resolved internally as:
-  - 2D: `mlp_v3_2d`
-  - 3D: `mlp_v3_3d`
-
-### 2.1 End-to-end flow
-
-```text
-Input:
-  x2d        [B, F2]
-  x3d_pad    [B, N, F3]
-  kpm        [B, N]   (True = padding)
-
-Branch A (molecule / 2D):
-  x2d -> 2D embedder (by name) -> [B, mol_hidden]
-      -> LayerNorm (post-embedder normalization)
-      -> proj2d (Linear + LayerNorm) -> e2d [B, proj_dim]
-      -> repeat per task -> e2d_rep [B, 4, proj_dim]
-
-Branch B (instance / 3D):
-  x3d_pad -> 3D embedder (by name) per instance -> [B, N, inst_hidden]
-          -> LayerNorm (post-embedder normalization, before aggregator)
-          -> aggregator (by name; current TaskAttentionPool)
-          -> pooled_tasks [B, 4, inst_hidden]
-          -> LayerNorm (post-aggregator normalization)
-          -> proj3d (Linear + LayerNorm) -> e3d [B, 4, proj_dim]
-
-Fusion + task representation:
-  concat(e2d_rep, e3d) -> [B, 4, 2*proj_dim]
-  mixer residual MLP (V3-like, same logic family as embedders) -> z_tasks [B, 4, mixer_hidden]
-  LayerNorm (post-mixer normalization, before predictors)
+Fusion + mixer:
+1. Concat: `concat([e2d_rep,e3d], dim=-1)` -> `[B,4,2*proj_dim]`
+2. Flatten task axis: `[B*4, 2*proj_dim]`
+3. `mixer` residual MLP -> `[B*4, mixer_hidden]`
+4. Reshape `[B,4,mixer_hidden]`
+5. `mixer_post_norm` (`LayerNorm(mixer_hidden)`) -> `z_tasks`
 
 Heads:
-  Classification heads (per-task residual MLP predictor):
-    z_tasks -> logits [B, 4]
+- Classification: one head per task, input `z_tasks[:,t,:]` -> logits `[B,4]`
+- Aux absorbance: two shared heads from `z_aux = mean(z_tasks, dim=1)` -> `[B,2]`
+- Aux fluorescence: four shared heads from `z_aux` -> `[B,4]`
+- Optional bitmask group head from `z_aux` -> `[B, n_groups]`
 
-  Auxiliary shared heads (residual MLP predictors from mean task embedding):
-    z_aux = mean(z_tasks over task axis) [B, mixer_hidden]
-    z_aux -> abs_heads  -> abs_out  [B, 2]
-    z_aux -> fluo_heads -> fluo_out [B, 4]
+### 6.3 Why 2D embedding is repeated per task
 
-Optional explainability output:
-  attention maps attn [B, 4, N] (mask-aware, renormalized)
-```
+2D branch learns one molecule representation per sample. Repetition does **not** create separate 2D encoders.
+It broadcasts the same molecule context to each task-specific fusion slot, where it is combined with task-specific aggregated 3D context before task-specific heads.
 
-### 2.2 Embedders
+So training remains end-to-end with one shared 2D encoder; task specificity is injected by:
+- 3D task-query attention pooling
+- task slot in fusion/mixer
+- task-specific classification heads.
 
-`mol_enc`, `inst_enc`, and `mixer` use `utils.mlp.make_residual_mlp_embedder_v3`
-(`MLPEmbedderV3Like`):
+### 6.4 Embedder/mixer block logic (V3-like residual MLP)
 
-- Input normalization + optional projection to hidden width
-- Stack of residual FFN blocks with:
-  - pre-norm layout
-  - SwiGLU-style gated FFN
-  - residual dropout
-  - stochastic depth (DropPath) across depth
-  - learnable residual scaling (with warmup for early blocks)
-- Last block FF2 is zero-initialized for near-identity start
-- Hidden width is constant across residual blocks
+Factory: `utils.mlp.make_residual_mlp_embedder_v3(...)` uses:
+- expansion `2.0`
+- pre-norm residual blocks
+- gated FFN (SwiGLU-like)
+- residual dropout `0.05`
+- stochastic depth `0.05` (depth-scaled)
+- learnable residual scale:
+  - warmup init `0.01` for early blocks
+  - main init `0.1` for last `2` blocks
+  - applied with `tanh`
+- last block FF2 zero-init (near-identity startup)
+- inner dimension rounded to multiple of `64`
 
-### 2.3 Pooling (task-specific attention)
+Used for:
+- 2D embedder
+- 3D embedder
+- mixer
 
-`TaskAttentionPool` uses multi-query attention:
+### 6.5 Aggregator logic (`TaskAttentionPool`)
 
-- Learned query tensor: `[1, n_tasks, dim]` (expanded to batch)
-- `nn.MultiheadAttention(batch_first=True)` with `attn_heads`
-- Pre-layer normalization before attention (V4-style)
-- Optional query temperature scaling
-- Per-head attention is averaged, then:
-  - padding positions masked to zero
-  - renormalized so each task attention sums to 1 over valid instances
-- Pooling source can be configured (`inputs`, `normed_inputs`, or `attn_out`)
-- Value projection can be tied to MHA V-projection (`tie_mha_v`)
-- Supports top-k attention pooling and optional residual blend with mean pooling
+Defaults and key options:
+- MHA with `batch_first=True`
+- learned task queries `q` shape `[1, n_tasks, dim]`
+- `pre_ln` on tokens (`use_layer_norm=True`, `pre_layer_norm=True`)
+- attention output average across heads -> `alpha [B,T,N]`
+- `alpha` masked and renormalized over valid conformers
+- optional threshold prune (`prune_below`) with argmax fallback if all pruned
+- pooling source default `pool_from="normed_inputs"`
+- value projection default `pool_v_mode="tie_mha_v"`
+- optional top-k pooling (`topk_n`, strategies: `renorm|mean|sum|argmax`)
+- optional residual blend with mean pooling
+- optional query temperature (`use_temperature`, `temperature_init=0.3`)
 
-Constraint:
+Model guardrail:
+- `aggregator_kwargs` cannot override reserved keys `{dim, n_heads, dropout, n_tasks}`.
 
-- `inst_hidden % attn_heads == 0` (enforced during HPO)
+### 6.6 Predictor head logic (V3-like)
 
-### 2.4 Multitask outputs
+Head class: `MLPPredictorV3Like`:
+- stack of residual FFN blocks
+- configurable `num_layers`, `dropout`, `stochastic_depth`, `fc2_gain_non_last`
+- GLU enabled (`use_glu=True`)
+- `input_layernorm=True`
+- `output_dim=1` for each individual head
 
-Task counts:
+Head defaults in builder:
+- expansion `2.0`
+- `res_scale_init=0.1`
+- `inner_multiple=64`
+- `proj_gain=0.5`
+- `head_dropout=0.0`
 
-- Classification tasks: `4`
-- Auxiliary absorbance heads: `2`
-- Auxiliary fluorescence heads: `4`
-- Auxiliary bitmask-group head: `K+1` classes (`K` train-fold top masks + `other`)
+### 6.7 Bitmask auxiliary head
 
-Classification task names (`utils.constants.TASK_COLS`):
+Enabled when:
+- `lambda_aux_bitmask > 0`
+- `bitmask_num_groups >= 2`
 
-- `Transmittance_340`
-- `Transmittance_450`
-- `Fluorescence_340_450`
-- `Fluorescence_more_than_480`
+Construction:
+- group IDs = `top_k` frequent bitmasks from fold-train + one `other`
+- head output dim = `len(top_ids) + 1`
+- targets from binary task vector -> integer bitmask -> mapped group ID
+- CE class weights from fold-train group frequencies
 
-Auxiliary absorbance targets (`AUX_ABS_COLS`):
+---
 
-- `Transmittance_340_quantitative`
-- `Transmittance_450_quantitative`
+## 7. Loss Functions and Training Objective
 
-Auxiliary fluorescence is built from base columns `wl_pred_nm` and `qy_pred`,
-expanded to 4 outputs to align with task structure.
+### 7.1 Classification loss (`MultiTaskFocal`)
 
-Head architecture note:
+Per-task focal BCE:
+- `bce = BCEWithLogits(logits, targets, pos_weight, reduction=none)`
+- `pt = sigmoid(logits)` matched to target class
+- `focal = (1 - pt) ^ gamma_t`
+- `loss = focal * bce`
+- weighted reduction per task with `w_cls`:
+  - `num_t = sum_i loss_it * w_it`
+  - `den_t = sum_i w_it + 1e-6`
+  - `per_task_loss_t = num_t / den_t`
 
-- Heads are selected by predictor name (current: V3-like residual MLP predictors; not plain linear layers)
-- Each head uses residual FFN blocks with SwiGLU, LayerNorm, DropPath, and learnable residual scaling
-- Final scalar output per head is produced by a small-gain linear output layer
-- Bitmask-group head (when enabled) uses the same V3 residual predictor style and outputs multi-class logits
+Then `weighted_per_task = per_task_loss * lam_t` and:
+- `loss_cls = mean_t(weighted_per_task_t)`
 
-## 3) Losses and Training Objective
+### 7.2 Regression losses (`reg_loss_weighted`)
 
-Primary loss assembly: `models/multimodal_mil/training.py`
+For `abs_out` and `fluo_out`:
+- mask invalid targets via `target_safe = where(mask, target, pred.detach())`
+- per-element loss:
+  - `mse`: `(pred-target_safe)^2`
+  - or `smoothl1`
+- weighted masked reduction:
+  - `num = sum(per * w_eff)`
+  - `den = sum(w_eff) + 1e-6`
+  - mean across output channels
 
-### 3.1 Classification loss (`MultiTaskFocal`)
+### 7.3 Bitmask auxiliary loss
 
-`losses/multi_task_focal.py`:
+If active:
+- `loss_bitmask = CrossEntropy(bitmask_logits, bitmask_targets, class_weight)`
+Else:
+- `loss_bitmask = 0`
 
-- Base: `BCEWithLogits` with per-task `pos_weight`
-- Focal factor: `(1 - pt) ^ gamma_t` per task
-- Sample/task weighting via `w_cls`
-- Returns per-task loss vector `[4]`
+### 7.4 Total training loss
 
-### 3.2 Regression losses (`reg_loss_weighted`)
+`loss_total = loss_cls + lambda_aux_abs*loss_abs + lambda_aux_fluo*loss_fluo + lambda_aux_bitmask*loss_bitmask`
 
-`losses/regression.py`:
+---
 
-- Supports `mse`
-- Applies boolean masks to ignore missing labels
-- Uses per-output weights and stable denominator clamping
+## 8. Task Weighting, Pos Weights, and Imbalance Logic
 
-### 3.3 Total objective
+### 8.1 Lambda task weighting (`lam`)
 
-For a batch:
+Two modes:
+1. Explicit per-task lambdas (`lam_t0..lam_t3`) provided:
+   - normalize by mean
+   - clip each task to `[lam_floor, lam_ceil]`
+   - renormalize by mean
+2. If explicit lambdas absent:
+   - prevalence-based: `lam_t ∝ (1/p_t)^lambda_power`, normalized by mean
 
-- `per_task_cls = MultiTaskFocal(...)` -> `[4]`
-- `loss_cls = mean(lam * per_task_cls)`
-- `loss_abs = reg_loss_weighted(abs_out, y_abs, m_abs, w_abs, reg_loss_type)`
-- `loss_fluo = reg_loss_weighted(fluo_out, y_fluo, m_fluo, w_fluo, reg_loss_type)`
-- `loss_bitmask = CE(bitmask_logits, bitmask_group_targets, class_weight=bitmask_group_class_weight)` (optional)
-- `loss_total = loss_cls + lambda_aux_abs * loss_abs + lambda_aux_fluo * loss_fluo + lambda_aux_bitmask * loss_bitmask`
+### 8.2 Positive class weights (`pos_weight`)
 
-Bitmask grouping protocol (no leakage):
+`pos_weight_t = neg_t / max(pos_t, 1)` with clipping:
+- either global scalar clip
+- or per-task clips `posw_clip_t0..t3`
 
-- For each CV fold, grouping is built from train-fold labels only:
-  select `top_k` most frequent bitmask IDs, map all remaining masks to `other`.
-- The same train-derived mapping is used for that fold's train and validation steps.
-- For final training, grouping is built from final-train split only and reused on leaderboard split.
-- Group CE class weights are computed from train-fold grouped frequencies only.
+### 8.3 Focal gamma per task
 
-Validation metrics:
+`gamma = [gamma_t0, gamma_t1, gamma_t2, gamma_t3]`
 
-- Per-task AP
-- `val_macro_ap` (mean AP over 4 tasks)
-- `val_min_ap` (worst-task AP)
+### 8.4 Oversampling and batch balancing
 
-## 4) Hyperparameters
+#### Weighted sampler (`make_weighted_sampler`)
 
-HPO search space is defined in `training/search_space.py::search_space`.
+Rarity severity per task:
+- If `rare_prev_thr` set:
+  - binary rarity: `severity_t = 1[p_t < rare_prev_thr]`
+- Else:
+  - smooth deficiency toward target prevalence:
+  - `severity_t = clip((rare_target_prev - p_t)/rare_target_prev, 0, 1)`
 
-### 4.1 Architecture capacity and regularization
+Per-sample rarity:
+- `rarity_i = max_t(y_it * severity_t)`
 
-- `mol_hidden` (`{128, 256}`): Hidden width of the 2D molecule encoder MLP; capped so effective V3 FFN widths stay <= 1024.
-- `mol_layers` (`[2, 5]`): Depth of the 2D encoder; deeper models can learn richer nonlinear combinations but are more prone to optimization instability.
-- `mol_dropout` (`[0.10, 0.25]`): Dropout probability in each 2D encoder block; higher values increase regularization and reduce overfitting risk.
-- `inst_hidden` (`{128, 256}`): Hidden width of the 3D instance encoder; directly controls token embedding dimensionality entering attention.
-- `inst_layers` (`[3, 5]`): Depth of the 3D encoder; affects expressiveness of conformation-level token features.
-- `inst_dropout` (`[0.05, 0.15]`): Dropout in 3D encoder blocks; regularizes token features before attention pooling.
-- `proj_dim` (`{256, 512}`): Common projection dimension for 2D and pooled 3D representations before fusion.
-- `attn_heads` (`{8, 16, 32}`): Number of heads in task-attention pooling; must divide `inst_hidden`.
-- `attn_dropout` (`[0.05, 0.2]`): Dropout inside multihead attention; regularizes per-task instance weighting.
-- `mixer_hidden` (`{128, 256}`): Width of the fusion mixer MLP that maps concatenated 2D/3D task features to task embeddings.
-- `mixer_layers` (`[3, 5]`): Depth of the fusion mixer; controls complexity of cross-modal feature interaction.
-- `mixer_dropout` (`[0.05, 0.2]`): Dropout in fusion mixer blocks; regularizes final task representations.
-- `mol_embedder_name` (fixed: `{mlp_v3_2d}`): 2D embedder implementation selected from registry.
-- `inst_embedder_name` (fixed: `{mlp_v3_3d}`): 3D instance embedder implementation selected from registry.
-- `aggregator_name` (fixed: `{task_attention_pool}`): 3D token aggregator selected from registry.
-- `predictor_name` (fixed: `{mlp_v3}`): Predictor head family selected from registry.
-- `head_num_layers` (`{2, 3, 4, 6}`): Shared residual predictor depth for all classification/aux heads.
-- `head_dropout` (`[0.0, 0.2]`): Shared dropout inside residual predictor blocks across all heads.
-- `head_stochastic_depth` (`[0.0, 0.1]`): Shared DropPath rate for residual predictor blocks in all heads.
-- `head_fc2_gain_non_last` (`{1e-3, 3e-3, 1e-2}`): Shared non-last residual block `fc2` init gain in all heads (controls early optimization speed).
-- `activation` (`{GELU, SiLU, Mish, ReLU, LeakyReLU}`): Nonlinearity selection passed to embedder and mixer blocks.
+Sample weight:
+- `w_i = clip(1 + rare_oversample_mult * rarity_i, 1, sample_weight_cap)`
 
-### 4.2 Optimization and effective batch size
+#### Balanced batch sampler (`MultitaskBalancedBatchSampler`)
 
-- `lr` (`[8e-5, 8e-4]`, log): AdamW learning rate; primary control of convergence speed vs instability.
-- `weight_decay` (`[3e-6, 3e-4]`, log): L2 regularization strength in AdamW; larger values can improve generalization but may underfit.
-- `batch_size` (`{128, 256, 512}`): Per-step minibatch size; larger values reduce gradient noise but increase memory pressure.
-- `accumulate_grad_batches` (`{8, 16}`): Gradient accumulation factor; increases effective batch size without increasing device memory footprint.
+- Enforces positive quota per batch:
+  - target positives: `round(batch_size * batch_pos_fraction)`
+  - clamp with `min_pos_per_batch`, positivity/negativity availability
+- Positive draws are rarity-weighted.
+- Optional bitmask-quota enrichment (`enforce_bitmask_quota=True`):
+  - per-256 quotas scaled to batch size:
+    - `quota_t450_per_256` (task index 1)
+    - `quota_fgt480_per_256` (task index 3)
+    - `quota_multi_per_256` (samples positive on >=2 tasks)
+  - priority order: Fgt480 -> T450 -> multi -> generic positive pool
+- Negatives drawn uniformly from all-negative samples.
 
-### 4.3 Class imbalance and task balancing
+### 8.5 Bitmask frequency weights
 
-- Task index mapping for `t0..t3`:
-  `t0=Transmittance_340`, `t1=Transmittance_450`,
-  `t2=Fluorescence_340_450`, `t3=Fluorescence_more_than_480`.
-- `posw_clip_t0` (`[12, 28]`, log): BCE positive-weight clip for `t0` (moderate imbalance, ~5.6% positives).
-- `posw_clip_t1` (`[35, 90]`, log): BCE positive-weight clip for `t1` (strong imbalance, ~1.5% positives).
-- `posw_clip_t2` (`[3, 10]`, log): BCE positive-weight clip for `t2` (least imbalanced task, ~16.7% positives).
-- `posw_clip_t3` (`[90, 220]`, log): BCE positive-weight clip for `t3` (extreme rarity, ~0.24% positives), bounded for stability.
-- `gamma_t0` (`[0.5, 2.0]`): Focal gamma for `t0`; moderate hard-example emphasis.
-- `gamma_t1` (`[1.0, 3.0]`): Focal gamma for `t1`; stronger focus on rare positives.
-- `gamma_t2` (`[0.0, 1.5]`): Focal gamma for `t2`; lighter focusing due to higher prevalence.
-- `gamma_t3` (`[1.5, 4.0]`): Focal gamma for `t3`; strongest hard-example focus.
-- `rare_oversample_mult` (`[2.0, 10.0]`): Multiplier for dynamic rarity score in sampler weights (`w = 1 + rare_oversample_mult * rarity` before clipping).
-- `rare_target_prev` (`[0.06, 0.12]`): Target prevalence for rarity scoring; centered to boost rare endpoints without forcing oversampling of the ~16.7% task.
-- `sample_weight_cap` (`[6.0, 9.0]`): Maximum per-sample sampler weight; tighter cap to avoid runaway repetition of very rare positives.
-- `use_balanced_batch_sampler` (default: `True`): Enables batch-level balancing so training batches are not dominated by all-negative samples.
-- `batch_pos_fraction` (default: `0.35`): Target fraction of positive samples per training batch (positives defined as any active endpoint).
-- `min_pos_per_batch` (default: `1`): Hard lower bound on number of positives per batch when both positive and negative pools exist.
-- `enforce_bitmask_quota` (default: `True`): Enables additional per-batch quotas for rare multitask patterns.
-- `quota_t450_per_256` (default: `4`): Target minimum count of `t1`-positive samples per batch, scaled linearly with batch size from anchor `256`.
-- `quota_fgt480_per_256` (default: `1`): Target minimum count of `t3`-positive samples per batch, scaled linearly with batch size from anchor `256`.
-- `quota_multi_per_256` (default: `8`): Target minimum count of multi-positive samples (`sum_t y_it >= 2`) per batch, scaled from anchor `256`.
-- `use_bitmask_loss_weight` (default: `True`): Enables train-fold bitmask-frequency weighting on `w_cls` to upweight rare endpoint combinations.
-- `bitmask_weight_alpha` (default: `0.5`): Exponent in bitmask rarity weighting (`0` disables effect, larger values increase emphasis on rare patterns).
-- `bitmask_weight_cap` (default: `3.0`): Upper bound for bitmask-frequency multiplier applied to `w_cls`.
-- `lam_t0` (`[0.6, 1.6]`, log): Raw classification-loss multiplier prior for `t0`.
-- `lam_t1` (`[1.0, 2.4]`, log): Raw classification-loss multiplier prior for `t1`.
-- `lam_t2` (`[0.25, 0.9]`, log): Raw classification-loss multiplier prior for `t2`.
-- `lam_t3` (`[1.8, 3.5]`, log): Raw classification-loss multiplier prior for `t3`.
-- `lam_floor` (`[0.35, 0.85]`): Lower bound for normalized per-task lambda weights; prevents easier tasks from collapsing to near-zero weight but avoids forcing full uniformity.
-- `lam_ceil` (`[1.30, 2.20]`): Upper bound for normalized per-task lambda weights; keeps rare-task emphasis strong without allowing unstable domination.
-- `lambda_aux_bitmask` (`[0.02, 0.08]`): Weight of auxiliary bitmask-group CE loss.
-- `bitmask_group_top_k` (default: `6`): Number of frequent bitmask IDs kept as explicit classes; remaining masks are merged into `other`.
-- `bitmask_group_weight_alpha` (default: `0.5`): Exponent for grouped-class inverse-frequency weighting in bitmask CE.
-- `bitmask_group_weight_cap` (default: `5.0`): Cap for grouped-class CE weight multiplier.
+`make_bitmask_sample_weights`:
+- bitmask ID from multitask binary vector
+- `weight_i = clip((median_nonzero_count / count(mask_i))^alpha, 1, cap)`
 
-Lambda processing used in training:
+Used to rescale `w_cls` when `use_bitmask_loss_weight=True`.
 
-- Raw `lam_t*` values are normalized by mean.
-- Values are clipped by `lam_floor/lam_ceil`.
-- Weights are renormalized by mean again.
-- Final `lam` scales per-task focal loss before averaging.
+---
 
-Sampler rarity processing used in training:
+## 9. Metrics and Optimization Target
+
+### 9.1 Validation metrics
+
+Prediction post-processing:
+- logits sanitized: `nan->0`, `+inf->50`, `-inf->-50`
+- probabilities: `sigmoid(logits)`
+
+Per-task AP (`ap_per_task`):
+- weighted by `w_cls` only for tasks `(0,1)`
+- if a task has zero positives, AP set to `0.0`
+
+Per-task ROC-AUC (`roc_auc_per_task`):
+- weighted by `w_cls` only for tasks `(0,1)`
+- if undefined (single-class target), fallback `0.5`
+
+### 9.2 Fold score during HPO
+
+Fixed objective mode: `macro_plus_min`
 
 Definitions:
+- `macro_ap = mean(AP_t0..AP_t3)`
+- `min_ap = min(AP_t0..AP_t3)`
+- `score = (1 - min_w) * macro_ap + min_w * min_ap`
 
-- Let `y_it in {0,1}` be label of sample `i` for task `t` (`t=0..3`).
-- Let `p_t = mean_i(y_it)` be task prevalence in the current train fold.
-- Let `P = {i : sum_t y_it > 0}` be samples positive for at least one task.
-- Let `N = {i : sum_t y_it = 0}` be all-negative samples.
+Interpretation:
+- optimizes average quality while penalizing neglect of weakest task.
 
-Step 1: task rarity (auto mode):
+Trial value:
+- mean of fold scores across configured CV folds.
 
-- `r_t = clip((rare_target_prev - p_t) / rare_target_prev, 0, 1)`.
-- Interpretation:
-  `r_t = 0` means task is not rare w.r.t. the target.
-  `r_t -> 1` means task is much rarer than target.
+### 9.3 Logged outputs per fold/trial
 
-Step 2: per-sample rarity:
+Fold detail includes:
+- trained epochs
+- best epoch
+- macro PR-AUC/AP
+- per-task PR-AUC/AP
+- macro ROC-AUC
+- per-task ROC-AUC
+- final fold score and objective settings
 
-- `r_i = max_t(y_it * r_t)`.
-- A sample is considered "more rare" if it is positive on a rarer task.
+---
 
-Step 3: rarity-aware sample weight:
+## 10. Hyperparameter Search Space (Current)
 
-- `w_i = clip(1 + rare_oversample_mult * r_i, 1, sample_weight_cap)`.
-- This weight controls preference among positives during batch construction.
+Source: `training/search_space.py`
 
-Step 4: batch-level positive quota (anti-all-negative guard):
+Task index mapping in code:
+- `t0 -> Transmittance_340`
+- `t1 -> Transmittance_450`
+- `t2 -> Fluorescence_340_450`
+- `t3 -> Fluorescence_more_than_480`
 
-- `target_pos = round(batch_size * batch_pos_fraction)`.
-- `n_pos = clip(max(min_pos_per_batch, target_pos), low, high)`, where:
-  `low = 1` if `|P|>0` else `0`;
-  `high = batch_size - 1` if `|N|>0` else `batch_size`.
-- `n_neg = batch_size - n_pos`.
+Observed prevalence prior used to tighten ranges (documented in code comments):
+- T340: `~0.056`
+- T450: `~0.015`
+- F340450: `~0.167`
+- Fgt480: `~0.0024`
 
-Step 5: optional bitmask-aware sub-quotas inside positive draw:
+### 10.1 Architecture and regularization
 
-- If `enforce_bitmask_quota=True`, reserve positive slots (up to available `n_pos`) for:
-  `t3` positives (`quota_fgt480_per_256`), `t1` positives (`quota_t450_per_256`),
-  and multi-positive samples (`quota_multi_per_256`), with per-batch quotas scaled by `batch_size / 256`.
-- Priority order is rarest-first: `t3` -> `t1` -> multi-positive.
-- Quota draws are with replacement and keep rarity-aware probabilities from `w_i`.
+- `mol_hidden`: `{128, 256}`
+- `mol_layers`: `[2, 5]`
+- `mol_dropout`: `[0.10, 0.25]`
+- `inst_hidden`: `{128, 256}`
+- `inst_layers`: `[3, 5]`
+- `inst_dropout`: `[0.05, 0.15]`
+- `proj_dim`: `{256, 512}`
+- `attn_heads`: `{8, 16, 32}`
+- `attn_dropout`: `[0.05, 0.2]`
+- `mixer_hidden`: `{128, 256}`
+- `mixer_layers`: `[3, 5]`
+- `mixer_dropout`: `[0.05, 0.2]`
+- `activation`: `{GELU, SiLU, Mish, ReLU, LeakyReLU}`
+- `mol_embedder_name`: `{mlp_v3_2d}`
+- `inst_embedder_name`: `{mlp_v3_3d}`
+- `aggregator_name`: `{task_attention_pool}`
+- `predictor_name`: `{mlp_v3}`
 
-Step 6: stochastic drawing per batch:
+Head-specific knobs:
+- `head_num_layers`: `{2, 3, 4, 6}`
+- `head_dropout`: `[0.0, 0.2]`
+- `head_stochastic_depth`: `[0.0, 0.1]`
+- `head_fc2_gain_non_last`: `{1e-3, 3e-3, 1e-2}`
 
-- Draw remaining positive slots from `P` with replacement, probability proportional to `w_i`.
-- Draw `n_neg` indices from `N` with replacement, uniformly.
-- Concatenate and shuffle.
+### 10.2 Optimization/runtime
 
-Step 7: repeat for each batch in epoch:
+- `lr`: `[8e-5, 8e-4]` (log)
+- `weight_decay`: `[3e-6, 3e-4]` (log)
+- `batch_size`: `{128, 256, 512}`
+- `accumulate_grad_batches`: `{8, 16}`
 
-- Number of batches is `ceil(num_train_samples / batch_size)` (`drop_last=False`).
-- Because draws use replacement, both positive balancing and rarity oversampling persist throughout the epoch.
+### 10.3 Imbalance/task weights
 
-What this guarantees:
+Pos-weight clips:
+- `posw_clip_t0`: `[12, 28]` (log)
+- `posw_clip_t1`: `[35, 90]` (log)
+- `posw_clip_t2`: `[3, 10]` (log)
+- `posw_clip_t3`: `[90, 220]` (log)
 
-- Batches are not dominated by all-negative samples when positives exist.
-- Oversampling is still active:
-  first at batch composition level (`n_pos` quota),
-  then inside positive subset via rarity-aware probabilities (`w_i`) and optional bitmask quotas.
-- Rare tasks are emphasized without hard task cutoffs.
+Focal gamma:
+- `gamma_t0`: `[0.5, 2.0]`
+- `gamma_t1`: `[1.0, 3.0]`
+- `gamma_t2`: `[0.0, 1.5]`
+- `gamma_t3`: `[1.5, 4.0]`
 
-Bitmask-frequency loss weighting (train fold only):
+Sampling:
+- `rare_oversample_mult`: `[2.0, 10.0]`
+- `rare_target_prev`: `[0.06, 0.12]`
+- `sample_weight_cap`: `[6.0, 9.0]`
 
-- Let `m_i` be integer bitmask of sample `i` (e.g., `[1,0,1,0] -> 5`).
-- Let `count(m_i)` be train-fold frequency of bitmask `m_i`.
-- Let `ref = median({count(k) | count(k) > 0})`.
-- Additional sample multiplier:
-  `u_i = clip((ref / count(m_i)) ^ bitmask_weight_alpha, 1, bitmask_weight_cap)`.
-- Training classification weights become:
-  `w_cls_train[i, t] = base_w_cls_train[i, t] * u_i`.
-- Validation/leaderboard weights are not reweighted by bitmask frequency.
+Lambda weights:
+- `lam_t0`: `[0.6, 1.6]` (log)
+- `lam_t1`: `[1.0, 2.4]` (log)
+- `lam_t2`: `[0.25, 0.9]` (log)
+- `lam_t3`: `[1.8, 3.5]` (log)
+- `lam_floor`: `[0.35, 0.85]`
+- `lam_ceil`: `[1.30, 2.20]`
 
-Legacy mode:
+Aux weights:
+- `lambda_aux_abs`: `[0.05, 0.5]`
+- `lambda_aux_fluo`: `[0.05, 0.5]`
+- `lambda_aux_bitmask`: `[0.02, 0.08]`
+- `reg_loss_type`: `{mse}`
 
-- If old params contain `rare_prev_thr`, sampler uses hard-threshold task rarity:
-  task is rare iff `p_t < rare_prev_thr`.
-  This is kept only for backward compatibility with previous studies.
+HPO objective control:
+- `min_w`: `[0.1, 0.6]`
 
-Illustrative example for your prevalence profile:
+### 10.4 Effective dimensional bounds
 
-- If fold prevalences are approximately
-  `T340=0.056`, `T450=0.0147`, `F340450=0.1669`, `Fgt480=0.0024`
-  and `rare_target_prev=0.10`, then:
-  `r ~= [0.44, 0.85, 0.00, 0.98]`.
-- With `rare_oversample_mult=6`, pre-cap weights for positives are roughly:
-  `T340: 3.64`, `T450: 6.10`, `F340450: 1.00`, `Fgt480: 6.86`.
-- So positives from `Fgt480` and `T450` are sampled much more often inside the positive quota.
+Given search space:
+- 2D encoder hidden width <= 256
+- 3D encoder hidden width <= 256
+- projection dim <= 512
+- mixer input dim = `2 * proj_dim` <= 1024
+- mixer hidden width <= 256
+- head input dim = mixer hidden <= 256
 
-### 4.4 Auxiliary weighting
+So current search space enforces compact architecture with no layer width above 1024.
 
-- `lambda_aux_abs` (`[0.05, 0.5]`): Weight of absorbance auxiliary regression loss in total objective.
-- `lambda_aux_fluo` (`[0.05, 0.5]`): Weight of fluorescence auxiliary regression loss in total objective.
-- `lambda_aux_bitmask` (`[0.02, 0.08]`): Weight of bitmask-group auxiliary classification loss in total objective.
-- `reg_loss_type` (fixed: `{mse}`): Regression criterion for auxiliary heads; currently constrained to MSE only in search space.
+---
 
-### 4.5 HPO objective control
+## 11. Trainer, Pruning, Reproducibility, and Resource Policy
 
-- `objective_mode` (fixed: `macro_plus_min`): Trial score combines overall AP and worst-task AP to discourage neglecting harder tasks.
-- `min_w` (`[0.1, 0.6]`): Weight of `min_ap` in score.
+### 11.1 Lightning trainer settings
 
-Per-fold metric definitions:
+`LightningTrainerFactory`:
+- Early stopping on `val_macro_ap`, mode `max`, patience from config
+- Optional checkpoint callback on same metric
+- Optional Optuna pruning callback
+- deterministic=True
+- gradient_clip_val=0.0
+- logger/progress/model-summary disabled for lean runtime
 
-- `aps = [ap_task0, ap_task1, ap_task2, ap_task3]`
-- `macro_ap = mean(aps)`
-- `min_ap = min(aps)`
+### 11.2 Pruning policy
 
-Per-fold objective:
+Optuna study defaults (`StudyConfig`):
+- `pruner_kind = "percentile"`
+- `pruner_warmup_steps = 8`
+- `pruner_startup_trials = 10`
+- `pruner_percentile = 25.0`
 
-- `fold_score = (1 - min_w) * macro_ap + min_w * min_ap`
+Interpretation:
+- Warmup steps are validation-report steps ignored before prune checks.
+- Startup trials run unpruned before pruner activates.
+- Percentile pruner at 25th percentile is intentionally less aggressive than median pruning.
 
-Optuna trial objective across CV folds:
+Alternative:
+- `pruner_kind="median"` switches to `MedianPruner` with same startup/warmup counts.
 
-- `trial_value = mean(fold_score_fold0, fold_score_fold1, ..., fold_score_foldK)`
+### 11.3 Checkpoint and disk behavior
 
-Notes:
+CV folds (`MILFoldTrainer`):
+- `save_checkpoint=False` to reduce disk usage.
+- temporary fold ckpt directories are removed after fold run.
 
-- `fold_score` is what you see as `score=...` in fold logs.
-- Printed `min_w` is rounded for display, while objective computation uses full precision.
+Final run (`MILFinalTrainer`):
+- saves exactly one best checkpoint (`save_top_k=1`) in `final_best_train_vs_leaderboard/`.
 
-### 4.6 Optuna pruning strategy
+---
 
-The CV-HPO stage uses delayed, less aggressive pruning by default:
+## 12. Pipeline Orchestration (HPO + Final)
 
-- `pruner_kind` (default: `percentile`): selects Optuna pruner type.
-- `pruner_warmup_steps` (default: `8`): no pruning decisions before this many reported steps.
-- `pruner_startup_trials` (default: `10`): first trials run without pruning-based elimination.
-- `pruner_percentile` (default: `25.0`): threshold for `PercentilePruner` (lower percentile = less aggressive pruning).
+Main orchestrator: `entrypoints/hpo_pipeline.py::MILPipelineOrchestrator`
 
-Behavior:
+### 12.1 Environment setup
 
-- If `pruner_kind == "percentile"`:
-  use `optuna.pruners.PercentilePruner(percentile=25.0, n_startup_trials=10, n_warmup_steps=8)`.
-- If `pruner_kind == "median"`:
-  use `optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=8)`.
+`PipelineEnvironmentFactory.prepare(...)`:
+- sets seeds (`set_all_seeds`)
+- sets torch matmul precision hint (`high`) best-effort
+- writes `run_meta.json`
+- resolves workers:
+  - if `num_workers >= 0`, use it directly
+  - else infer from `SLURM_CPUS_PER_TASK`/`os.cpu_count()` and cap to `[0..23]`
+- `pin_memory` only if CLI flag true and CUDA available
 
-Rationale:
+### 12.2 HPO stage
 
-- Rare-task AP often stabilizes later, so earlier defaults could prune promising trials too soon.
-- Longer warmup and startup windows reduce premature pruning while still controlling HPO cost.
+If `--run_hpo`:
+1. Build `MILCVData` from `--use_splits` rows.
+2. Build `CVRunConfig`.
+3. Create study:
+   - study name fixed: `multimodal_mil_aux_gpu`
+   - storage: `sqlite:///<study_dir>/multimodal_mil_aux_gpu.sqlite3`
+   - `load_if_exists=True`
+4. Run `study.optimize(...)`.
+5. Save artifacts:
+   - `multimodal_mil_aux_gpu_trials.csv`
+   - `multimodal_mil_aux_gpu_best_params.json`
+   - `multimodal_mil_aux_gpu_best_fold_metrics.json`
 
-## 5) Training Behavior (non-search)
+If not `--run_hpo`:
+- load params from `--best_params_json` or default `<study_dir>/multimodal_mil_aux_gpu_best_params.json`.
 
-- Early stopping + checkpoint monitor: `val_macro_ap`
-- Deterministic trainer setup is enabled
-- Optuna pruning callback is integrated for CV trials
-- Auxiliary targets are standardized using train-fold statistics only
-- Train dataloaders use `MultitaskBalancedBatchSampler` by default (`use_balanced_batch_sampler=True`)
-- Train-fold `w_cls` can be bitmask-frequency reweighted (`use_bitmask_loss_weight=True` by default)
-- Bitmask-group mapping and bitmask-group class weights are computed from train fold only (CV) / train split only (final)
-- HPO runs only when CLI flag `--run_hpo` is provided
-- Without `--run_hpo`, pipeline loads params from `--best_params_json`; if omitted, defaults to `<study_dir>/multimodal_mil_aux_gpu_best_params.json`
-- Final training stage retrains best config and can export leaderboard attention
+### 12.3 Final stage (always runs)
 
-## 6) Guardrails
+Always executed after HPO/param load:
+1. Build final instance index using IDs from `train U leaderboard_split`.
+2. Train model on `train` only.
+3. Validate on `leaderboard_split`.
+4. Write final artifacts in `final_best_train_vs_leaderboard/`.
 
-- No compatibility alias modules for removed paths
-- No duplicated implementations across layers
-- No wildcard exports (`import *`) in package surfaces
+No condition on `--export_leaderboard_attn`; this flag is compatibility-only.
 
-## 7) Chem-ACE Explainability
+---
 
-Chem-ACE implementation lives in:
+## 13. Final Evaluation and Export Artifacts
 
-- `explainability/chem_ace/config.py`
-- `explainability/chem_ace/types.py`
-- `explainability/chem_ace/patches/*`
-- `explainability/chem_ace/embedding/*`
-- `explainability/chem_ace/concepts/*`
-- `explainability/chem_ace/semantics/*`
-- `explainability/chem_ace/cav/*`
-- `explainability/chem_ace/db/*`
-- `explainability/chem_ace/analytics/*`
-- `entrypoints/chem_ace_demo.py`
+Directory: `<study_dir>/final_best_train_vs_leaderboard/`
 
-Flow:
+### 13.1 Core metrics
 
-1. Patch generation:
-   local subgraphs, BRICS, Murcko, optional Pharm3D features.
-2. Patch embeddings:
-   activation-layer embeddings via masked input or node-pooling strategy.
-3. Concept discovery:
-   k-means / hierarchical / optional HDBSCAN, with support/coherence filtering and centroid deduplication.
-4. Semantic tagging:
-   charge, conjugation/aromaticity, geometry, pharmacophore role tags + `label_auto`.
-5. CAV/TCAV:
-   repeated random counterexample sets, per-task sign-rate and mean directional derivative.
-6. Persistence and analytics:
-   SQLAlchemy/SQLite concept DB with immutable concept-set snapshots and query API for trend/collapse analysis.
+- `leaderboard_eval.json`:
+  - macro PR-AUC (`macro_ap`, `macro_pr_auc`)
+  - macro ROC-AUC (`macro_auc`)
+  - per-task PR-AUC and ROC-AUC
+  - `best_epoch`, `best_ckpt_path`
+- `leaderboard_auc_per_task.csv`:
+  - `task`, `auc`
 
-## 8) Integrated Explainability In Final Pipeline
+### 13.2 Attention + predictions export
 
-Final MIL training (`MILFinalTrainer`) now supports integrated Chem-ACE and Lambda-Vol with CLI flags:
+`export_leaderboard_attention(...)` writes one row per conformer:
+- `ID`
+- `conf_id`
+- 4 prediction columns:
+  - `pred_Transmittance_340`
+  - `pred_Transmittance_450`
+  - `pred_Fluorescence_340_450`
+  - `pred_Fluorescence_more_than_480`
+- 4 attention columns:
+  - `attn_Transmittance_340`
+  - `attn_Transmittance_450`
+  - `attn_Fluorescence_340_450`
+  - `attn_Fluorescence_more_than_480`
 
+Attention handling details:
+- takes `attn [B,4,N]`
+- masks invalid positions
+- renormalizes per task over valid conformers
+- if sum invalid/non-positive, falls back to uniform over valid conformers
+
+Output format:
+- If extension is parquet and parquet engine missing, automatic fallback to CSV with warning.
+- Default final output path: `<study_dir>/leaderboard_attn.csv` unless `--attn_out` provided.
+
+---
+
+## 14. Chem-ACE Integration (Optional)
+
+Integration entry: `training/explainability_runtime.py::prepare_chem_ace_bundle`
+
+Enabled by:
 - `--run_chem_ace`
-- `--run_lambda_vol` (auto-enables Chem-ACE)
+- or implicitly when `--run_lambda_vol` is set
 
-### 8.1 Chem-ACE in pipeline
+Hard requirements:
+- RDKit must be importable
+- labels table must contain `--curated_smiles_col` (default `curated_SMILES`)
 
-During final optimized run, Chem-ACE concept preparation uses:
+### 14.1 Chem-ACE pipeline configuration in final run
 
-- `ID` + `curated_SMILES` from labels table
-- per-`ID` 2D vectors
-- per-(`ID`,`conf_id`) merged 3D+QM vectors
+Runtime sets:
+- `embedding.layer_name = "feature_fusion_2d3dqm"`
+- `embedding.strategy = "masked_input"` at config object level, but integrated final embedding persistence uses explicit `strategy="feature_projection"` for fused vectors
+- `patch_generation.pharm3d.enabled = False` in this integrated path
+- database default URI:
+  - `sqlite:///<chem_ace_output_dir>/chem_ace.sqlite3`
 
-Implementation entry:
+### 14.2 Molecule preparation
 
-- `training/explainability_runtime.py::prepare_chem_ace_bundle`
+- Uses `Chem.MolFromSmiles(curated_SMILES)` then `Chem.AddHs`.
+- Concept scope IDs = `train U leaderboard IDs`, optionally truncated by `chem_ace_max_ids`.
+- Conformers per molecule truncated by `chem_ace_max_confs_per_id` if >0.
 
-Design:
+### 14.3 Patch generation
 
-- patch generation runs per molecule and per selected conformer ID (configurable cap)
-- Pharm3D patch generation is disabled in integrated mode by default for scale stability
-- each patch gets a fused embedding: `2D slice + 3D/QM slice + patch descriptors + patch-type one-hot`
-- concept discovery + semantic tagging are persisted in Chem-ACE SQLite DB
-- concept-to-molecule and concept-to-(ID,conf_id) membership maps are produced for monitoring
+Available generators in framework:
+- local subgraph
+- BRICS
+- Murcko (+ optional framework)
+- Pharm3D
 
-### 8.2 Lambda-Vol during training
+Integrated final pipeline currently disables Pharm3D by config; others remain active.
 
-Lambda-Vol is attached as a Lightning callback in final training:
+Patch IDs/hashes are deterministic SHA1 signatures over:
+- patch type
+- sorted atom indices
+- SMARTS/fragment representation
+- metadata
 
+### 14.4 Patch embedding in integrated final pipeline
+
+For each patch, integrated runtime creates feature-level vector:
+- `v2d = take_or_pad(x2d, chem_ace_max_2d_dim)`
+- `v3dqm = take_or_pad(conf-specific instance vector or molecule mean, chem_ace_max_3dqm_dim)`
+- descriptor vector:
+  - 10 scalar patch descriptors
+  - +5 one-hot patch type indicators
+
+Final patch vector:
+- `vec = concat([v2d, v3dqm, descriptors])`
+- dimension = `chem_ace_max_2d_dim + chem_ace_max_3dqm_dim + 15`
+
+Stored with metadata via embedding cache and DB.
+
+### 14.5 Concept discovery
+
+Clustering algorithms configured (default):
+- kmeans
+- hierarchical
+- hdbscan (if installed)
+
+Defaults (`ConceptDiscoveryConfig`):
+- `kmeans_k=24`
+- `hierarchical_distance_threshold=1.25`
+- `hdbscan_min_cluster_size=12`
+- `min_support=8`
+- `min_coherence=0.0`
+- `dedup_centroid_similarity_threshold=0.98`
+
+Coherence definition:
+- `coherence = 1 / (1 + mean_distance_to_centroid)`
+
+Membership score:
+- `membership_score = 1 / (1 + distance_to_centroid)`
+
+Medoid:
+- nearest point to centroid in Euclidean distance.
+
+Concept IDs:
+- SHA1 over `(layer_name, algorithm, sorted patch IDs)`.
+
+### 14.6 Semantic tagging and naming
+
+Taggers produce evidence-backed tags with confidence:
+- charge tags
+- conjugation/aromaticity tags
+- geometry tags
+- pharmacophore tags
+
+Key thresholds (`SemanticTaggingConfig` defaults):
+- `charge_threshold_formal = 1`
+- `aromatic_fraction_threshold = 0.35`
+- `conjugation_size_threshold = 6`
+- `planarity_rmsd_threshold = 0.25`
+
+Naming:
+- rule-based first (JSON registry)
+- fallback descriptor-based label (`"<top descriptors> motif"`)
+
+### 14.7 Chem-ACE persistence schema
+
+Core tables (`explainability/chem_ace/db/models.py`):
+- `runs`, `tasks`, `molecules`, `conformers`
+- `patches`, `patch_embeddings`
+- `concept_sets` (immutable/versioned)
+- `concepts`, `concept_memberships`, `concept_tags`
+- `cavs`, `tcav_epoch`, `mil_concept_epoch`
+
+Concept-set snapshots are immutable and versioned per run.
+
+---
+
+## 15. Lambda-Vol Integration (Optional)
+
+Integration path:
 - `training/explainability_runtime.py::build_lambda_vol_callback`
-- callback class: `explainability/lambda_vol/integrations/lightning.py::LambdaVolLightningCallback`
+- callback: `LambdaVolLightningCallback`
+- monitor core: `LambdaVolMonitor`
 
-Per validation epoch, provider collects:
+Enabled by:
+- `--run_lambda_vol`
 
-- task/concept attention support and prevalence using conformer-level attention weights
-- attention entropy and witness rate per task
-- TCAV per task/concept from current model layer activations + gradients (`collect_gradients_for_layer`, `run_tcav_from_arrays`)
-- task metrics from trainer callback metrics
+Automatically enforces:
+- `run_lambda_vol -> run_chem_ace = True`
 
-These frames feed `LambdaVolMonitor`, which computes pressure dynamics, regime labels, alerts, and recommendations, then exports artifacts on fit end.
+### 15.1 Pressure state definition
 
-### 8.3 Output artifacts
+For task `x`, concept `y`, epoch `t`:
+- tracked inputs:
+  - `TCAV[x,y,t]`
+  - `attention_support[x,y,t]`
+  - `prevalence[x,y,t]`
+  - task-level entropy/witness/train/val/loss/calibration
 
-Final run writes:
+Smoothing and drift:
+- `tcav_smoothed_t = beta * tcav_smoothed_{t-1} + (1-beta)*tcav_t` with `beta = tcav_ema_beta`
+- `delta_tcav_t = tcav_t - tcav_{t-1}`
 
-- `final_best_train_vs_leaderboard/explainability_artifacts.json`
+Composite pressure:
+- `rho_t = alpha * tcav_smoothed_t + (1-alpha) * attention_support_t`
 
-This file points to:
+Drift:
+- `drift_t = clip(rho_t - rho_{t-1}, -drift_clip, +drift_clip)`
 
-- Chem-ACE DB/artifacts directory
-- Lambda-Vol tensor/log/HTML outputs (3D manifold/lattice, alerts, recommendations)
+Default tracker config:
+- `alpha=0.6`
+- `tcav_ema_beta=0.8`
+- `drift_clip=5.0`
+
+### 15.2 Regime inference (`q(t)`)
+
+Rule-based labels:
+- `warmup`
+- `fitting`
+- `stable_generalization`
+- `overfit_onset`
+- `refit`
+
+Default thresholds:
+- `warmup_epochs=3`
+- `val_slope_small=1e-3`
+- `overfit_gap_threshold=0.03`
+- `entropy_drop_threshold=0.05`
+- `concentration_rise_threshold=0.05`
+
+Uses recent slope heuristics over aggregated per-task history (window up to 4).
+
+### 15.3 Dynamics model (discrete)
+
+For matrix `rho` (tasks x concepts):
+- `regime_core = A_q * rho` where `A_q = regime_a[regime_label]`
+- `trend_loop = trend_coeff * prev_drift`
+- `revert_loop = -revert_coeff * (rho - running_mean_rho)`
+- `context_term = context_scale * tanh(mean(context_covariates))` broadcasted
+- `feedback = task_coupling @ rho + rho @ concept_coupling` (optional)
+- `dissipation = lambda_damping * rho + phi_state_damping * rho^2`
+- `predicted_next = rho + regime_core + trend_loop + revert_loop + context_term + feedback - dissipation`
+
+Default dynamics config:
+- `lambda_damping=0.08`
+- `phi_state_damping=0.0`
+- `trend_coeff=0.25`
+- `revert_coeff=0.20`
+- `context_scale=0.15`
+- `use_cross_task_coupling=True`
+- `use_cross_concept_coupling=True`
+- regime gains:
+  - warmup `0.15`
+  - fitting `0.08`
+  - stable_generalization `0.02`
+  - overfit_onset `0.18`
+  - refit `0.06`
+
+### 15.4 Alerts and collapse detection
+
+Detector computes:
+- concentration metrics per task:
+  - normalized entropy
+  - gini
+  - top-k mass
+- runaway score per task/concept:
+  - `runaway = max(drift, 0) / (abs(dissipation)+1e-6)`
+- trend-vs-dissipation matrix:
+  - `drift - dissipation`
+
+Default alert thresholds:
+- `runaway_threshold=1.0`
+- `concentration_top_k=5`
+- `concentration_entropy_drop_alert=0.10`
+- `concentration_topk_mass_alert=0.75`
+- `blocked_concept_positive_drift=0.05`
+
+### 15.5 Recommendation policy
+
+Alert-driven recommendation engine (default enabled, auto-action disabled):
+- Runaway pressure:
+  - concept-balanced batching
+  - increase attention-entropy regularization
+- Concept collapse:
+  - hard-negative mining
+  - increase dropout/damping
+- Blocked concept drift:
+  - activate blocked-concept penalty
+  - oversample counterexamples
+
+Default policy:
+- `enabled=True`
+- `auto_action=False`
+
+### 15.6 Lambda-Vol artifacts
+
+Exporter writes under `<lambda_vol_output_dir>/<run_id>/`:
+- `concept_pressure_tensors.npz`
+- `concept_pressure_long.csv`
+- optional `concept_pressure_long.parquet`
+- `task_metrics_long.csv`
+- `concept_xyz.csv`
+- `pressure_lattice_long.csv`
+- plotly HTMLs:
+  - concept manifold per task
+  - pressure lattice
+  - heatmaps
+  - trend-vs-dissipation
+  - optional coupling graph
+- `alerts.json`, `alerts.md`
+- `recommendations.json`
+- `trend_vs_dissipation.csv`
+- `diagnostics_summary.md`
+- optional VTK (`concept_pressure.vtp`)
+- `metadata.json`
+
+### 15.7 Lambda-Vol persistence schema
+
+Tables (`explainability/lambda_vol/db/models.py`):
+- `lv_runs`
+- `lv_pressure_epoch`
+- `lv_task_epoch`
+- `lv_alerts`
+- `lv_recommendations`
+
+Query APIs include:
+- planar/conjugated rising pressure
+- high TCAV low prevalence
+- top trend loops
+- recommendations history
+
+---
+
+## 16. Integrated Explainability in Final Training
+
+When enabled in final run:
+1. Chem-ACE bundle prepared from train+leaderboard IDs.
+2. Lambda-Vol callback attached to Lightning trainer.
+3. On each validation epoch end:
+   - monitor loader sampled from leaderboard set
+   - per-epoch frames collected (TCAV + attention + task metrics)
+   - monitor step updates rho/regime/dynamics/alerts/recommendations and DB
+4. On fit end:
+   - Lambda-Vol exports finalized artifacts
+5. Final JSON summary:
+   - `final_best_train_vs_leaderboard/explainability_artifacts.json`
+
+Payload includes paths for Chem-ACE and Lambda-Vol artifacts.
+
+---
+
+## 17. CLI Surface (Current Behavior)
+
+Main parser: `entrypoints/hpo_pipeline.py`
+
+Key controls:
+- HPO:
+  - `--run_hpo`
+  - `--best_params_json`
+  - `--trials` (and compatibility alias `--trials_mil`)
+- Splits/folds:
+  - `--use_splits ...` (HPO dataset filter)
+  - `--folds ...` (optional explicit fold list)
+  - `--leaderboard_split` (final validation split name)
+- Runtime:
+  - `--max_epochs`, `--patience`, `--seed`
+  - `--nn_accelerator`, `--nn_devices`, `--precision`
+  - `--num_workers`, `--pin_memory`
+- Explainability:
+  - Chem-ACE flags and limits
+  - Lambda-Vol flags and monitoring limits
+
+Compatibility flags still accepted:
+- `--do_mil` (MIL-only pipeline)
+- `--export_leaderboard_attn` (deprecated compatibility; final eval/export always runs)
+
+---
+
+## 18. Reproducibility and Seed Usage
+
+Global setup:
+- `set_all_seeds(seed)` sets numpy, torch, cuda, and Lightning worker seed behavior.
+
+Notable deterministic offsets:
+- CV fold run seed: `seed + 5000*fold_id + trial.number`
+- CV train dataset seed: `seed + fold_id`
+- CV val dataset seed: `seed + 999 + fold_id`
+- CV balanced sampler seed: `seed + 1000*fold_id + trial.number`
+- Final balanced sampler seed: `seed + 4242`
+- Lambda-Vol monitor loader seed: `seed + 707`
+- Final attention export dataset seed: `seed + 123`
+
+---
+
+## 19. Guardrails and Failure Modes
+
+Explicit checks/fail-fast behavior:
+- Missing required columns in inputs -> `ValueError`
+- Missing IDs during 2D alignment -> `ValueError`
+- Empty leaderboard split in final stage -> `ValueError`
+- Empty patch set in Chem-ACE -> `RuntimeError`
+- Missing RDKit when Chem-ACE requested -> `RuntimeError`
+- Missing layer activation hook capture -> `RuntimeError`
+- Shape mismatch in tracker/dynamics -> `ValueError`
+- Unknown registry names -> `ValueError`
+
+Graceful degradation:
+- HDBSCAN unavailable -> skip hdbscan clustering with warning
+- Plotly unavailable -> write fallback text for HTML
+- Parquet engine unavailable in attention export -> fallback CSV
+- Optional VTK export only when PyVista available
+
+---
+
+## 20. Known Approximations and Design Choices
+
+1. Fluorescence auxiliary duplication
+- Two base regression targets are duplicated to 4 outputs.
+- This is an intentional shape-alignment approximation.
+
+2. Task-weighted metrics
+- Sample weights applied only to tasks `(0,1)` in AP/AUC calculations.
+- Tasks `(2,3)` are unweighted in metric computation.
+
+3. Concept pressure composition
+- `rho` is a convex blend of smoothed TCAV and attention support.
+- Chosen for stability and interpretability, not physical realism.
+
+4. Dynamics linearity
+- Lambda-Vol dynamics are linear-plus-damping heuristics with bounded context projection.
+- Intended for monitoring/control signals, not mechanistic simulation.
+
+5. Chem-ACE integrated embedding strategy in final pipeline
+- Uses fused feature vectors (`2D + 3D/QM + descriptors`) rather than model-layer activations.
+- This is deliberate for deterministic, scalable concept extraction over large datasets.
+
+6. Objective choice
+- `macro_plus_min` explicitly trades global gain vs weakest-task protection.
+- `min_w` controls that trade-off.
+
+---
+
+## 21. Extension Points (No Spaghetti Path)
+
+### 21.1 Add new model components
+
+- New 2D embedder:
+  - register via `register_2d_embedder(name, builder)`
+- New 3D embedder:
+  - register via `register_3d_embedder(name, builder)`
+- New aggregator:
+  - register via `register_aggregator(name, builder)`
+- New predictor family:
+  - register via `register_predictor(name, builder)`
+
+### 21.2 Add new Chem-ACE patching/tagging behavior
+
+- New patch generator implementing `PatchGenerator`
+- Include in `CompositePatchGenerator`
+- Add semantic tag rules or custom naming registry JSON
+
+### 21.3 Add new Lambda-Vol logic
+
+- Custom regime classifier via `RegimeClassifier` protocol
+- Custom action hooks via `InterventionActionHook`
+- Custom provider backends via provider protocols
+
+---
+
+## 22. Artifact Index (What to Expect After a Full Run)
+
+In `--study_dir`:
+- `run_meta.json`
+- HPO artifacts (if `--run_hpo`):
+  - `multimodal_mil_aux_gpu.sqlite3`
+  - `multimodal_mil_aux_gpu_trials.csv`
+  - `multimodal_mil_aux_gpu_best_params.json`
+  - `multimodal_mil_aux_gpu_best_fold_metrics.json`
+- final directory:
+  - `final_best_train_vs_leaderboard/leaderboard_eval.json`
+  - `final_best_train_vs_leaderboard/leaderboard_auc_per_task.csv`
+  - `leaderboard_attn.csv` (or custom `--attn_out`)
+  - optional `final_best_train_vs_leaderboard/explainability_artifacts.json`
+
+If Chem-ACE enabled:
+- Chem-ACE output dir with DB, cache, and pipeline summary.
+
+If Lambda-Vol enabled:
+- Lambda-Vol output dir with tensor exports, long tables, HTML visualizations, alerts, recommendations, and metadata.
+
+---
+
+## 23. Full Default Constant Reference
+
+This section lists defaults exactly as defined in typed configs and CLI parser, so no default constant is implicit.
+
+### 23.1 `BackboneConfig` defaults
+
+- `mol_hidden = 1024`
+- `mol_layers = 2`
+- `mol_dropout = 0.10`
+- `inst_hidden = 256`
+- `inst_layers = 3`
+- `inst_dropout = 0.05`
+- `proj_dim = 512`
+- `attn_heads = 8`
+- `attn_dropout = 0.05`
+- `mixer_hidden = 512`
+- `mixer_layers = 3`
+- `mixer_dropout = 0.05`
+- `activation = \"GELU\"`
+- `mol_embedder_name = \"mlp_v3_2d\"`
+- `inst_embedder_name = \"mlp_v3_3d\"`
+- `aggregator_name = \"task_attention_pool\"`
+- `predictor_name = \"mlp_v3\"`
+
+### 23.2 `HeadConfig` defaults
+
+- `num_layers = 2`
+- `dropout = 0.1`
+- `stochastic_depth = 0.1`
+- `fc2_gain_non_last = 1e-2`
+
+### 23.3 `OptimizationConfig` defaults
+
+- `lr = 8e-5`
+- `weight_decay = 3e-6`
+
+### 23.4 `RuntimeConfig` defaults
+
+- `batch_size = 128`
+- `accumulate_grad_batches = 8`
+
+### 23.5 `SamplerConfig` defaults
+
+- `rare_oversample_mult = 0.0`
+- `rare_target_prev = 0.10`
+- `rare_prev_thr = None`
+- `sample_weight_cap = 10.0`
+- `use_balanced_batch_sampler = True`
+- `batch_pos_fraction = 0.35`
+- `min_pos_per_batch = 1`
+- `enforce_bitmask_quota = True`
+- `quota_t450_per_256 = 4`
+- `quota_fgt480_per_256 = 1`
+- `quota_multi_per_256 = 8`
+- `use_bitmask_loss_weight = True`
+- `bitmask_weight_alpha = 0.5`
+- `bitmask_weight_cap = 3.0`
+
+### 23.6 `LossWeightingConfig` defaults
+
+- `lam_t0 = None`
+- `lam_t1 = None`
+- `lam_t2 = None`
+- `lam_t3 = None`
+- `lam_floor = 0.25`
+- `lam_ceil = 3.5`
+- `lambda_power = 1.0`
+- `posw_clip_t0 = None`
+- `posw_clip_t1 = None`
+- `posw_clip_t2 = None`
+- `posw_clip_t3 = None`
+- `pos_weight_clip = 50.0`
+- `gamma_t0 = 0.0`
+- `gamma_t1 = 0.0`
+- `gamma_t2 = 0.0`
+- `gamma_t3 = 0.0`
+- `lambda_aux_abs = 0.05`
+- `lambda_aux_fluo = 0.05`
+- `lambda_aux_bitmask = 0.05`
+- `bitmask_group_top_k = 6`
+- `bitmask_group_weight_alpha = 0.5`
+- `bitmask_group_weight_cap = 5.0`
+- `reg_loss_type = \"mse\"`
+
+### 23.7 `ObjectiveConfig` defaults
+
+- `mode = \"macro_plus_min\"`
+- `min_w = 0.30`
+
+### 23.8 Study/pruner defaults (`StudyConfig`)
+
+- `direction = \"maximize\"`
+- `pruner_kind = \"percentile\"`
+- `pruner_warmup_steps = 8`
+- `pruner_startup_trials = 10`
+- `pruner_percentile = 25.0`
+
+### 23.9 Final explainability defaults (`FinalExplainabilityConfig`)
+
+- `run_chem_ace = False`
+- `run_lambda_vol = False`
+- `curated_smiles_col = \"curated_SMILES\"`
+- `chem_ace_output_dir = None`
+- `chem_ace_db_uri = None`
+- `chem_ace_max_ids = 10000`
+- `chem_ace_max_confs_per_id = 4`
+- `chem_ace_max_2d_dim = 256`
+- `chem_ace_max_3dqm_dim = 256`
+- `chem_ace_top_concepts = 64`
+- `lambda_vol_output_dir = None`
+- `lambda_vol_db_uri = None`
+- `lambda_vol_layer_name = \"mixer_post_norm\"`
+- `lambda_vol_top_concepts = 24`
+- `lambda_vol_monitor_max_samples = 512`
+- `lambda_vol_tcav_repeats = 2`
+- `lambda_vol_random_counterexamples = 96`
+- `lambda_vol_min_concept_samples = 8`
+
+### 23.10 CLI parser defaults (`entrypoints/hpo_pipeline.py`)
+
+Data/columns:
+- `--id_col ID`
+- `--conf_col conf_id`
+- `--split_col split`
+- `--fold_col cv_fold`
+- `--use_splits train`
+- `--folds None`
+
+Runtime/HPO:
+- `--max_epochs 150`
+- `--patience 20`
+- `--trials 50`
+- `--trials_mil None` (compatibility alias to `--trials`)
+- `--seed 0`
+- `--nn_accelerator gpu`
+- `--nn_devices 1`
+- `--precision 16-mixed`
+- `--num_workers -1` (auto-resolve)
+- `--pin_memory False`
+
+Final export:
+- `--leaderboard_split leaderboard`
+- `--attn_out None` (defaults to `<study_dir>/leaderboard_attn.csv`)
+- `--export_leaderboard_attn False` (compatibility only)
+- `--do_mil False` (compatibility only; pipeline remains MIL-only)
+
+Explainability:
+- `--run_chem_ace False`
+- `--run_lambda_vol False`
+- `--curated_smiles_col curated_SMILES`
+- `--chem_ace_output_dir None`
+- `--chem_ace_db_uri None`
+- `--chem_ace_max_ids 10000`
+- `--chem_ace_max_confs_per_id 4`
+- `--chem_ace_max_2d_dim 256`
+- `--chem_ace_max_3dqm_dim 256`
+- `--chem_ace_top_concepts 64`
+- `--lambda_vol_output_dir None`
+- `--lambda_vol_db_uri None`
+- `--lambda_vol_layer_name mixer_post_norm`
+- `--lambda_vol_top_concepts 24`
+- `--lambda_vol_monitor_max_samples 512`
+- `--lambda_vol_tcav_repeats 2`
+- `--lambda_vol_random_counterexamples 96`
+- `--lambda_vol_min_concept_samples 8`
+
+---
+
+## 24. Canonical Runtime Commands
+
+From repository root (`../` relative to this file):
+
+Run HPO + final:
+```bash
+python ../opt_net_fast.py \
+  --labels <labels.csv> \
+  --feat2d_scaled <scaled_2d.csv> \
+  --feat3d_scaled <scaled_3d.csv> \
+  --feat3d_qm_scaled <scaled_3d_quantum.csv> \
+  --study_dir <out_dir> \
+  --use_splits train \
+  --run_hpo \
+  --trials 50
+```
+
+Skip HPO, reuse best params JSON:
+```bash
+python ../opt_net_fast.py \
+  --labels <labels.csv> \
+  --feat2d_scaled <scaled_2d.csv> \
+  --feat3d_scaled <scaled_3d.csv> \
+  --feat3d_qm_scaled <scaled_3d_quantum.csv> \
+  --study_dir <out_dir> \
+  --best_params_json <multimodal_mil_aux_gpu_best_params.json>
+```
+
+Enable explainability in final run:
+```bash
+python ../opt_net_fast.py ... --run_hpo --run_lambda_vol
+```
+
+(`--run_lambda_vol` auto-enables Chem-ACE.)
