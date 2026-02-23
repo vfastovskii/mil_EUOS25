@@ -11,13 +11,13 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 if str(PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(PKG_ROOT))
 
-from explainability.chem_ace.analytics import ConceptQueryService
-from explainability.chem_ace.cav import run_tcav_from_arrays
-from explainability.chem_ace.config import CAVConfig, ConceptDiscoveryConfig
-from explainability.chem_ace.concepts import discover_concepts
-from explainability.chem_ace.db.repository import ChemACERepository
-from explainability.chem_ace.patches.base import make_patch_record
-from explainability.chem_ace.types import PatchEmbeddingRecord
+from ..explainability.chem_ace.analytics import ConceptQueryService
+from ..explainability.chem_ace.cav import run_tcav_from_arrays
+from ..explainability.chem_ace.config import CAVConfig, ConceptDiscoveryConfig
+from ..explainability.chem_ace.concepts import discover_concepts
+from ..explainability.chem_ace.db.repository import ChemACERepository
+from ..explainability.chem_ace.patches.base import make_patch_record
+from ..explainability.chem_ace.types import PatchEmbeddingRecord
 
 
 class ChemACETest(unittest.TestCase):

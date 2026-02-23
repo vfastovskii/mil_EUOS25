@@ -12,11 +12,11 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 if str(PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(PKG_ROOT))
 
-from explainability.lambda_vol.config import DetectorConfig, ExportConfig, LambdaVolConfig, StoreConfig, TrackerConfig
-from explainability.lambda_vol.detectors import ConceptPressureDetector, concentration_metrics
-from explainability.lambda_vol.monitor import LambdaVolMonitor
-from explainability.lambda_vol.tracker import ConceptPressureTracker
-from explainability.lambda_vol.types import RegimeLabel
+from ..explainability.lambda_vol.config import DetectorConfig, ExportConfig, LambdaVolConfig, StoreConfig, TrackerConfig
+from ..explainability.lambda_vol.detectors import ConceptPressureDetector, concentration_metrics
+from ..explainability.lambda_vol.monitor import LambdaVolMonitor
+from ..explainability.lambda_vol.tracker import ConceptPressureTracker
+from ..explainability.lambda_vol.types import RegimeLabel
 
 
 class LambdaVolCoreTest(unittest.TestCase):
