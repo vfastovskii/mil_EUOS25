@@ -207,6 +207,27 @@ Skipped categories are counted and logged:
 
 This guarantees no silent wrong conformer assignment.
 
+### 5.5 Exact scope used for `n_molecules` in logs
+
+The `n_molecules` printed at:
+
+- `explainability.chem_ace.generate_patches n_molecules=...`
+
+is **not** "all rows in labels".
+
+In the final pipeline it is built from:
+
+1. IDs in split `train`
+2. union IDs in split `leaderboard` (or your configured `--leaderboard_split`)
+3. after dropping IDs with no valid conformer bags
+4. after applying `--chem_ace_max_ids` (if > 0)
+5. after deduplication to unique IDs
+
+Additional scope logs now emitted:
+
+- `final.prepare_chem_ace_bundle.scope n_train_ids=... n_leaderboard_ids=... n_scope_ids=...`
+- `explainability.chem_ace.scope_ids n_scope_ids_input=... n_scope_ids_selected=... chem_ace_max_ids=...`
+
 ## 6) Patch volume control and scaling
 
 Config sources:
@@ -217,6 +238,7 @@ Config sources:
 Key controls:
 
 - `--chem_ace_max_ids` (default `0` = all IDs in scope)
+- `--chem_ace_max_confs_per_id` (default `0` = all conformers per molecule)
 - `--chem_ace_local_radii` (default `1`)
 - `--chem_ace_patch_cap_per_mol` (default `0`, means auto)
 - `--chem_ace_target_total_patches` (default `1200000`)
@@ -351,6 +373,10 @@ These are used by Lambda-Vol monitoring to compute per-task/per-concept:
 
 They are also used to build positive concept target sets for Concept-RL.
 
+Ricci geometry details for Lambda-Vol are documented in:
+
+- `RICCI_FLOW_README.md`
+
 ## 8) Dedicated 3D patch lifecycle (end-to-end)
 
 For one `(mol_id, conf_id)`:
@@ -383,6 +409,22 @@ Chem-ACE emits structured progress events for:
 - patch persistence
 - embedding compute
 - embedding persistence
+
+Patch generation progress now includes explicit 2D/3D visibility:
+
+- `patches` total accumulated patches
+- `patches_2d` accumulated patches with `conf_id=None`
+- `patches_3d` accumulated conformer-aware patches (`conf_id!=None`)
+- `mols_with_conf_done` processed molecules that had at least one conformer candidate
+- `mols_with_3d_patches_done` processed molecules that produced at least one 3D patch
+
+End-of-stage summary log:
+
+- `explainability.chem_ace.generate_patches.summary ... patches_total=... patches_2d=... patches_3d=...`
+
+Post-generation ready log:
+
+- `explainability.chem_ace.patches_ready n_patches=... n_patches_2d=... n_patches_3d=...`
 
 Typical pattern:
 

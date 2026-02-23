@@ -2,6 +2,10 @@
 
 This module adds a training-time monitoring/control layer for concept reliance dynamics in multitask molecular models.
 
+For full Ricci geometry details (formulas, thresholds, artifact schema, interpretation), see:
+
+- `/Users/vfastovskii/Desktop/mil_explainability_2026/opt_attn_net_feb/RICCI_FLOW_README.md`
+
 ## What it implements
 
 - Per-epoch concept pressure tracking:
@@ -122,6 +126,22 @@ By default, Ricci is enabled for Lambda-Vol runs and exported as:
 - `ricci_edges_long.csv`
 - `ricci_task_summary.csv`
 - `ricci_flow_tensors.npz`
+
+### Ricci implementation summary
+
+- Concept graph edges are built from weighted combination of:
+  - pressure `rho`
+  - attention support
+  - prevalence
+  - absolute TCAV-history correlation
+- Edges are sparsified by quantile/min-threshold + top-k per node.
+- Curvature uses Forman-Ricci style discrete edge curvature.
+- Flow iteratively updates edge lengths/weights (`flow_steps`, `flow_step_size`).
+- Optional: mean flowed similarity is injected as concept coupling in dynamics.
+- Detector emits Ricci alerts:
+  - `ricci_negative_curvature_surge`
+  - `ricci_bridge_concentration`
+  - `ricci_extreme_negative_bridge`
 
 ## Query API examples
 

@@ -97,6 +97,10 @@ python -m entrypoints.hpo_pipeline ... \
 
 `--run_lambda_vol` automatically enables Chem-ACE concept preparation.
 
+Detailed Ricci-flow documentation:
+
+- `/Users/vfastovskii/Desktop/mil_explainability_2026/opt_attn_net_feb/RICCI_FLOW_README.md`
+
 Useful controls:
 
 - `--lambda_vol_layer_name mixer_post_norm`

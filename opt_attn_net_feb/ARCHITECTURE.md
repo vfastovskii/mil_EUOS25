@@ -1421,6 +1421,9 @@ python ../opt_net_fast.py ... --run_hpo --run_lambda_vol
 (`--run_lambda_vol` auto-enables Chem-ACE.)
 ## Ricci Geometry Layer (Lambda-Vol Integration)
 
+Detailed Ricci reference:
+- `RICCI_FLOW_README.md`
+
 The explainability pack now includes a discrete graph-Ricci module integrated into Lambda-Vol epoch monitoring:
 
 - Build per-task concept graph from `rho`, `attention_support`, `prevalence`, and absolute TCAV-history correlation.
