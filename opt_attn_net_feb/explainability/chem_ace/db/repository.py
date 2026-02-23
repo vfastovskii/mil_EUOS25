@@ -174,6 +174,36 @@ class ChemACERepository:
                 existing.metadata_json = _json_dumps(dict(rec.metadata))
             s.commit()
 
+    def upsert_patch_embeddings(self, recs: Iterable[PatchEmbeddingRecord]) -> None:
+        """Persist embedding metadata for many records in one DB transaction."""
+        with self.session() as s:
+            for rec in recs:
+                if rec.embedding_uri is None:
+                    raise ValueError("PatchEmbeddingRecord.embedding_uri is required for DB persistence")
+                existing = s.execute(
+                    select(PatchEmbeddingORM).where(
+                        PatchEmbeddingORM.patch_id == rec.patch_id,
+                        PatchEmbeddingORM.layer_name == rec.layer_name,
+                        PatchEmbeddingORM.strategy == rec.strategy,
+                    )
+                ).scalar_one_or_none()
+                if existing is None:
+                    s.add(
+                        PatchEmbeddingORM(
+                            patch_id=str(rec.patch_id),
+                            layer_name=str(rec.layer_name),
+                            strategy=str(rec.strategy),
+                            embedding_uri=str(rec.embedding_uri),
+                            embedding_dim=int(rec.vector.shape[-1]),
+                            metadata_json=_json_dumps(dict(rec.metadata)),
+                        )
+                    )
+                else:
+                    existing.embedding_uri = str(rec.embedding_uri)
+                    existing.embedding_dim = int(rec.vector.shape[-1])
+                    existing.metadata_json = _json_dumps(dict(rec.metadata))
+            s.commit()
+
     def create_concept_set_snapshot(
         self,
         *,

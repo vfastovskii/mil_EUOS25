@@ -88,7 +88,8 @@ python3 "$WORKDIR/opt_net_fast.py" \
   --nn_accelerator gpu \
   --nn_devices 1 \
   --precision 16-mixed \
-  --num_workers 23
+  --num_workers 23 \
+  --cpu_workers -1
 
 # -------------------- copy back --------------------
 echo "[INFO] Copy results back..."

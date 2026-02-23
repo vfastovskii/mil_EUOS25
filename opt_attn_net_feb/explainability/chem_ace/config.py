@@ -116,6 +116,7 @@ class ChemACEConfig:
     run_name: str = "chem_ace_run"
     seed: int = 0
     output_dir: str = "chem_ace_outputs"
+    cpu_workers: int = 0
     patch_generation: PatchGenerationConfig = field(default_factory=PatchGenerationConfig)
     embedding: EmbeddingConfig = field(default_factory=lambda: EmbeddingConfig(layer_name="encoder"))
     discovery: ConceptDiscoveryConfig = field(default_factory=ConceptDiscoveryConfig)

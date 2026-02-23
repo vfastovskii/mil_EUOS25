@@ -68,6 +68,7 @@ python "${PROJECT_DIR}/opt_net_fast.py" \
   --nn_devices 1 \
   --precision 16-mixed \
   --num_workers -1 \
+  --cpu_workers -1 \
   --pin_memory \
   --leaderboard_split leaderboard \
   --attn_out "${OUT_DIR}/leaderboard_attn.csv"
@@ -96,6 +97,7 @@ tail -f /path/to/mil_explainability_2026/opt_attn_net_feb/logs/mil_hpo_<jobid>.o
 ## 4) Notes
 
 - Keep `--num_workers -1` to auto-tune workers from `SLURM_CPUS_PER_TASK`.
+- Keep `--cpu_workers -1` to auto-allocate CPU worker budget for CPU-bound stages (Chem-ACE patch generation/tagging/feature embedding and torch CPU thread pools).
 - If your cluster uses different GPU resource syntax, adapt `#SBATCH --gres=gpu:1`.
 - Final stage always runs after HPO:
   - train on `split == train`

@@ -6,6 +6,11 @@
 python /Users/vfastovskii/Desktop/mil_explainability_2026/opt_attn_net_feb/opt_net_fast.py ... --run_hpo --trials 50
 ```
 
+CPU parallelization controls (recommended on GPU+CPU node):
+
+- `--num_workers -1` : dataloader workers auto from node CPUs.
+- `--cpu_workers -1` : CPU worker budget for CPU-bound stages (Chem-ACE patching/tagging/feature embedding + torch CPU thread pools).
+
 ## Skip optimization and use an existing params JSON
 
 ```bash
@@ -59,6 +64,7 @@ Useful controls:
 - `--chem_ace_max_confs_per_id 4`
 - `--chem_ace_top_concepts 64`
 - `--chem_ace_output_dir /path/to/chem_ace_out`
+- `--cpu_workers -1`
 
 ## Enable Lambda-Vol monitoring during final training (requires Chem-ACE concepts)
 

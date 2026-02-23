@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 from pathlib import Path
@@ -46,6 +47,7 @@ class FinalExplainabilityConfig:
     run_chem_ace: bool = False
     run_lambda_vol: bool = False
     curated_smiles_col: str = "curated_SMILES"
+    cpu_workers: int = 0
 
     chem_ace_output_dir: Optional[str] = None
     chem_ace_db_uri: Optional[str] = None
@@ -440,7 +442,12 @@ def prepare_chem_ace_bundle(
     """Build Chem-ACE concepts from curated SMILES + fused 2D/3D/QM features."""
     if not bool(config.run_chem_ace):
         return None
-    log_event("START", "explainability.prepare_chem_ace_bundle", outdir=str(outdir))
+    log_event(
+        "START",
+        "explainability.prepare_chem_ace_bundle",
+        outdir=str(outdir),
+        cpu_workers=int(max(0, config.cpu_workers)),
+    )
 
     try:
         require_rdkit()
@@ -464,6 +471,7 @@ def prepare_chem_ace_bundle(
         run_name="chem_ace_final_pipeline",
         seed=int(seed),
         output_dir=str(ace_out_dir),
+        cpu_workers=max(0, int(config.cpu_workers)),
         embedding=EmbeddingConfig(layer_name="feature_fusion_2d3dqm", strategy="masked_input"),
         discovery=ConceptDiscoveryConfig(),
         patch_generation=PatchGenerationConfig(pharm3d=Pharm3DPatchConfig(enabled=False)),
@@ -532,6 +540,7 @@ def prepare_chem_ace_bundle(
             xinst_mean_by_id=inst_mean_map,
             max_2d_dim=int(config.chem_ace_max_2d_dim),
             max_3dqm_dim=int(config.chem_ace_max_3dqm_dim),
+            n_workers=max(0, int(config.cpu_workers)),
         )
     log_event("INFO", "explainability.chem_ace.embeddings_ready", n_embeddings=int(len(embeddings)))
 
@@ -801,14 +810,17 @@ def _build_feature_patch_embeddings(
     xinst_mean_by_id: Mapping[str, np.ndarray],
     max_2d_dim: int,
     max_3dqm_dim: int,
+    n_workers: int = 0,
 ) -> list[PatchEmbeddingRecord]:
     emb_recs: list[PatchEmbeddingRecord] = []
 
-    for patch in patches:
+    workers = max(0, int(n_workers))
+
+    def _compute_patch_vec(patch: PatchRecord) -> tuple[PatchRecord, np.ndarray, dict[str, int]] | None:
         mol_id = str(patch.mol_id)
         x2d = x2d_by_id.get(mol_id)
         if x2d is None:
-            continue
+            return None
 
         x3d = None
         if patch.conf_id is not None:
@@ -824,7 +836,23 @@ def _build_feature_patch_embeddings(
         v2d = _take_or_pad(np.asarray(x2d, dtype=np.float32), int(max_2d_dim))
         v3d = _take_or_pad(np.asarray(x3d, dtype=np.float32), int(max_3dqm_dim))
         vec = np.concatenate([v2d, v3d, desc], axis=0).astype(np.float32)
+        md = {
+            "d2": int(v2d.shape[0]),
+            "d3qm": int(v3d.shape[0]),
+            "ddesc": int(desc.shape[0]),
+        }
+        return patch, vec, md
 
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            computed = list(ex.map(_compute_patch_vec, patches))
+    else:
+        computed = [_compute_patch_vec(p) for p in patches]
+
+    for item in computed:
+        if item is None:
+            continue
+        patch, vec, md = item
         rec = pipeline.embedding_cache.save(
             patch=patch,
             layer_name="feature_fusion_2d3dqm",
@@ -832,13 +860,18 @@ def _build_feature_patch_embeddings(
             vector=vec,
             metadata={
                 "strategy": "feature_projection",
-                "d2": int(v2d.shape[0]),
-                "d3qm": int(v3d.shape[0]),
-                "ddesc": int(desc.shape[0]),
+                "d2": int(md["d2"]),
+                "d3qm": int(md["d3qm"]),
+                "ddesc": int(md["ddesc"]),
             },
         )
-        pipeline.repository.upsert_patch_embedding(rec)
         emb_recs.append(rec)
+
+    if hasattr(pipeline.repository, "upsert_patch_embeddings"):
+        pipeline.repository.upsert_patch_embeddings(emb_recs)
+    else:
+        for rec in emb_recs:
+            pipeline.repository.upsert_patch_embedding(rec)
 
     if not emb_recs:
         raise RuntimeError("Chem-ACE feature projection produced zero patch embeddings")

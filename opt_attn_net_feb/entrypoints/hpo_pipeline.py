@@ -147,6 +147,7 @@ class CLIRuntimeConfig:
     nn_devices: int
     precision: str
     num_workers: int
+    cpu_workers: int
     pin_memory: bool
 
 
@@ -270,6 +271,7 @@ class PipelineEnvironment:
     """
     outdir: Path
     num_workers: int
+    cpu_workers: int
     pin_memory: bool
 
 
@@ -344,6 +346,7 @@ class PipelineConfigFactory:
                 nn_devices=int(args.nn_devices),
                 precision=str(args.precision),
                 num_workers=int(args.num_workers),
+                cpu_workers=int(args.cpu_workers),
                 pin_memory=bool(args.pin_memory),
             ),
             export=CLIExportConfig(
@@ -438,6 +441,8 @@ class PipelineEnvironmentFactory:
                 "nn_devices": int(self.config.runtime.nn_devices),
                 "precision": str(self.config.runtime.precision),
                 "patience": int(self.config.runtime.patience),
+                "num_workers": int(self.config.runtime.num_workers),
+                "cpu_workers": int(self.config.runtime.cpu_workers),
                 "run_hpo": bool(self.config.hpo.run_hpo),
                 "best_params_json": self.config.hpo.best_params_json,
                 "run_chem_ace": bool(self.config.explainability.run_chem_ace),
@@ -454,15 +459,31 @@ class PipelineEnvironmentFactory:
             log_event("INFO", "pipeline.run_meta_written", path=str(run_meta_path))
 
             num_workers = self._resolve_num_workers()
+            cpu_workers = self._resolve_cpu_workers()
+            if cpu_workers > 0:
+                try:
+                    torch.set_num_threads(int(cpu_workers))
+                except Exception:
+                    pass
+                try:
+                    torch.set_num_interop_threads(int(max(1, min(8, cpu_workers // 2))))
+                except Exception:
+                    pass
             pin_memory = bool(self.config.runtime.pin_memory) and torch.cuda.is_available()
             log_event(
                 "INFO",
                 "pipeline.dataloader_runtime",
                 num_workers=int(num_workers),
+                cpu_workers=int(cpu_workers),
                 pin_memory=bool(pin_memory),
                 precision=str(self.config.runtime.precision),
             )
-            return PipelineEnvironment(outdir=outdir, num_workers=num_workers, pin_memory=pin_memory)
+            return PipelineEnvironment(
+                outdir=outdir,
+                num_workers=num_workers,
+                cpu_workers=cpu_workers,
+                pin_memory=pin_memory,
+            )
 
     def _resolve_num_workers(self) -> int:
         if int(self.config.runtime.num_workers) >= 0:
@@ -471,6 +492,21 @@ class PipelineEnvironmentFactory:
         if cpus <= 0:
             cpus = os.cpu_count() or 0
         return max(2, min(23, cpus - 2)) if cpus >= 4 else 0
+
+    def _resolve_cpu_workers(self) -> int:
+        if int(self.config.runtime.cpu_workers) >= 0:
+            return int(self.config.runtime.cpu_workers)
+        cpus = int(os.environ.get("SLURM_CPUS_PER_TASK") or 0)
+        if cpus <= 0:
+            cpus = os.cpu_count() or 0
+        if cpus <= 0:
+            return 1
+        # Reserve some CPU for dataloader workers and system activity.
+        if int(self.config.runtime.num_workers) >= 0:
+            reserve = int(self.config.runtime.num_workers)
+        else:
+            reserve = max(2, min(23, cpus - 2)) if cpus >= 4 else 0
+        return max(1, int(cpus - reserve - 1))
 
 
 class HPODataBuilder:
@@ -660,6 +696,7 @@ class MILPipelineOrchestrator:
                 "INFO",
                 "pipeline.dataloader",
                 num_workers=int(env.num_workers),
+                cpu_workers=int(env.cpu_workers),
                 pin_memory=bool(env.pin_memory),
                 precision=str(self.config.runtime.precision),
             )
@@ -804,6 +841,7 @@ class MILPipelineOrchestrator:
                         run_chem_ace=bool(self.config.explainability.run_chem_ace),
                         run_lambda_vol=bool(self.config.explainability.run_lambda_vol),
                         curated_smiles_col=str(self.config.explainability.curated_smiles_col),
+                        cpu_workers=int(env.cpu_workers),
                         chem_ace_output_dir=self.config.explainability.chem_ace_output_dir,
                         chem_ace_db_uri=self.config.explainability.chem_ace_db_uri,
                         chem_ace_max_ids=int(self.config.explainability.chem_ace_max_ids),
@@ -925,6 +963,12 @@ def _parse_args(argv: Any | None = None):
     ap.add_argument("--nn_devices", type=int, default=1)
     ap.add_argument("--precision", default="16-mixed")
     ap.add_argument("--num_workers", type=int, default=-1)
+    ap.add_argument(
+        "--cpu_workers",
+        type=int,
+        default=-1,
+        help="CPU worker budget for CPU-bound pipeline stages; -1 auto-resolves from node CPUs.",
+    )
     ap.add_argument("--pin_memory", action="store_true")
 
     # Deprecated compatibility flag; final train+leaderboard stage now always runs.
@@ -1032,6 +1076,8 @@ def main(argv: Any | None = None) -> None:
             "pipeline.main.args",
             run_hpo=bool(config.hpo.run_hpo),
             study_dir=str(config.data_paths.study_dir),
+            num_workers=int(config.runtime.num_workers),
+            cpu_workers=int(config.runtime.cpu_workers),
             run_chem_ace=bool(config.explainability.run_chem_ace),
             run_lambda_vol=bool(config.explainability.run_lambda_vol),
             run_concept_rl=bool(config.explainability.run_concept_rl),
