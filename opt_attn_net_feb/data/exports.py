@@ -16,6 +16,7 @@ def export_leaderboard_attention(
     dl_lb_export: Any,
     device: torch.device,
     out_path: Path,
+    pred_thresholds: List[float] | None = None,
 ) -> None:
     """
     Exports attention weights for leaderboard evaluation to a specified output path.
@@ -26,6 +27,7 @@ def export_leaderboard_attention(
     - ID
     - conf_id
     - 4 endpoint predictions (probabilities from logits)
+    - 4 endpoint binary labels (thresholded probabilities)
     - 4 attention weights (one per endpoint)
 
     Parameters:
@@ -44,6 +46,10 @@ def export_leaderboard_attention(
             The file path where the attention data will be written. File format is inferred
             from the extension (.parquet or .csv).
 
+        pred_thresholds: List[float] | None
+            Optional probability thresholds per task for binary labels. If not provided,
+            0.5 is used for all tasks.
+
     Raises:
         RuntimeError:
             Raised if attention weights are not returned by the model when expected.
@@ -55,6 +61,20 @@ def export_leaderboard_attention(
     """
     model.eval()
     model.to(device)
+
+    if pred_thresholds is None:
+        pred_thresholds_arr = np.full((len(TASK_COLS),), 0.5, dtype=np.float64)
+    else:
+        if len(pred_thresholds) != len(TASK_COLS):
+            raise ValueError(
+                f"pred_thresholds length mismatch: got {len(pred_thresholds)}, "
+                f"expected {len(TASK_COLS)}"
+            )
+        pred_thresholds_arr = np.asarray(pred_thresholds, dtype=np.float64)
+        if not np.all(np.isfinite(pred_thresholds_arr)):
+            raise ValueError("pred_thresholds must be finite numbers")
+        if np.any((pred_thresholds_arr < 0.0) | (pred_thresholds_arr > 1.0)):
+            raise ValueError("pred_thresholds must be within [0, 1]")
 
     rows: List[Dict[str, Any]] = []
 
@@ -98,11 +118,16 @@ def export_leaderboard_attention(
                 f"pred_{TASK_COLS[t]}": float(probs_np[b, t])
                 for t in range(T)
             }
+            pred_label_cols = {
+                f"pred_label_{TASK_COLS[t]}": int(float(probs_np[b, t]) >= float(pred_thresholds_arr[t]))
+                for t in range(T)
+            }
             for i in range(L):
                 row: Dict[str, Any] = {
                     "ID": mid,
                     "conf_id": confs[i],
                     **pred_cols,
+                    **pred_label_cols,
                 }
                 for t in range(T):
                     row[f"attn_{TASK_COLS[t]}"] = float(attn_norm[t, i])
