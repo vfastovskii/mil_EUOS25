@@ -322,6 +322,10 @@ Algorithms:
 Flow:
 
 1. cluster embeddings per algorithm
+   - k-means switches to MiniBatchKMeans for large `N` (`kmeans_minibatch_over`)
+   - hierarchical is guarded by `hierarchical_max_samples` and `hierarchical_max_pairwise_gb` to avoid O(N^2) memory blowups
+   - HDBSCAN is guarded by `hdbscan_max_samples`
+   - if one algorithm fails/skips, others still run
 2. compute support and coherence
 3. filter by `min_support` and `min_coherence`
 4. compute centroid + medoid patch

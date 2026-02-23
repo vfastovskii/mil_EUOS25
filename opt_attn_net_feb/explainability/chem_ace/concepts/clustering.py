@@ -6,7 +6,7 @@ import logging
 from typing import Dict, Iterable, List
 
 import numpy as np
-from sklearn.cluster import AgglomerativeClustering, KMeans
+from sklearn.cluster import AgglomerativeClustering, KMeans, MiniBatchKMeans
 from sklearn.metrics.pairwise import cosine_similarity
 
 from ..config import ConceptDiscoveryConfig
@@ -50,8 +50,55 @@ def _cluster_with_kmeans(x: np.ndarray, k: int, seed: int) -> np.ndarray:
     return model.fit_predict(x)
 
 
+def _cluster_with_kmeans_adaptive(
+    x: np.ndarray,
+    *,
+    k: int,
+    seed: int,
+    minibatch_over: int,
+    minibatch_size: int,
+) -> np.ndarray:
+    n = int(x.shape[0])
+    kk = max(2, min(int(k), n))
+    if n >= int(max(2, minibatch_over)):
+        bs = int(max(256, min(int(minibatch_size), n)))
+        model = MiniBatchKMeans(
+            n_clusters=kk,
+            random_state=int(seed),
+            batch_size=bs,
+            n_init=3,
+            reassignment_ratio=0.01,
+        )
+        return model.fit_predict(x)
+    return _cluster_with_kmeans(x=x, k=kk, seed=seed)
 
-def _cluster_with_hierarchical(x: np.ndarray, distance_threshold: float) -> np.ndarray:
+
+def _estimated_pdist_bytes(n_samples: int) -> int:
+    # scipy.spatial.distance.pdist allocates condensed pairwise distances (float64).
+    n = int(max(0, n_samples))
+    return (n * (n - 1) // 2) * int(np.dtype(np.float64).itemsize)
+
+
+
+def _cluster_with_hierarchical(
+    x: np.ndarray,
+    *,
+    distance_threshold: float,
+    max_samples: int,
+    max_pairwise_gb: float,
+) -> np.ndarray:
+    n = int(x.shape[0])
+    if n > int(max_samples):
+        raise RuntimeError(
+            f"hierarchical skipped: n_samples={n} exceeds hierarchical_max_samples={int(max_samples)}"
+        )
+    req_bytes = _estimated_pdist_bytes(n)
+    req_gb = float(req_bytes) / float(1024 ** 3)
+    if req_gb > float(max_pairwise_gb):
+        raise RuntimeError(
+            "hierarchical skipped: estimated pairwise distance memory "
+            f"{req_gb:.2f} GiB exceeds hierarchical_max_pairwise_gb={float(max_pairwise_gb):.2f}"
+        )
     model = AgglomerativeClustering(n_clusters=None, distance_threshold=float(distance_threshold))
     return model.fit_predict(x)
 
@@ -73,17 +120,60 @@ def _algorithm_labels(
     out: Dict[str, np.ndarray] = {}
     for algo in config.algorithms:
         key = str(algo).lower()
-        if key == "kmeans":
-            out[key] = _cluster_with_kmeans(x, k=config.kmeans_k, seed=seed)
-        elif key == "hierarchical":
-            out[key] = _cluster_with_hierarchical(x, distance_threshold=config.hierarchical_distance_threshold)
-        elif key == "hdbscan":
-            if has_hdbscan():
-                out[key] = _cluster_with_hdbscan(x, min_cluster_size=config.hdbscan_min_cluster_size)
+        try:
+            if key == "kmeans":
+                out[key] = _cluster_with_kmeans_adaptive(
+                    x,
+                    k=config.kmeans_k,
+                    seed=seed,
+                    minibatch_over=config.kmeans_minibatch_over,
+                    minibatch_size=config.kmeans_minibatch_size,
+                )
+            elif key == "hierarchical":
+                out[key] = _cluster_with_hierarchical(
+                    x,
+                    distance_threshold=config.hierarchical_distance_threshold,
+                    max_samples=config.hierarchical_max_samples,
+                    max_pairwise_gb=config.hierarchical_max_pairwise_gb,
+                )
+            elif key == "hdbscan":
+                if has_hdbscan():
+                    if int(x.shape[0]) > int(config.hdbscan_max_samples):
+                        logger.warning(
+                            "hdbscan skipped due sample count",
+                            extra={
+                                "n_samples": int(x.shape[0]),
+                                "hdbscan_max_samples": int(config.hdbscan_max_samples),
+                            },
+                        )
+                        continue
+                    out[key] = _cluster_with_hdbscan(x, min_cluster_size=config.hdbscan_min_cluster_size)
+                else:
+                    logger.warning("hdbscan not installed; skipping hdbscan clustering")
             else:
-                logger.warning("hdbscan not installed; skipping hdbscan clustering")
-        else:
-            logger.warning("Unknown clustering algorithm requested", extra={"algorithm": algo})
+                logger.warning("Unknown clustering algorithm requested", extra={"algorithm": algo})
+        except MemoryError:
+            logger.exception(
+                "Clustering algorithm failed with MemoryError; skipping",
+                extra={"algorithm": key, "n_samples": int(x.shape[0])},
+            )
+            continue
+        except RuntimeError as exc:
+            logger.warning(
+                "Clustering algorithm skipped by guardrail",
+                extra={
+                    "algorithm": key,
+                    "n_samples": int(x.shape[0]),
+                    "reason": str(exc),
+                },
+            )
+            continue
+        except Exception:
+            logger.exception(
+                "Clustering algorithm failed; skipping",
+                extra={"algorithm": key, "n_samples": int(x.shape[0])},
+            )
+            continue
     return out
 
 
@@ -235,6 +325,23 @@ def discover_concepts(
     x = np.stack([np.asarray(e.vector, dtype=np.float32) for e in emb_list], axis=0)
 
     labels_per_algo = _algorithm_labels(x=x, config=config, seed=seed)
+    if len(labels_per_algo) == 0:
+        logger.warning(
+            "No clustering algorithms produced labels; returning empty concept set",
+            extra={"n_embeddings": int(len(emb_list)), "algorithms": list(config.algorithms)},
+        )
+        return DiscoveredConceptSet(
+            layer_name=layer_name,
+            candidates=[],
+            memberships=[],
+            metadata={
+                "n_embeddings": int(len(emb_list)),
+                "n_algorithms": 0,
+                "n_candidates_before_dedup": 0,
+                "n_candidates_after_dedup": 0,
+                "algorithms_requested": [str(a) for a in config.algorithms],
+            },
+        )
 
     all_candidates: list[ConceptCandidate] = []
     all_memberships: list[ConceptMembership] = []

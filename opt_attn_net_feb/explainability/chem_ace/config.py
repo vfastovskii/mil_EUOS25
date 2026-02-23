@@ -72,8 +72,16 @@ class ConceptDiscoveryConfig:
 
     algorithms: tuple[str, ...] = ("kmeans", "hierarchical", "hdbscan")
     kmeans_k: int = 24
+    # Use MiniBatchKMeans above this sample size to reduce memory pressure.
+    kmeans_minibatch_over: int = 200000
+    kmeans_minibatch_size: int = 4096
     hierarchical_distance_threshold: float = 1.25
+    # Agglomerative clustering requires O(N^2) pairwise distances; keep guarded.
+    hierarchical_max_samples: int = 25000
+    hierarchical_max_pairwise_gb: float = 8.0
     hdbscan_min_cluster_size: int = 12
+    # HDBSCAN can become very memory-heavy at large N.
+    hdbscan_max_samples: int = 300000
     min_support: int = 8
     min_coherence: float = 0.0
     dedup_centroid_similarity_threshold: float = 0.98

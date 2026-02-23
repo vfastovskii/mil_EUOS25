@@ -337,6 +337,16 @@ class ChemACEPipeline:
         embeddings: Sequence[PatchEmbeddingRecord],
     ) -> tuple[DiscoveredConceptSet, str]:
         """Run concept discovery, persist snapshot, concepts, and memberships."""
+        log_event(
+            "INFO",
+            "explainability.chem_ace.discover_concepts.config",
+            n_embeddings=int(len(embeddings)),
+            algorithms=",".join(str(x) for x in self.config.discovery.algorithms),
+            kmeans_k=int(self.config.discovery.kmeans_k),
+            hierarchical_max_samples=int(self.config.discovery.hierarchical_max_samples),
+            hierarchical_max_pairwise_gb=float(self.config.discovery.hierarchical_max_pairwise_gb),
+            hdbscan_max_samples=int(self.config.discovery.hdbscan_max_samples),
+        )
         concept_set = discover_concepts(
             embeddings=embeddings,
             config=self.config.discovery,
