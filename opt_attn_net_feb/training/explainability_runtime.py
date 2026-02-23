@@ -455,6 +455,7 @@ def prepare_chem_ace_bundle(
         "explainability.prepare_chem_ace_bundle",
         outdir=str(outdir),
         cpu_workers=int(max(0, config.cpu_workers)),
+        n_scope_ids_input=int(len(ids_scope)),
     )
 
     try:
@@ -508,9 +509,17 @@ def prepare_chem_ace_bundle(
     log_event("INFO", "explainability.chem_ace.run_started", run_id=str(run_id), db_uri=str(db_uri))
 
     ids_unique = sorted({str(x) for x in ids_scope})
+    n_ids_before_limit = int(len(ids_unique))
     max_ids = int(config.chem_ace_max_ids)
     if max_ids > 0:
         ids_unique = ids_unique[:max_ids]
+    log_event(
+        "INFO",
+        "explainability.chem_ace.scope_ids",
+        n_scope_ids_input=int(n_ids_before_limit),
+        n_scope_ids_selected=int(len(ids_unique)),
+        chem_ace_max_ids=int(max_ids),
+    )
 
     smiles_by_id = (
         df_full[[id_col, smiles_col]]
@@ -610,7 +619,15 @@ def prepare_chem_ace_bundle(
         patches = pipeline.generate_patches(molecules=molecules)
     if len(patches) == 0:
         raise RuntimeError("Chem-ACE generated zero patches; cannot continue")
-    log_event("INFO", "explainability.chem_ace.patches_ready", n_patches=int(len(patches)))
+    n_patches_2d = int(sum(1 for p in patches if p.conf_id is None))
+    n_patches_3d = int(len(patches) - n_patches_2d)
+    log_event(
+        "INFO",
+        "explainability.chem_ace.patches_ready",
+        n_patches=int(len(patches)),
+        n_patches_2d=int(n_patches_2d),
+        n_patches_3d=int(n_patches_3d),
+    )
 
     with log_step("explainability.chem_ace.embed_patches"):
         embeddings = _build_feature_patch_embeddings(

@@ -936,6 +936,14 @@ class MILFinalTrainer:
         if explain_cfg is not None and bool(explain_cfg.run_chem_ace):
             log_event("INFO", "final.prepare_chem_ace_bundle.start")
             ids_scope = sorted(set(ids_tr).union(set(ids_lb)))
+            log_event(
+                "INFO",
+                "final.prepare_chem_ace_bundle.scope",
+                n_train_ids=int(len(ids_tr)),
+                n_leaderboard_ids=int(len(ids_lb)),
+                n_scope_ids=int(len(ids_scope)),
+                scope_splits=f"train+{str(data.leaderboard_split)}",
+            )
             chem_bundle = prepare_chem_ace_bundle(
                 config=explain_cfg,
                 outdir=outdir,

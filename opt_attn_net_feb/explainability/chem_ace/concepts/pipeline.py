@@ -141,7 +141,12 @@ class ChemACEPipeline:
             target_total_patches=int(getattr(self.config, "target_total_patches", 0)),
         )
 
-        def _gen_for_molecule(item: MoleculeSource) -> list[PatchRecord]:
+        three_d_patch_types = {
+            str(getattr(g, "patch_type", "")) for g in self.patch_generators_3d
+        }
+        n_molecules_with_conf_total = int(sum(1 for item in molecules if bool(item.conf_ids)))
+
+        def _gen_for_molecule(item: MoleculeSource) -> tuple[list[PatchRecord], int, int, bool, bool]:
             out: dict[str, PatchRecord] = {}
             for generator in self.patch_generators_2d:
                 try:
@@ -182,13 +187,25 @@ class ChemACEPipeline:
                             out[patch.patch_id] = patch
 
             patch_list = list(out.values())
-            return self._deterministic_cap_patches(
+            kept = self._deterministic_cap_patches(
                 mol_id=str(item.mol_id),
                 patches=patch_list,
                 cap=int(patch_cap),
             )
+            kept_3d = int(sum(1 for p in kept if str(p.patch_type) in three_d_patch_types))
+            kept_2d = int(len(kept) - kept_3d)
+            has_conf = bool(item.conf_ids)
+            has_3d_kept = bool(kept_3d > 0)
+            return kept, kept_2d, kept_3d, has_conf, has_3d_kept
 
-        def _emit_progress(done_molecules: int, n_patches: int) -> None:
+        def _emit_progress(
+            done_molecules: int,
+            n_patches: int,
+            n_2d_patches: int,
+            n_3d_patches: int,
+            done_mols_with_conf: int,
+            done_mols_with_3d: int,
+        ) -> None:
             if total_molecules <= 0:
                 return
             elapsed = max(1e-9, float(time.perf_counter() - t0))
@@ -200,6 +217,10 @@ class ChemACEPipeline:
                 done=f"{int(done_molecules)}/{int(total_molecules)}",
                 pct=f"{(100.0 * done_molecules / float(total_molecules)):.1f}",
                 patches=int(n_patches),
+                patches_2d=int(n_2d_patches),
+                patches_3d=int(n_3d_patches),
+                mols_with_conf_done=f"{int(done_mols_with_conf)}/{int(n_molecules_with_conf_total)}",
+                mols_with_3d_patches_done=int(done_mols_with_3d),
                 mol_per_s=f"{rate:.2f}",
                 eta_s=(f"{eta_s:.1f}" if eta_s is not None else "na"),
                 cpu_workers=int(workers),
@@ -207,25 +228,62 @@ class ChemACEPipeline:
 
         all_patches: list[PatchRecord] = []
         done = 0
+        kept_2d_total = 0
+        kept_3d_total = 0
+        done_with_conf = 0
+        done_with_3d = 0
         if workers > 1:
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 futures = [ex.submit(_gen_for_molecule, item) for item in molecules]
                 for fut in as_completed(futures):
-                    patch_list = fut.result()
+                    patch_list, kept_2d, kept_3d, has_conf, has_3d = fut.result()
                     all_patches.extend(patch_list)
+                    kept_2d_total += int(kept_2d)
+                    kept_3d_total += int(kept_3d)
+                    done_with_conf += int(1 if has_conf else 0)
+                    done_with_3d += int(1 if has_3d else 0)
                     done += 1
                     if done == total_molecules or (
                         progress_every > 0 and (done % progress_every == 0)
                     ):
-                        _emit_progress(done, len(all_patches))
+                        _emit_progress(
+                            done,
+                            len(all_patches),
+                            kept_2d_total,
+                            kept_3d_total,
+                            done_with_conf,
+                            done_with_3d,
+                        )
         else:
             for item in molecules:
-                all_patches.extend(_gen_for_molecule(item))
+                patch_list, kept_2d, kept_3d, has_conf, has_3d = _gen_for_molecule(item)
+                all_patches.extend(patch_list)
+                kept_2d_total += int(kept_2d)
+                kept_3d_total += int(kept_3d)
+                done_with_conf += int(1 if has_conf else 0)
+                done_with_3d += int(1 if has_3d else 0)
                 done += 1
                 if done == total_molecules or (
                     progress_every > 0 and (done % progress_every == 0)
                 ):
-                    _emit_progress(done, len(all_patches))
+                    _emit_progress(
+                        done,
+                        len(all_patches),
+                        kept_2d_total,
+                        kept_3d_total,
+                        done_with_conf,
+                        done_with_3d,
+                    )
+        log_event(
+            "INFO",
+            "explainability.chem_ace.generate_patches.summary",
+            n_molecules=int(total_molecules),
+            n_molecules_with_conf=int(n_molecules_with_conf_total),
+            n_molecules_with_3d_patches=int(done_with_3d),
+            patches_total=int(len(all_patches)),
+            patches_2d=int(kept_2d_total),
+            patches_3d=int(kept_3d_total),
+        )
         log_event(
             "START",
             "explainability.chem_ace.persist_patches",
