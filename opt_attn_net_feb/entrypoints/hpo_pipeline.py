@@ -201,6 +201,7 @@ class CLIExplainabilityConfig:
     chem_ace_max_2d_dim: int
     chem_ace_max_3dqm_dim: int
     chem_ace_top_concepts: int
+    chem_ace_infer_max_distance: float
     lambda_vol_output_dir: str | None
     lambda_vol_db_uri: str | None
     lambda_vol_layer_name: str
@@ -386,6 +387,7 @@ class PipelineConfigFactory:
                 chem_ace_max_2d_dim=int(args.chem_ace_max_2d_dim),
                 chem_ace_max_3dqm_dim=int(args.chem_ace_max_3dqm_dim),
                 chem_ace_top_concepts=int(args.chem_ace_top_concepts),
+                chem_ace_infer_max_distance=float(args.chem_ace_infer_max_distance),
                 lambda_vol_output_dir=(
                     None if args.lambda_vol_output_dir is None else str(args.lambda_vol_output_dir)
                 ),
@@ -866,6 +868,7 @@ class MILPipelineOrchestrator:
                         chem_ace_max_2d_dim=int(self.config.explainability.chem_ace_max_2d_dim),
                         chem_ace_max_3dqm_dim=int(self.config.explainability.chem_ace_max_3dqm_dim),
                         chem_ace_top_concepts=int(self.config.explainability.chem_ace_top_concepts),
+                        chem_ace_infer_max_distance=float(self.config.explainability.chem_ace_infer_max_distance),
                         lambda_vol_output_dir=self.config.explainability.lambda_vol_output_dir,
                         lambda_vol_db_uri=self.config.explainability.lambda_vol_db_uri,
                         lambda_vol_layer_name=str(self.config.explainability.lambda_vol_layer_name),
@@ -1050,6 +1053,15 @@ def _parse_args(argv: Any | None = None):
     ap.add_argument("--chem_ace_max_2d_dim", type=int, default=256)
     ap.add_argument("--chem_ace_max_3dqm_dim", type=int, default=256)
     ap.add_argument("--chem_ace_top_concepts", type=int, default=64)
+    ap.add_argument(
+        "--chem_ace_infer_max_distance",
+        type=float,
+        default=-1.0,
+        help=(
+            "Max L2 distance for nearest-centroid assignment on infer scope "
+            "(<=0 disables distance gating)."
+        ),
+    )
     ap.add_argument("--lambda_vol_output_dir", default=None)
     ap.add_argument("--lambda_vol_db_uri", default=None)
     ap.add_argument("--lambda_vol_layer_name", default="mixer_post_norm")

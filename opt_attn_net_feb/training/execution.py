@@ -935,14 +935,16 @@ class MILFinalTrainer:
         chem_bundle = None
         if explain_cfg is not None and bool(explain_cfg.run_chem_ace):
             log_event("INFO", "final.prepare_chem_ace_bundle.start")
-            ids_scope = sorted(set(ids_tr).union(set(ids_lb)))
+            # Anti-leakage guard: build Chem-ACE concepts only from train IDs.
+            ids_scope = sorted(set(ids_tr))
             log_event(
                 "INFO",
                 "final.prepare_chem_ace_bundle.scope",
                 n_train_ids=int(len(ids_tr)),
                 n_leaderboard_ids=int(len(ids_lb)),
                 n_scope_ids=int(len(ids_scope)),
-                scope_splits=f"train+{str(data.leaderboard_split)}",
+                scope_splits="train",
+                anti_leakage="enabled",
             )
             chem_bundle = prepare_chem_ace_bundle(
                 config=explain_cfg,
@@ -951,6 +953,7 @@ class MILFinalTrainer:
                 df_full=data.df_full,
                 id_col=data.id_col,
                 ids_scope=ids_scope,
+                ids_infer_scope=ids_lb,
                 ids_2d_file=data.X2d_file_ids,
                 X2d_file=data.X2d_file,
                 starts=data.starts,

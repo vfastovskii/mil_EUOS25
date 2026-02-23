@@ -28,7 +28,13 @@ from ..explainability.chem_ace.config import (
 from ..explainability.chem_ace.concepts.pipeline import ChemACEPipeline, MoleculeSource
 from ..explainability.chem_ace.embedding.hooks import LayerActivationHook
 from ..explainability.chem_ace.optional_deps import OptionalDependencyError, require_rdkit
-from ..explainability.chem_ace.types import ModelTaskAdapter, PatchEmbeddingRecord, PatchRecord
+from ..explainability.chem_ace.types import (
+    ConceptCandidate,
+    ConceptMembership,
+    ModelTaskAdapter,
+    PatchEmbeddingRecord,
+    PatchRecord,
+)
 from ..explainability.lambda_vol import LambdaVolConfig
 from ..explainability.lambda_vol.config import ExportConfig as LambdaVolExportConfig
 from ..explainability.lambda_vol.config import PolicyConfig, RicciConfig, StoreConfig, TrackerConfig
@@ -64,6 +70,8 @@ class FinalExplainabilityConfig:
     chem_ace_max_2d_dim: int = 256
     chem_ace_max_3dqm_dim: int = 256
     chem_ace_top_concepts: int = 64
+    # <=0 disables distance gating for inference-time nearest-centroid assignment.
+    chem_ace_infer_max_distance: float = -1.0
 
     lambda_vol_output_dir: Optional[str] = None
     lambda_vol_db_uri: Optional[str] = None
@@ -439,6 +447,7 @@ def prepare_chem_ace_bundle(
     df_full: pd.DataFrame,
     id_col: str,
     ids_scope: Sequence[str],
+    ids_infer_scope: Optional[Sequence[str]],
     ids_2d_file: Sequence[str],
     X2d_file: np.ndarray,
     starts: np.ndarray,
@@ -447,7 +456,12 @@ def prepare_chem_ace_bundle(
     conf_sorted: np.ndarray,
     Xinst_sorted: np.ndarray,
 ) -> Optional[ChemACEBundle]:
-    """Build Chem-ACE concepts from curated SMILES + fused 2D/3D/QM features."""
+    """
+    Build Chem-ACE concepts and mappings with leakage-safe two-phase logic.
+
+    Phase A (fit): discover concepts only from `ids_scope` patches.
+    Phase B (infer): assign `ids_infer_scope` patches to frozen Phase A centroids.
+    """
     if not bool(config.run_chem_ace):
         return None
     log_event(
@@ -456,6 +470,7 @@ def prepare_chem_ace_bundle(
         outdir=str(outdir),
         cpu_workers=int(max(0, config.cpu_workers)),
         n_scope_ids_input=int(len(ids_scope)),
+        n_infer_scope_ids_input=int(len(ids_infer_scope or [])),
     )
 
     try:
@@ -508,16 +523,21 @@ def prepare_chem_ace_bundle(
     run_id = pipeline.start_run(task_ids=TASK_COLS)
     log_event("INFO", "explainability.chem_ace.run_started", run_id=str(run_id), db_uri=str(db_uri))
 
-    ids_unique = sorted({str(x) for x in ids_scope})
-    n_ids_before_limit = int(len(ids_unique))
+    ids_discover = sorted({str(x) for x in ids_scope})
+    n_discover_before_limit = int(len(ids_discover))
     max_ids = int(config.chem_ace_max_ids)
     if max_ids > 0:
-        ids_unique = ids_unique[:max_ids]
+        ids_discover = ids_discover[:max_ids]
+    ids_infer = sorted({str(x) for x in (ids_infer_scope or [])})
+    discover_set = set(ids_discover)
+    ids_infer = [x for x in ids_infer if x not in discover_set]
     log_event(
         "INFO",
         "explainability.chem_ace.scope_ids",
-        n_scope_ids_input=int(n_ids_before_limit),
-        n_scope_ids_selected=int(len(ids_unique)),
+        n_discover_ids_input=int(n_discover_before_limit),
+        n_discover_ids_selected=int(len(ids_discover)),
+        n_infer_ids_input=int(len(ids_infer_scope or [])),
+        n_infer_ids_selected=int(len(ids_infer)),
         chem_ace_max_ids=int(max_ids),
     )
 
@@ -535,8 +555,9 @@ def prepare_chem_ace_bundle(
         for i, v in zip(ids_2d_file, X2d_file)
     }
 
+    ids_for_features = sorted(set(ids_discover).union(ids_infer))
     conf_map, inst_map, inst_mean_map = _build_instance_feature_maps(
-        ids=ids_unique,
+        ids=ids_for_features,
         starts=starts,
         counts=counts,
         id2pos=id2pos,
@@ -566,73 +587,106 @@ def prepare_chem_ace_bundle(
             skipped_no_conformer=int(sdf_stats["skipped_no_conformer"]),
         )
 
-    molecules: list[MoleculeSource] = []
-    molecules_by_id: dict[str, Any] = {}
-    n_requested_confs = 0
-    n_found_confs = 0
-    n_skipped_missing_confs = 0
-    n_skipped_incompatible_confs = 0
-    n_mols_with_confs = 0
-    for mol_id in ids_unique:
-        smi = smiles_by_id.get(mol_id)
-        if smi is None:
-            continue
-        mol = Chem.MolFromSmiles(str(smi))
-        if mol is None:
-            continue
-        mol = Chem.AddHs(mol)
+    def _build_molecules_for_ids(
+        *,
+        target_ids: Sequence[str],
+        phase: str,
+    ) -> tuple[list[MoleculeSource], dict[str, Any], dict[str, int]]:
+        molecules_local: list[MoleculeSource] = []
+        mols_by_id_local: dict[str, Any] = {}
+        n_requested_confs = 0
+        n_found_confs = 0
+        n_skipped_missing_confs = 0
+        n_skipped_incompatible_confs = 0
+        n_mols_with_confs = 0
 
-        conf_labels = tuple(conf_map.get(mol_id, []))
-        n_requested_confs += int(len(conf_labels))
-        conf_ids: tuple[str, ...] = ()
-        if len(conf_labels) > 0 and len(sdf_conformers_by_conf_id) > 0:
-            merged_mol, kept_conf_labels, dropped_incompatible = _merge_sdf_conformers_for_molecule(
-                conf_ids=conf_labels,
-                sdf_conformers_by_conf_id=sdf_conformers_by_conf_id,
-            )
-            n_skipped_incompatible_confs += int(dropped_incompatible)
-            n_found_confs += int(len(kept_conf_labels))
-            n_skipped_missing_confs += int(max(0, len(conf_labels) - len(kept_conf_labels) - dropped_incompatible))
-            if merged_mol is not None and len(kept_conf_labels) > 0:
-                mol = merged_mol
-            conf_ids = tuple(str(x) for x in kept_conf_labels)
-            if len(conf_ids) > 0:
-                n_mols_with_confs += 1
-        elif len(conf_labels) > 0:
-            n_skipped_missing_confs += int(len(conf_labels))
+        for mol_id in target_ids:
+            smi = smiles_by_id.get(mol_id)
+            if smi is None:
+                continue
+            mol = Chem.MolFromSmiles(str(smi))
+            if mol is None:
+                continue
+            mol = Chem.AddHs(mol)
 
-        molecules.append(MoleculeSource(mol_id=str(mol_id), mol=mol, conf_ids=conf_ids))
-        molecules_by_id[str(mol_id)] = mol
+            conf_labels = tuple(conf_map.get(mol_id, []))
+            n_requested_confs += int(len(conf_labels))
+            conf_ids: tuple[str, ...] = ()
+            if len(conf_labels) > 0 and len(sdf_conformers_by_conf_id) > 0:
+                merged_mol, kept_conf_labels, dropped_incompatible = _merge_sdf_conformers_for_molecule(
+                    conf_ids=conf_labels,
+                    sdf_conformers_by_conf_id=sdf_conformers_by_conf_id,
+                )
+                n_skipped_incompatible_confs += int(dropped_incompatible)
+                n_found_confs += int(len(kept_conf_labels))
+                n_skipped_missing_confs += int(
+                    max(0, len(conf_labels) - len(kept_conf_labels) - dropped_incompatible)
+                )
+                if merged_mol is not None and len(kept_conf_labels) > 0:
+                    mol = merged_mol
+                conf_ids = tuple(str(x) for x in kept_conf_labels)
+                if len(conf_ids) > 0:
+                    n_mols_with_confs += 1
+            elif len(conf_labels) > 0:
+                n_skipped_missing_confs += int(len(conf_labels))
 
-    log_event(
-        "INFO",
-        "explainability.chem_ace.conformers_ready",
-        n_molecules=int(len(molecules)),
-        n_molecules_with_conformers=int(n_mols_with_confs),
-        requested_conformers=int(n_requested_confs),
-        found_in_sdf=int(n_found_confs),
-        skipped_missing=int(n_skipped_missing_confs),
-        skipped_incompatible=int(n_skipped_incompatible_confs),
+            molecules_local.append(MoleculeSource(mol_id=str(mol_id), mol=mol, conf_ids=conf_ids))
+            mols_by_id_local[str(mol_id)] = mol
+
+        stats = {
+            "n_molecules": int(len(molecules_local)),
+            "n_molecules_with_conformers": int(n_mols_with_confs),
+            "requested_conformers": int(n_requested_confs),
+            "found_in_sdf": int(n_found_confs),
+            "skipped_missing": int(n_skipped_missing_confs),
+            "skipped_incompatible": int(n_skipped_incompatible_confs),
+        }
+        log_event(
+            "INFO",
+            "explainability.chem_ace.conformers_ready",
+            phase=str(phase),
+            **stats,
+        )
+        return molecules_local, mols_by_id_local, stats
+
+    molecules_train, molecules_by_id_train, _train_stats = _build_molecules_for_ids(
+        target_ids=ids_discover,
+        phase="discover_train",
     )
+    if len(molecules_train) == 0:
+        raise RuntimeError("Chem-ACE train-scope molecule set is empty; cannot continue")
 
-    with log_step("explainability.chem_ace.generate_patches", n_molecules=int(len(molecules))):
-        patches = pipeline.generate_patches(molecules=molecules)
-    if len(patches) == 0:
-        raise RuntimeError("Chem-ACE generated zero patches; cannot continue")
-    n_patches_2d = int(sum(1 for p in patches if p.conf_id is None))
-    n_patches_3d = int(len(patches) - n_patches_2d)
+    molecules_infer, molecules_by_id_infer, _infer_stats = _build_molecules_for_ids(
+        target_ids=ids_infer,
+        phase="infer_scope",
+    )
+    molecules_by_id: dict[str, Any] = {}
+    molecules_by_id.update(molecules_by_id_train)
+    molecules_by_id.update(molecules_by_id_infer)
+
+    with log_step(
+        "explainability.chem_ace.generate_patches",
+        phase="discover_train",
+        n_molecules=int(len(molecules_train)),
+    ):
+        patches_train = pipeline.generate_patches(molecules=molecules_train)
+    if len(patches_train) == 0:
+        raise RuntimeError("Chem-ACE generated zero train patches; cannot continue")
+    n_patches_train_2d = int(sum(1 for p in patches_train if p.conf_id is None))
+    n_patches_train_3d = int(len(patches_train) - n_patches_train_2d)
     log_event(
         "INFO",
         "explainability.chem_ace.patches_ready",
-        n_patches=int(len(patches)),
-        n_patches_2d=int(n_patches_2d),
-        n_patches_3d=int(n_patches_3d),
+        phase="discover_train",
+        n_patches=int(len(patches_train)),
+        n_patches_2d=int(n_patches_train_2d),
+        n_patches_3d=int(n_patches_train_3d),
     )
 
-    with log_step("explainability.chem_ace.embed_patches"):
-        embeddings = _build_feature_patch_embeddings(
+    with log_step("explainability.chem_ace.embed_patches", phase="discover_train"):
+        embeddings_train = _build_feature_patch_embeddings(
             pipeline=pipeline,
-            patches=patches,
+            patches=patches_train,
             molecules_by_id=molecules_by_id,
             x2d_by_id=x2d_by_id,
             xinst_by_pair=inst_map,
@@ -641,24 +695,116 @@ def prepare_chem_ace_bundle(
             max_3dqm_dim=int(config.chem_ace_max_3dqm_dim),
             n_workers=max(0, int(config.cpu_workers)),
         )
-    log_event("INFO", "explainability.chem_ace.embeddings_ready", n_embeddings=int(len(embeddings)))
+    log_event(
+        "INFO",
+        "explainability.chem_ace.embeddings_ready",
+        phase="discover_train",
+        n_embeddings=int(len(embeddings_train)),
+    )
 
-    with log_step("explainability.chem_ace.discover_concepts"):
+    with log_step("explainability.chem_ace.discover_concepts", phase="discover_train"):
         concept_set, concept_set_id = pipeline.discover_and_store_concepts(
             run_id=run_id,
-            embeddings=embeddings,
+            embeddings=embeddings_train,
         )
-    with log_step("explainability.chem_ace.tag_concepts"):
+    with log_step("explainability.chem_ace.tag_concepts", phase="discover_train"):
         tagging = pipeline.tag_and_store_concepts(
             concept_set=concept_set,
-            patches=patches,
-            molecules_by_id=molecules_by_id,
+            patches=patches_train,
+            molecules_by_id=molecules_by_id_train,
         )
 
-    concept_mol_map, concept_conf_map = _build_concept_membership_maps(
+    concept_mol_map_train, concept_conf_map_train = _build_concept_membership_maps(
         concept_set=concept_set,
-        patches=patches,
+        patches=patches_train,
     )
+    concept_mol_map_infer: dict[str, set[str]] = {}
+    concept_conf_map_infer: dict[str, set[tuple[str, str]]] = {}
+    n_patches_infer = 0
+    n_embeddings_infer = 0
+    n_inferred_memberships = 0
+
+    if len(ids_infer) > 0 and len(concept_set.candidates) > 0:
+        with log_step(
+            "explainability.chem_ace.generate_patches",
+            phase="infer_scope",
+            n_molecules=int(len(molecules_infer)),
+        ):
+            patches_infer = pipeline.generate_patches(molecules=molecules_infer)
+        n_patches_infer = int(len(patches_infer))
+        if n_patches_infer > 0:
+            n_patches_infer_2d = int(sum(1 for p in patches_infer if p.conf_id is None))
+            n_patches_infer_3d = int(n_patches_infer - n_patches_infer_2d)
+            log_event(
+                "INFO",
+                "explainability.chem_ace.patches_ready",
+                phase="infer_scope",
+                n_patches=int(n_patches_infer),
+                n_patches_2d=int(n_patches_infer_2d),
+                n_patches_3d=int(n_patches_infer_3d),
+            )
+
+            with log_step("explainability.chem_ace.embed_patches", phase="infer_scope"):
+                embeddings_infer = _build_feature_patch_embeddings(
+                    pipeline=pipeline,
+                    patches=patches_infer,
+                    molecules_by_id=molecules_by_id,
+                    x2d_by_id=x2d_by_id,
+                    xinst_by_pair=inst_map,
+                    xinst_mean_by_id=inst_mean_map,
+                    max_2d_dim=int(config.chem_ace_max_2d_dim),
+                    max_3dqm_dim=int(config.chem_ace_max_3dqm_dim),
+                    n_workers=max(0, int(config.cpu_workers)),
+                )
+            n_embeddings_infer = int(len(embeddings_infer))
+            log_event(
+                "INFO",
+                "explainability.chem_ace.embeddings_ready",
+                phase="infer_scope",
+                n_embeddings=int(n_embeddings_infer),
+            )
+
+            with log_step("explainability.chem_ace.infer_memberships", phase="infer_scope"):
+                inferred_memberships = _infer_memberships_to_frozen_centroids(
+                    embeddings=embeddings_infer,
+                    candidates=concept_set.candidates,
+                    max_distance=float(config.chem_ace_infer_max_distance),
+                )
+            n_inferred_memberships = int(len(inferred_memberships))
+            if n_inferred_memberships > 0 and hasattr(pipeline.repository, "upsert_memberships"):
+                with log_step(
+                    "explainability.chem_ace.persist_inferred_memberships",
+                    n_memberships=int(n_inferred_memberships),
+                ):
+                    pipeline.repository.upsert_memberships(inferred_memberships)
+
+            concept_mol_map_infer, concept_conf_map_infer = _build_membership_maps_from_memberships(
+                memberships=inferred_memberships,
+                patches=patches_infer,
+            )
+            log_event(
+                "INFO",
+                "explainability.chem_ace.infer_memberships_ready",
+                n_memberships=int(n_inferred_memberships),
+                n_concepts_hit=int(len(concept_mol_map_infer)),
+                max_distance=float(config.chem_ace_infer_max_distance),
+            )
+        else:
+            log_event(
+                "WARN",
+                "explainability.chem_ace.infer_scope.no_patches",
+                n_molecules=int(len(molecules_infer)),
+            )
+
+    concept_mol_map = _merge_membership_maps(
+        base=concept_mol_map_train,
+        extra=concept_mol_map_infer,
+    )
+    concept_conf_map = _merge_membership_maps(
+        base=concept_conf_map_train,
+        extra=concept_conf_map_infer,
+    )
+
     support_map = {str(c.concept_local_id): int(c.support) for c in concept_set.candidates}
     tag_map = {
         str(t.concept_id): {
@@ -670,12 +816,18 @@ def prepare_chem_ace_bundle(
 
     concept_metadata: dict[str, dict[str, Any]] = {}
     for cid, support in support_map.items():
+        mols_train = concept_mol_map_train.get(cid, set())
+        confs_train = concept_conf_map_train.get(cid, set())
+        mols_total = concept_mol_map.get(cid, set())
+        confs_total = concept_conf_map.get(cid, set())
         concept_metadata[cid] = {
             "support": int(support),
             "label_auto": tag_map.get(cid, {}).get("label_auto"),
             "tags": tag_map.get(cid, {}).get("tags", []),
-            "n_molecules": int(len(concept_mol_map.get(cid, set()))),
-            "n_conf_pairs": int(len(concept_conf_map.get(cid, set()))),
+            "n_molecules_train": int(len(mols_train)),
+            "n_conf_pairs_train": int(len(confs_train)),
+            "n_molecules_total": int(len(mols_total)),
+            "n_conf_pairs_total": int(len(confs_total)),
         }
 
     ordered_concepts = sorted(
@@ -690,9 +842,13 @@ def prepare_chem_ace_bundle(
     summary = {
         "run_id": str(run_id),
         "concept_set_id": str(concept_set_id),
-        "n_molecules": int(len(molecules)),
-        "n_patches": int(len(patches)),
-        "n_embeddings": int(len(embeddings)),
+        "n_molecules_discover": int(len(molecules_train)),
+        "n_molecules_infer": int(len(molecules_infer)),
+        "n_patches_discover": int(len(patches_train)),
+        "n_patches_infer": int(n_patches_infer),
+        "n_embeddings_discover": int(len(embeddings_train)),
+        "n_embeddings_infer": int(n_embeddings_infer),
+        "n_inferred_memberships": int(n_inferred_memberships),
         "n_concepts": int(len(concept_set.candidates)),
         "selected_concepts": ordered_concepts,
     }
@@ -704,7 +860,7 @@ def prepare_chem_ace_bundle(
             "run_id": run_id,
             "concept_set_id": concept_set_id,
             "n_concepts": len(ordered_concepts),
-            "n_patches": len(patches),
+            "n_patches": len(patches_train),
         },
     )
     log_event(
@@ -1189,16 +1345,75 @@ def _take_or_pad(vec: np.ndarray, dim: int) -> np.ndarray:
 
 
 
-def _build_concept_membership_maps(
+def _infer_memberships_to_frozen_centroids(
     *,
-    concept_set: Any,
+    embeddings: Sequence[PatchEmbeddingRecord],
+    candidates: Sequence[ConceptCandidate],
+    max_distance: float,
+    chunk_size: int = 4096,
+) -> list[ConceptMembership]:
+    if len(embeddings) == 0 or len(candidates) == 0:
+        return []
+
+    centroids = np.stack([np.asarray(c.centroid, dtype=np.float32) for c in candidates], axis=0)
+    concept_ids = [str(c.concept_local_id) for c in candidates]
+    c_sq = np.sum(np.square(centroids), axis=1).reshape(1, -1)
+
+    out: list[ConceptMembership] = []
+    n = int(len(embeddings))
+    step = int(max(1, chunk_size))
+    progress_every = 200000
+
+    for start in range(0, n, step):
+        end = min(n, start + step)
+        batch = embeddings[start:end]
+        x = np.stack([np.asarray(e.vector, dtype=np.float32) for e in batch], axis=0)
+        x_sq = np.sum(np.square(x), axis=1, keepdims=True)
+        d2 = x_sq + c_sq - 2.0 * np.matmul(x, centroids.T)
+        np.maximum(d2, 0.0, out=d2)
+
+        nn_idx = np.argmin(d2, axis=1)
+        row_idx = np.arange(d2.shape[0])
+        min_dist = np.sqrt(d2[row_idx, nn_idx]).astype(np.float32)
+
+        for i, emb in enumerate(batch):
+            dist = float(min_dist[i])
+            if float(max_distance) > 0.0 and dist > float(max_distance):
+                continue
+            cid = concept_ids[int(nn_idx[i])]
+            out.append(
+                ConceptMembership(
+                    concept_local_id=str(cid),
+                    patch_id=str(emb.patch_id),
+                    membership_score=float(1.0 / (1.0 + dist)),
+                    distance_to_centroid=dist,
+                )
+            )
+
+        done = int(end)
+        if done == n or (progress_every > 0 and (done % progress_every == 0)):
+            log_event(
+                "PROGRESS",
+                "explainability.chem_ace.infer_memberships.assign",
+                done=f"{done}/{n}",
+                pct=f"{(100.0 * done / float(max(1, n))):.1f}",
+                assigned=int(len(out)),
+            )
+
+    return out
+
+
+
+def _build_membership_maps_from_memberships(
+    *,
+    memberships: Sequence[ConceptMembership],
     patches: Sequence[PatchRecord],
 ) -> tuple[dict[str, set[str]], dict[str, set[tuple[str, str]]]]:
     patch_by_id = {str(p.patch_id): p for p in patches}
     concept_mols: dict[str, set[str]] = {}
     concept_confs: dict[str, set[tuple[str, str]]] = {}
 
-    for m in concept_set.memberships:
+    for m in memberships:
         cid = str(m.concept_local_id)
         patch = patch_by_id.get(str(m.patch_id))
         if patch is None:
@@ -1208,6 +1423,31 @@ def _build_concept_membership_maps(
             concept_confs.setdefault(cid, set()).add((str(patch.mol_id), str(patch.conf_id)))
 
     return concept_mols, concept_confs
+
+
+
+def _build_concept_membership_maps(
+    *,
+    concept_set: Any,
+    patches: Sequence[PatchRecord],
+) -> tuple[dict[str, set[str]], dict[str, set[tuple[str, str]]]]:
+    return _build_membership_maps_from_memberships(
+        memberships=list(concept_set.memberships),
+        patches=patches,
+    )
+
+
+
+def _merge_membership_maps(
+    *,
+    base: Mapping[str, set[Any]],
+    extra: Mapping[str, set[Any]],
+) -> dict[str, set[Any]]:
+    out: dict[str, set[Any]] = {str(k): set(v) for k, v in base.items()}
+    for k, vals in extra.items():
+        key = str(k)
+        out.setdefault(key, set()).update(set(vals))
+    return out
 
 
 

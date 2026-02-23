@@ -73,6 +73,12 @@ Useful controls:
 - `--chem_ace_sdf_conf_id_prop conf_id` (falls back to SDF record name if missing)
 - `--cpu_workers -1`
 
+Anti-leakage behavior:
+
+- Chem-ACE concept discovery in final pipeline is train-only.
+- Leaderboard explainability is inference-only: leaderboard patches are assigned to frozen train centroids (no reclustering).
+- Use `--chem_ace_infer_max_distance` to drop far leaderboard assignments (`<=0` disables gating).
+
 Behavior for conformers:
 
 - 2D patches are generated once per molecule.

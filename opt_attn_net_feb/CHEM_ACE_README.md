@@ -218,15 +218,27 @@ is **not** "all rows in labels".
 In the final pipeline it is built from:
 
 1. IDs in split `train`
-2. union IDs in split `leaderboard` (or your configured `--leaderboard_split`)
-3. after dropping IDs with no valid conformer bags
-4. after applying `--chem_ace_max_ids` (if > 0)
-5. after deduplication to unique IDs
+2. after dropping IDs with no valid conformer bags
+3. after applying `--chem_ace_max_ids` (if > 0)
+4. after deduplication to unique IDs
+
+This is an intentional anti-leakage policy with two phases:
+
+- concept discovery uses train-only IDs
+- leaderboard IDs are **not** used to define/update concept clusters
+- leaderboard explainability uses inference-only assignment:
+  - generate leaderboard patches + embeddings
+  - assign each leaderboard patch to nearest frozen train centroid
+  - optional distance gate via `--chem_ace_infer_max_distance`
+  - no reclustering on leaderboard
 
 Additional scope logs now emitted:
 
-- `final.prepare_chem_ace_bundle.scope n_train_ids=... n_leaderboard_ids=... n_scope_ids=...`
-- `explainability.chem_ace.scope_ids n_scope_ids_input=... n_scope_ids_selected=... chem_ace_max_ids=...`
+- `final.prepare_chem_ace_bundle.scope n_train_ids=... n_leaderboard_ids=... n_scope_ids=... scope_splits=train anti_leakage=enabled`
+- `explainability.chem_ace.scope_ids n_discover_ids_input=... n_discover_ids_selected=... n_infer_ids_input=... n_infer_ids_selected=... chem_ace_max_ids=...`
+- `explainability.chem_ace.generate_patches phase=discover_train|infer_scope ...`
+- `explainability.chem_ace.embed_patches phase=discover_train|infer_scope ...`
+- `explainability.chem_ace.infer_memberships ...`
 
 ## 6) Patch volume control and scaling
 
@@ -242,6 +254,7 @@ Key controls:
 - `--chem_ace_local_radii` (default `1`)
 - `--chem_ace_patch_cap_per_mol` (default `0`, means auto)
 - `--chem_ace_target_total_patches` (default `1200000`)
+- `--chem_ace_infer_max_distance` (default `-1.0`, disabled; if `>0`, drops far leaderboard assignments)
 
 ### Auto-cap math
 

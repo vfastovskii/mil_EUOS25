@@ -790,7 +790,11 @@ Runtime sets:
 ### 14.2 Molecule preparation
 
 - Uses `Chem.MolFromSmiles(curated_SMILES)` then `Chem.AddHs`.
-- Concept scope IDs = `train U leaderboard IDs`, optionally truncated by `chem_ace_max_ids`.
+- Discovery scope IDs = `train` IDs only (anti-leakage), optionally truncated by `chem_ace_max_ids`.
+- Inference scope IDs (typically leaderboard) are processed separately:
+  - patch embeddings are mapped to nearest frozen train concept centroids
+  - no concept re-clustering or centroid updates on inference scope
+  - optional distance gate: `chem_ace_infer_max_distance` (`<=0` disables gate)
 - Conformers per molecule truncated by `chem_ace_max_confs_per_id` if >0.
 
 ### 14.3 Patch generation
@@ -1041,7 +1045,9 @@ Query APIs include:
 ## 16. Integrated Explainability in Final Training
 
 When enabled in final run:
-1. Chem-ACE bundle prepared from train+leaderboard IDs.
+1. Chem-ACE bundle prepared in two phases:
+   - fit/discover on train-only IDs (anti-leakage)
+   - infer memberships on leaderboard IDs using frozen train centroids (no reclustering)
 2. Optional concept-guided RL controller prepared:
    - target concepts are selected per task from concepts frequent in positive train samples
    - train dataset enables molecule/conformer metadata for attention-to-concept alignment
