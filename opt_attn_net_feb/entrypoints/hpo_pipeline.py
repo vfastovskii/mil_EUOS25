@@ -195,6 +195,9 @@ class CLIExplainabilityConfig:
     chem_ace_db_uri: str | None
     chem_ace_max_ids: int
     chem_ace_max_confs_per_id: int
+    chem_ace_local_radii: tuple[int, ...]
+    chem_ace_patch_cap_per_mol: int
+    chem_ace_target_total_patches: int
     chem_ace_max_2d_dim: int
     chem_ace_max_3dqm_dim: int
     chem_ace_top_concepts: int
@@ -377,6 +380,9 @@ class PipelineConfigFactory:
                 ),
                 chem_ace_max_ids=int(args.chem_ace_max_ids),
                 chem_ace_max_confs_per_id=int(args.chem_ace_max_confs_per_id),
+                chem_ace_local_radii=tuple(int(x) for x in args.chem_ace_local_radii),
+                chem_ace_patch_cap_per_mol=int(args.chem_ace_patch_cap_per_mol),
+                chem_ace_target_total_patches=int(args.chem_ace_target_total_patches),
                 chem_ace_max_2d_dim=int(args.chem_ace_max_2d_dim),
                 chem_ace_max_3dqm_dim=int(args.chem_ace_max_3dqm_dim),
                 chem_ace_top_concepts=int(args.chem_ace_top_concepts),
@@ -854,6 +860,9 @@ class MILPipelineOrchestrator:
                         chem_ace_db_uri=self.config.explainability.chem_ace_db_uri,
                         chem_ace_max_ids=int(self.config.explainability.chem_ace_max_ids),
                         chem_ace_max_confs_per_id=int(self.config.explainability.chem_ace_max_confs_per_id),
+                        chem_ace_local_radii=tuple(self.config.explainability.chem_ace_local_radii),
+                        chem_ace_patch_cap_per_mol=int(self.config.explainability.chem_ace_patch_cap_per_mol),
+                        chem_ace_target_total_patches=int(self.config.explainability.chem_ace_target_total_patches),
                         chem_ace_max_2d_dim=int(self.config.explainability.chem_ace_max_2d_dim),
                         chem_ace_max_3dqm_dim=int(self.config.explainability.chem_ace_max_3dqm_dim),
                         chem_ace_top_concepts=int(self.config.explainability.chem_ace_top_concepts),
@@ -1007,8 +1016,37 @@ def _parse_args(argv: Any | None = None):
     )
     ap.add_argument("--chem_ace_output_dir", default=None)
     ap.add_argument("--chem_ace_db_uri", default=None)
-    ap.add_argument("--chem_ace_max_ids", type=int, default=10000)
-    ap.add_argument("--chem_ace_max_confs_per_id", type=int, default=4)
+    ap.add_argument(
+        "--chem_ace_max_ids",
+        type=int,
+        default=0,
+        help="Max molecule IDs for Chem-ACE (0 means use all available IDs in scope).",
+    )
+    ap.add_argument(
+        "--chem_ace_max_confs_per_id",
+        type=int,
+        default=0,
+        help="Max conformers per molecule for Chem-ACE (<=0 means use all conformers).",
+    )
+    ap.add_argument(
+        "--chem_ace_local_radii",
+        nargs="+",
+        type=int,
+        default=[1],
+        help="Local-subgraph radii for 2D patching.",
+    )
+    ap.add_argument(
+        "--chem_ace_patch_cap_per_mol",
+        type=int,
+        default=0,
+        help="Per-molecule patch cap (<=0 enables dynamic auto-cap).",
+    )
+    ap.add_argument(
+        "--chem_ace_target_total_patches",
+        type=int,
+        default=1200000,
+        help="Target total patches when auto-cap is enabled (<=0 disables auto-cap).",
+    )
     ap.add_argument("--chem_ace_max_2d_dim", type=int, default=256)
     ap.add_argument("--chem_ace_max_3dqm_dim", type=int, default=256)
     ap.add_argument("--chem_ace_top_concepts", type=int, default=64)

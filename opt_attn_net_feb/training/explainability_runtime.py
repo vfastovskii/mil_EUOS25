@@ -21,6 +21,7 @@ from ..explainability.chem_ace.config import (
     ConceptDiscoveryConfig,
     DatabaseConfig,
     EmbeddingConfig,
+    LocalSubgraphPatchConfig,
     PatchGenerationConfig,
     Pharm3DPatchConfig,
 )
@@ -53,8 +54,13 @@ class FinalExplainabilityConfig:
 
     chem_ace_output_dir: Optional[str] = None
     chem_ace_db_uri: Optional[str] = None
-    chem_ace_max_ids: int = 10000
-    chem_ace_max_confs_per_id: int = 4
+    chem_ace_max_ids: int = 0
+    # <=0 means use all available conformers per molecule.
+    chem_ace_max_confs_per_id: int = 0
+    chem_ace_local_radii: tuple[int, ...] = (1,)
+    # <= 0 enables dynamic cap by chem_ace_target_total_patches / n_molecules.
+    chem_ace_patch_cap_per_mol: int = 0
+    chem_ace_target_total_patches: int = 1200000
     chem_ace_max_2d_dim: int = 256
     chem_ace_max_3dqm_dim: int = 256
     chem_ace_top_concepts: int = 64
@@ -469,14 +475,32 @@ def prepare_chem_ace_bundle(
     ace_out_dir.mkdir(parents=True, exist_ok=True)
     db_uri = str(config.chem_ace_db_uri) if config.chem_ace_db_uri else f"sqlite:///{(ace_out_dir / 'chem_ace.sqlite3').as_posix()}"
 
+    local_radii = tuple(
+        sorted({int(r) for r in config.chem_ace_local_radii if int(r) >= 0})
+    )
+    if len(local_radii) == 0:
+        local_radii = (1,)
+    log_event(
+        "INFO",
+        "explainability.chem_ace.patch_config",
+        local_radii=",".join(str(x) for x in local_radii),
+        patch_cap_per_mol=int(config.chem_ace_patch_cap_per_mol),
+        target_total_patches=int(config.chem_ace_target_total_patches),
+    )
+
     ace_cfg = ChemACEConfig(
         run_name="chem_ace_final_pipeline",
         seed=int(seed),
         output_dir=str(ace_out_dir),
         cpu_workers=max(0, int(config.cpu_workers)),
+        max_patches_per_molecule=int(config.chem_ace_patch_cap_per_mol),
+        target_total_patches=int(config.chem_ace_target_total_patches),
         embedding=EmbeddingConfig(layer_name="feature_fusion_2d3dqm", strategy="masked_input"),
         discovery=ConceptDiscoveryConfig(),
-        patch_generation=PatchGenerationConfig(pharm3d=Pharm3DPatchConfig(enabled=True)),
+        patch_generation=PatchGenerationConfig(
+            local_subgraph=LocalSubgraphPatchConfig(radii=tuple(local_radii)),
+            pharm3d=Pharm3DPatchConfig(enabled=True),
+        ),
         database=DatabaseConfig(uri=db_uri),
     )
     pipeline = ChemACEPipeline(config=ace_cfg)

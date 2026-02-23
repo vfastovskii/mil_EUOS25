@@ -10,7 +10,7 @@ import json
 class LocalSubgraphPatchConfig:
     """Configuration for atom-centered local subgraph patch generation."""
 
-    radii: tuple[int, ...] = (1, 2)
+    radii: tuple[int, ...] = (1,)
     include_center_atom: bool = True
 
 
@@ -117,6 +117,10 @@ class ChemACEConfig:
     seed: int = 0
     output_dir: str = "chem_ace_outputs"
     cpu_workers: int = 0
+    # <= 0 enables dynamic cap from target_total_patches / n_molecules.
+    max_patches_per_molecule: int = 0
+    # Used only when max_patches_per_molecule <= 0.
+    target_total_patches: int = 1200000
     progress_log_every_molecules: int = 250
     patch_generation: PatchGenerationConfig = field(default_factory=PatchGenerationConfig)
     embedding: EmbeddingConfig = field(default_factory=lambda: EmbeddingConfig(layer_name="encoder"))

@@ -42,7 +42,17 @@ LABELS="${EXP_DIR}/master_table_labels_final_modelling_ready_1401_with_cv_split.
 FEAT2D_SCALED="${EXP_DIR}/scaled_2d.csv"
 FEAT3D_SCALED="${EXP_DIR}/scaled_3d.csv"
 FEAT3D_QM="${EXP_DIR}/scaled_3d_quantum.csv"
-CONF_SDF="${EXP_DIR}/test_mols_batch.sdf"
+
+# Conformer SDF input (override at submit time via --export=ALL,CONF_SDF=/path/file.sdf)
+CONF_SDF="${CONF_SDF:-${EXP_DIR}/test_mols_batch.sdf}"
+# Property name in SDF storing conf identifier.
+# Your SDF uses record name as conformer identifier.
+CONF_ID_PROP="${CONF_ID_PROP:-_Name}"
+# Chem-ACE patch-budget controls (override via --export=ALL,...)
+CHEMACE_MAX_IDS="${CHEMACE_MAX_IDS:-0}"
+CHEMACE_LOCAL_RADII="${CHEMACE_LOCAL_RADII:-1}"
+CHEMACE_PATCH_CAP_PER_MOL="${CHEMACE_PATCH_CAP_PER_MOL:-0}"
+CHEMACE_TARGET_TOTAL_PATCHES="${CHEMACE_TARGET_TOTAL_PATCHES:-1200000}"
 
 # -------------------- node-local scratch --------------------
 WORKDIR="${SLURM_TMPDIR:-/tmp}/${SLURM_JOB_ID}"
@@ -57,6 +67,12 @@ echo "[INFO] Workdir: $WORKDIR"
 echo "[INFO] Study dir (node-local): $STUDY_DIR"
 echo "[INFO] Output dir: $OUTDIR"
 echo "[INFO] CPUs=${SLURM_CPUS_PER_TASK} | CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "[INFO] Conformer SDF: $CONF_SDF"
+echo "[INFO] SDF conf-id prop: $CONF_ID_PROP"
+echo "[INFO] Chem-ACE max IDs: $CHEMACE_MAX_IDS"
+echo "[INFO] Chem-ACE local radii: $CHEMACE_LOCAL_RADII"
+echo "[INFO] Chem-ACE patch cap per mol: $CHEMACE_PATCH_CAP_PER_MOL"
+echo "[INFO] Chem-ACE target total patches: $CHEMACE_TARGET_TOTAL_PATCHES"
 
 # optional: GPU info
 command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || true
@@ -108,7 +124,11 @@ python3 "$WORKDIR/opt_net_fast.py" \
   --run_concept_rl \
   --curated_smiles_col curated_SMILES \
   --chem_ace_conformer_sdf "$WORKDIR/$(basename "$CONF_SDF")" \
-  --chem_ace_sdf_conf_id_prop conf_id \
+  --chem_ace_sdf_conf_id_prop "$CONF_ID_PROP" \
+  --chem_ace_max_ids "$CHEMACE_MAX_IDS" \
+  --chem_ace_local_radii $CHEMACE_LOCAL_RADII \
+  --chem_ace_patch_cap_per_mol "$CHEMACE_PATCH_CAP_PER_MOL" \
+  --chem_ace_target_total_patches "$CHEMACE_TARGET_TOTAL_PATCHES" \
   --leaderboard_split leaderboard \
   --attn_out "$STUDY_DIR/leaderboard_attn.csv" \
   --max_epochs 150 \
@@ -118,7 +138,7 @@ python3 "$WORKDIR/opt_net_fast.py" \
   --nn_devices 1 \
   --precision 16-mixed \
   --num_workers 23 \
-  --cpu_workers -1
+  --cpu_workers 18
 
 # -------------------- copy back --------------------
 echo "[INFO] Copy results back..."

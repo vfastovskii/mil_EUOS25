@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from hashlib import sha1
 import logging
+import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 import time
@@ -88,12 +90,56 @@ class ChemACEPipeline:
         except Exception:
             return 250
 
+    def _resolve_patch_cap(self, *, total_molecules: int) -> int:
+        try:
+            configured_cap = int(getattr(self.config, "max_patches_per_molecule", 0))
+        except Exception:
+            configured_cap = 0
+        if configured_cap > 0:
+            return int(configured_cap)
+
+        try:
+            target_total = int(getattr(self.config, "target_total_patches", 0))
+        except Exception:
+            target_total = 0
+        if target_total <= 0 or int(total_molecules) <= 0:
+            return 0
+
+        raw_cap = int(math.ceil(float(target_total) / float(total_molecules)))
+        # Keep dynamic cap in a sane range for stability.
+        return int(max(16, min(256, raw_cap)))
+
+    @staticmethod
+    def _deterministic_cap_patches(
+        *,
+        mol_id: str,
+        patches: Sequence[PatchRecord],
+        cap: int,
+    ) -> list[PatchRecord]:
+        if cap <= 0 or len(patches) <= cap:
+            return list(patches)
+        ranked: list[tuple[str, PatchRecord]] = []
+        for patch in patches:
+            h = sha1(f"{mol_id}|{patch.patch_id}|chemace_patch_cap_v1".encode("utf-8")).hexdigest()
+            ranked.append((h, patch))
+        ranked.sort(key=lambda x: x[0])
+        return [p for _, p in ranked[:cap]]
+
     def generate_patches(self, *, molecules: Sequence[MoleculeSource]) -> list[PatchRecord]:
         """Generate patches for a set of molecules and persist them."""
         workers = self._cpu_workers()
         total_molecules = int(len(molecules))
         progress_every = self._patch_progress_every()
+        patch_cap = self._resolve_patch_cap(total_molecules=total_molecules)
         t0 = time.perf_counter()
+
+        log_event(
+            "INFO",
+            "explainability.chem_ace.patch_budget",
+            n_molecules=int(total_molecules),
+            cap_per_molecule=int(patch_cap),
+            target_total_patches=int(getattr(self.config, "target_total_patches", 0)),
+        )
 
         def _gen_for_molecule(item: MoleculeSource) -> list[PatchRecord]:
             out: dict[str, PatchRecord] = {}
@@ -135,7 +181,12 @@ class ChemACEPipeline:
                         for patch in generated:
                             out[patch.patch_id] = patch
 
-            return list(out.values())
+            patch_list = list(out.values())
+            return self._deterministic_cap_patches(
+                mol_id=str(item.mol_id),
+                patches=patch_list,
+                cap=int(patch_cap),
+            )
 
         def _emit_progress(done_molecules: int, n_patches: int) -> None:
             if total_molecules <= 0:

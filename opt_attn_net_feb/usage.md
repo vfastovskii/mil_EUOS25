@@ -62,8 +62,11 @@ python -m entrypoints.hpo_pipeline ... \
 
 Useful controls:
 
-- `--chem_ace_max_ids 10000`
-- `--chem_ace_max_confs_per_id 4`
+- `--chem_ace_max_ids 0` (default: auto use all IDs in scope)
+- `--chem_ace_max_confs_per_id 0` (default: use all conformers)
+- `--chem_ace_local_radii 1` (default)
+- `--chem_ace_patch_cap_per_mol 0` (default: dynamic auto-cap)
+- `--chem_ace_target_total_patches 1200000` (used when auto-cap is enabled)
 - `--chem_ace_top_concepts 64`
 - `--chem_ace_output_dir /path/to/chem_ace_out`
 - `--chem_ace_conformer_sdf /path/to/precomputed_conformers.sdf`
@@ -75,6 +78,14 @@ Behavior for conformers:
 - 2D patches are generated once per molecule.
 - 3D Pharm3D patches are generated only for conformers found in the SDF.
 - If a `conf_id` from the features is missing in SDF, it is skipped (no conformer generation fallback).
+
+Patch-budget behavior:
+
+- Local-subgraph default is `radii=(1,)`.
+- If `--chem_ace_patch_cap_per_mol <= 0`, cap is derived dynamically from:
+  `ceil(chem_ace_target_total_patches / n_molecules_in_scope)`, clipped to `[16, 256]`.
+- If `--chem_ace_patch_cap_per_mol > 0`, that fixed cap is used.
+- Capping uses deterministic per-molecule sampling (stable across reruns with same inputs).
 
 ## Enable Lambda-Vol monitoring during final training (requires Chem-ACE concepts)
 

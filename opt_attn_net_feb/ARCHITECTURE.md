@@ -783,7 +783,7 @@ Hard requirements:
 Runtime sets:
 - `embedding.layer_name = "feature_fusion_2d3dqm"`
 - `embedding.strategy = "masked_input"` at config object level, but integrated final embedding persistence uses explicit `strategy="feature_projection"` for fused vectors
-- `patch_generation.pharm3d.enabled = False` in this integrated path
+- `patch_generation.pharm3d.enabled = True` in this integrated path
 - database default URI:
   - `sqlite:///<chem_ace_output_dir>/chem_ace.sqlite3`
 
@@ -801,7 +801,7 @@ Available generators in framework:
 - Murcko (+ optional framework)
 - Pharm3D
 
-Integrated final pipeline currently disables Pharm3D by config; others remain active.
+Integrated final pipeline enables Pharm3D when conformers are available from the provided SDF.
 
 Patch IDs/hashes are deterministic SHA1 signatures over:
 - patch type
@@ -1321,8 +1321,8 @@ This section lists defaults exactly as defined in typed configs and CLI parser, 
 - `curated_smiles_col = \"curated_SMILES\"`
 - `chem_ace_output_dir = None`
 - `chem_ace_db_uri = None`
-- `chem_ace_max_ids = 10000`
-- `chem_ace_max_confs_per_id = 4`
+- `chem_ace_max_ids = 0` (`0` means use all IDs in scope)
+- `chem_ace_max_confs_per_id = 0` (`<=0` means use all conformers)
 - `chem_ace_max_2d_dim = 256`
 - `chem_ace_max_3dqm_dim = 256`
 - `chem_ace_top_concepts = 64`
@@ -1369,8 +1369,8 @@ Explainability:
 - `--curated_smiles_col curated_SMILES`
 - `--chem_ace_output_dir None`
 - `--chem_ace_db_uri None`
-- `--chem_ace_max_ids 10000`
-- `--chem_ace_max_confs_per_id 4`
+- `--chem_ace_max_ids 0` (`0` means use all IDs in scope)
+- `--chem_ace_max_confs_per_id 0` (`<=0` means use all conformers)
 - `--chem_ace_max_2d_dim 256`
 - `--chem_ace_max_3dqm_dim 256`
 - `--chem_ace_top_concepts 64`
