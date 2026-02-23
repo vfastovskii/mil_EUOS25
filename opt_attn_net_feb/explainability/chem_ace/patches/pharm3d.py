@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import json
 from typing import Any, Optional
 
 from ..config import Pharm3DPatchConfig
@@ -16,6 +17,7 @@ class Pharm3DPatchGenerator(PatchGenerator):
     """Generate pharmacophore-feature patches from conformer-aware RDKit features."""
 
     patch_type = "pharm3d"
+    requires_conformer = True
 
     def __init__(self, config: Pharm3DPatchConfig | None = None):
         self.config = config or Pharm3DPatchConfig()
@@ -36,7 +38,9 @@ class Pharm3DPatchGenerator(PatchGenerator):
         if mol.GetNumConformers() == 0:
             return []
 
-        conf_idx = int(conf_id) if conf_id is not None else -1
+        conf_idx = self._resolve_conf_idx(mol=mol, conf_id=conf_id)
+        if conf_idx is None:
+            return []
         fdef_path = Path(RDConfig.RDDataDir) / self.config.feature_factory_name
         if not fdef_path.exists():
             logger.warning("Feature factory file not found", extra={"path": str(fdef_path)})
@@ -71,6 +75,34 @@ class Pharm3DPatchGenerator(PatchGenerator):
             )
             out[patch.patch_id] = patch
         return list(out.values())
+
+    @staticmethod
+    def _resolve_conf_idx(*, mol: Any, conf_id: Optional[str]) -> Optional[int]:
+        if conf_id is None:
+            return -1
+
+        cid = str(conf_id)
+        try:
+            idx = int(cid)
+            mol.GetConformer(int(idx))
+            return int(idx)
+        except Exception:
+            pass
+
+        if mol.HasProp("_chemace_conf_id_map"):
+            try:
+                mapping = json.loads(mol.GetProp("_chemace_conf_id_map"))
+                if cid in mapping:
+                    idx = int(mapping[cid])
+                    mol.GetConformer(int(idx))
+                    return int(idx)
+            except Exception:
+                pass
+
+        if mol.GetNumConformers() == 1:
+            return 0
+
+        return None
 
 
 __all__ = ["Pharm3DPatchGenerator"]

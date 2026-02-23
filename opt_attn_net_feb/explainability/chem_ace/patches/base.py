@@ -45,6 +45,7 @@ class PatchGenerator(ABC):
     """Abstract base class for molecular patch generators."""
 
     patch_type: str
+    requires_conformer: bool = False
 
     @abstractmethod
     def generate(self, *, mol_id: str, mol: Any, conf_id: Optional[str] = None) -> list[PatchRecord]:

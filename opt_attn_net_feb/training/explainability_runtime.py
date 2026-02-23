@@ -47,6 +47,8 @@ class FinalExplainabilityConfig:
     run_chem_ace: bool = False
     run_lambda_vol: bool = False
     curated_smiles_col: str = "curated_SMILES"
+    chem_ace_conformer_sdf: Optional[str] = None
+    chem_ace_sdf_conf_id_prop: str = "conf_id"
     cpu_workers: int = 0
 
     chem_ace_output_dir: Optional[str] = None
@@ -474,7 +476,7 @@ def prepare_chem_ace_bundle(
         cpu_workers=max(0, int(config.cpu_workers)),
         embedding=EmbeddingConfig(layer_name="feature_fusion_2d3dqm", strategy="masked_input"),
         discovery=ConceptDiscoveryConfig(),
-        patch_generation=PatchGenerationConfig(pharm3d=Pharm3DPatchConfig(enabled=False)),
+        patch_generation=PatchGenerationConfig(pharm3d=Pharm3DPatchConfig(enabled=True)),
         database=DatabaseConfig(uri=db_uri),
     )
     pipeline = ChemACEPipeline(config=ace_cfg)
@@ -510,8 +512,34 @@ def prepare_chem_ace_bundle(
         max_confs_per_id=int(config.chem_ace_max_confs_per_id),
     )
 
+    sdf_conformers_by_conf_id: dict[str, Any] = {}
+    if config.chem_ace_conformer_sdf is not None:
+        sdf_path = Path(str(config.chem_ace_conformer_sdf))
+        if not sdf_path.exists():
+            raise FileNotFoundError(f"Chem-ACE conformer SDF does not exist: {sdf_path}")
+        with log_step("explainability.chem_ace.load_conformer_sdf", path=str(sdf_path)):
+            sdf_conformers_by_conf_id, sdf_stats = _load_sdf_conformers_by_conf_id(
+                sdf_path=sdf_path,
+                conf_id_prop=str(config.chem_ace_sdf_conf_id_prop),
+            )
+        log_event(
+            "INFO",
+            "explainability.chem_ace.sdf_ready",
+            path=str(sdf_path),
+            loaded=int(sdf_stats["loaded"]),
+            duplicates=int(sdf_stats["duplicates"]),
+            skipped_none=int(sdf_stats["skipped_none"]),
+            skipped_no_conf_id=int(sdf_stats["skipped_no_conf_id"]),
+            skipped_no_conformer=int(sdf_stats["skipped_no_conformer"]),
+        )
+
     molecules: list[MoleculeSource] = []
     molecules_by_id: dict[str, Any] = {}
+    n_requested_confs = 0
+    n_found_confs = 0
+    n_skipped_missing_confs = 0
+    n_skipped_incompatible_confs = 0
+    n_mols_with_confs = 0
     for mol_id in ids_unique:
         smi = smiles_by_id.get(mol_id)
         if smi is None:
@@ -520,9 +548,39 @@ def prepare_chem_ace_bundle(
         if mol is None:
             continue
         mol = Chem.AddHs(mol)
-        conf_ids = tuple(conf_map.get(mol_id, []))
+
+        conf_labels = tuple(conf_map.get(mol_id, []))
+        n_requested_confs += int(len(conf_labels))
+        conf_ids: tuple[str, ...] = ()
+        if len(conf_labels) > 0 and len(sdf_conformers_by_conf_id) > 0:
+            merged_mol, kept_conf_labels, dropped_incompatible = _merge_sdf_conformers_for_molecule(
+                conf_ids=conf_labels,
+                sdf_conformers_by_conf_id=sdf_conformers_by_conf_id,
+            )
+            n_skipped_incompatible_confs += int(dropped_incompatible)
+            n_found_confs += int(len(kept_conf_labels))
+            n_skipped_missing_confs += int(max(0, len(conf_labels) - len(kept_conf_labels) - dropped_incompatible))
+            if merged_mol is not None and len(kept_conf_labels) > 0:
+                mol = merged_mol
+            conf_ids = tuple(str(x) for x in kept_conf_labels)
+            if len(conf_ids) > 0:
+                n_mols_with_confs += 1
+        elif len(conf_labels) > 0:
+            n_skipped_missing_confs += int(len(conf_labels))
+
         molecules.append(MoleculeSource(mol_id=str(mol_id), mol=mol, conf_ids=conf_ids))
         molecules_by_id[str(mol_id)] = mol
+
+    log_event(
+        "INFO",
+        "explainability.chem_ace.conformers_ready",
+        n_molecules=int(len(molecules)),
+        n_molecules_with_conformers=int(n_mols_with_confs),
+        requested_conformers=int(n_requested_confs),
+        found_in_sdf=int(n_found_confs),
+        skipped_missing=int(n_skipped_missing_confs),
+        skipped_incompatible=int(n_skipped_incompatible_confs),
+    )
 
     with log_step("explainability.chem_ace.generate_patches", n_molecules=int(len(molecules))):
         patches = pipeline.generate_patches(molecules=molecules)
@@ -799,6 +857,95 @@ def _build_instance_feature_maps(
     return conf_map, inst_map, inst_mean_map
 
 
+def _load_sdf_conformers_by_conf_id(
+    *,
+    sdf_path: Path,
+    conf_id_prop: str,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    from rdkit import Chem
+
+    conf_to_mol: dict[str, Any] = {}
+    stats = {
+        "loaded": 0,
+        "duplicates": 0,
+        "skipped_none": 0,
+        "skipped_no_conf_id": 0,
+        "skipped_no_conformer": 0,
+    }
+
+    supplier = Chem.SDMolSupplier(str(sdf_path), removeHs=False)
+    for mol in supplier:
+        if mol is None:
+            stats["skipped_none"] += 1
+            continue
+        if mol.GetNumConformers() <= 0:
+            stats["skipped_no_conformer"] += 1
+            continue
+
+        conf_id: Optional[str] = None
+        if conf_id_prop and mol.HasProp(str(conf_id_prop)):
+            val = str(mol.GetProp(str(conf_id_prop))).strip()
+            if val:
+                conf_id = val
+        if conf_id is None and mol.HasProp("_Name"):
+            val = str(mol.GetProp("_Name")).strip()
+            if val:
+                conf_id = val
+
+        if conf_id is None:
+            stats["skipped_no_conf_id"] += 1
+            continue
+        if conf_id in conf_to_mol:
+            stats["duplicates"] += 1
+            continue
+
+        conf_to_mol[conf_id] = mol
+        stats["loaded"] += 1
+
+    return conf_to_mol, stats
+
+
+def _merge_sdf_conformers_for_molecule(
+    *,
+    conf_ids: Sequence[str],
+    sdf_conformers_by_conf_id: Mapping[str, Any],
+) -> tuple[Optional[Any], list[str], int]:
+    from rdkit import Chem
+
+    base_mol: Optional[Any] = None
+    for conf_id in conf_ids:
+        mol = sdf_conformers_by_conf_id.get(str(conf_id))
+        if mol is not None and mol.GetNumConformers() > 0:
+            base_mol = Chem.Mol(mol)
+            break
+    if base_mol is None:
+        return None, [], 0
+
+    base_mol.RemoveAllConformers()
+    kept_conf_ids: list[str] = []
+    conf_id_map: dict[str, int] = {}
+    dropped_incompatible = 0
+    n_atoms = int(base_mol.GetNumAtoms())
+
+    for conf_id in conf_ids:
+        mol = sdf_conformers_by_conf_id.get(str(conf_id))
+        if mol is None or mol.GetNumConformers() <= 0:
+            continue
+        if int(mol.GetNumAtoms()) != n_atoms:
+            dropped_incompatible += 1
+            continue
+        conf = Chem.Conformer(mol.GetConformer(0))
+        new_idx = int(base_mol.AddConformer(conf, assignId=True))
+        key = str(conf_id)
+        kept_conf_ids.append(key)
+        conf_id_map[key] = int(new_idx)
+
+    if len(kept_conf_ids) == 0:
+        return None, [], dropped_incompatible
+
+    base_mol.SetProp("_chemace_conf_id_map", json.dumps(conf_id_map, sort_keys=True))
+    return base_mol, kept_conf_ids, dropped_incompatible
+
 
 def _build_feature_patch_embeddings(
     *,
@@ -815,6 +962,8 @@ def _build_feature_patch_embeddings(
     emb_recs: list[PatchEmbeddingRecord] = []
 
     workers = max(0, int(n_workers))
+    total_patches = int(len(patches))
+    progress_every = 200000
 
     def _compute_patch_vec(patch: PatchRecord) -> tuple[PatchRecord, np.ndarray, dict[str, int]] | None:
         mol_id = str(patch.mol_id)
@@ -845,33 +994,75 @@ def _build_feature_patch_embeddings(
 
     if workers > 1:
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            computed = list(ex.map(_compute_patch_vec, patches))
+            computed_iter = ex.map(_compute_patch_vec, patches)
+            for i, item in enumerate(computed_iter, start=1):
+                if i == total_patches or (progress_every > 0 and (i % progress_every == 0)):
+                    log_event(
+                        "PROGRESS",
+                        "explainability.chem_ace.embed_patches.compute",
+                        done=f"{int(i)}/{int(total_patches)}",
+                        pct=f"{(100.0 * i / float(max(1, total_patches))):.1f}",
+                        cpu_workers=int(workers),
+                    )
+                if item is None:
+                    continue
+                patch, vec, md = item
+                rec = pipeline.embedding_cache.save(
+                    patch=patch,
+                    layer_name="feature_fusion_2d3dqm",
+                    strategy="feature_projection",
+                    vector=vec,
+                    metadata={
+                        "strategy": "feature_projection",
+                        "d2": int(md["d2"]),
+                        "d3qm": int(md["d3qm"]),
+                        "ddesc": int(md["ddesc"]),
+                    },
+                )
+                emb_recs.append(rec)
     else:
-        computed = [_compute_patch_vec(p) for p in patches]
+        for i, patch in enumerate(patches, start=1):
+            item = _compute_patch_vec(patch)
+            if i == total_patches or (progress_every > 0 and (i % progress_every == 0)):
+                log_event(
+                    "PROGRESS",
+                    "explainability.chem_ace.embed_patches.compute",
+                    done=f"{int(i)}/{int(total_patches)}",
+                    pct=f"{(100.0 * i / float(max(1, total_patches))):.1f}",
+                    cpu_workers=int(workers),
+                )
+            if item is None:
+                continue
+            patch_rec, vec, md = item
+            rec = pipeline.embedding_cache.save(
+                patch=patch_rec,
+                layer_name="feature_fusion_2d3dqm",
+                strategy="feature_projection",
+                vector=vec,
+                metadata={
+                    "strategy": "feature_projection",
+                    "d2": int(md["d2"]),
+                    "d3qm": int(md["d3qm"]),
+                    "ddesc": int(md["ddesc"]),
+                },
+            )
+            emb_recs.append(rec)
 
-    for item in computed:
-        if item is None:
-            continue
-        patch, vec, md = item
-        rec = pipeline.embedding_cache.save(
-            patch=patch,
-            layer_name="feature_fusion_2d3dqm",
-            strategy="feature_projection",
-            vector=vec,
-            metadata={
-                "strategy": "feature_projection",
-                "d2": int(md["d2"]),
-                "d3qm": int(md["d3qm"]),
-                "ddesc": int(md["ddesc"]),
-            },
-        )
-        emb_recs.append(rec)
-
+    log_event(
+        "START",
+        "explainability.chem_ace.persist_patch_embeddings",
+        n_embeddings=int(len(emb_recs)),
+    )
     if hasattr(pipeline.repository, "upsert_patch_embeddings"):
         pipeline.repository.upsert_patch_embeddings(emb_recs)
     else:
         for rec in emb_recs:
             pipeline.repository.upsert_patch_embedding(rec)
+    log_event(
+        "DONE",
+        "explainability.chem_ace.persist_patch_embeddings",
+        n_embeddings=int(len(emb_recs)),
+    )
 
     if not emb_recs:
         raise RuntimeError("Chem-ACE feature projection produced zero patch embeddings")

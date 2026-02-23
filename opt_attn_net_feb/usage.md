@@ -55,7 +55,9 @@ Outputs:
 python -m entrypoints.hpo_pipeline ... \
   --run_hpo \
   --run_chem_ace \
-  --curated_smiles_col curated_SMILES
+  --curated_smiles_col curated_SMILES \
+  --chem_ace_conformer_sdf /path/to/precomputed_conformers.sdf \
+  --chem_ace_sdf_conf_id_prop conf_id
 ```
 
 Useful controls:
@@ -64,7 +66,15 @@ Useful controls:
 - `--chem_ace_max_confs_per_id 4`
 - `--chem_ace_top_concepts 64`
 - `--chem_ace_output_dir /path/to/chem_ace_out`
+- `--chem_ace_conformer_sdf /path/to/precomputed_conformers.sdf`
+- `--chem_ace_sdf_conf_id_prop conf_id` (falls back to SDF record name if missing)
 - `--cpu_workers -1`
+
+Behavior for conformers:
+
+- 2D patches are generated once per molecule.
+- 3D Pharm3D patches are generated only for conformers found in the SDF.
+- If a `conf_id` from the features is missing in SDF, it is skipped (no conformer generation fallback).
 
 ## Enable Lambda-Vol monitoring during final training (requires Chem-ACE concepts)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Optional
 
 from sqlalchemy import DateTime, Float, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -85,8 +86,8 @@ class PressureAlertORM(Base):
     epoch: Mapped[int] = mapped_column(Integer, nullable=False)
     code: Mapped[str] = mapped_column(String(128), nullable=False)
     severity: Mapped[str] = mapped_column(String(32), nullable=False)
-    task_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    concept_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    task_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    concept_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     score: Mapped[float] = mapped_column(Float, nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     details_json: Mapped[str] = mapped_column(Text, nullable=False)
@@ -100,8 +101,8 @@ class RecommendationORM(Base):
     epoch: Mapped[int] = mapped_column(Integer, nullable=False)
     recommendation_type: Mapped[str] = mapped_column(String(128), nullable=False)
     action_level: Mapped[str] = mapped_column(String(64), nullable=False)
-    task_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    concept_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    task_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    concept_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     rationale: Mapped[str] = mapped_column(Text, nullable=False)
     params_json: Mapped[str] = mapped_column(Text, nullable=False)
 

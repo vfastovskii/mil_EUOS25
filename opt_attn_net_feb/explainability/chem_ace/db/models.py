@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Optional
 
 from sqlalchemy import (
     Boolean,
@@ -30,14 +31,14 @@ class RunORM(Base):
         nullable=False,
     )
     config_json: Mapped[str] = mapped_column(Text, nullable=False)
-    concept_set_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("concept_sets.id"), nullable=True)
+    concept_set_id: Mapped[Optional[str]] = mapped_column(String(64), ForeignKey("concept_sets.id"), nullable=True)
 
 
 class TaskORM(Base):
     __tablename__ = "tasks"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    description: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
 
 
 class MoleculeORM(Base):
@@ -51,7 +52,7 @@ class ConformerORM(Base):
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     mol_id: Mapped[str] = mapped_column(String(128), ForeignKey("molecules.id"), nullable=False)
-    conf_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    conf_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
 
 
 class PatchORM(Base):
@@ -59,11 +60,11 @@ class PatchORM(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     mol_id: Mapped[str] = mapped_column(String(128), ForeignKey("molecules.id"), nullable=False)
-    conf_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    conf_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     patch_type: Mapped[str] = mapped_column(String(64), nullable=False)
     atom_indices_json: Mapped[str] = mapped_column(Text, nullable=False)
-    smarts: Mapped[str | None] = mapped_column(Text, nullable=True)
-    fragment_repr: Mapped[str | None] = mapped_column(Text, nullable=True)
+    smarts: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    fragment_repr: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     feature_metadata_json: Mapped[str] = mapped_column(Text, nullable=False)
     patch_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -118,7 +119,7 @@ class ConceptORM(Base):
     coherence: Mapped[float] = mapped_column(Float, nullable=False)
     centroid_uri: Mapped[str] = mapped_column(Text, nullable=False)
     medoid_patch_id: Mapped[str] = mapped_column(String(64), ForeignKey("patches.id"), nullable=False)
-    label_auto: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    label_auto: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     metadata_json: Mapped[str] = mapped_column(Text, nullable=False)
 
 
@@ -187,7 +188,7 @@ class TCAVEpochORM(Base):
     tcav_sign_rate: Mapped[float] = mapped_column(Float, nullable=False)
     tcav_mean_directional_derivative: Mapped[float] = mapped_column(Float, nullable=False)
     n_samples: Mapped[int] = mapped_column(Integer, nullable=False)
-    p_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    p_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     metadata_json: Mapped[str] = mapped_column(Text, nullable=False)
 
 

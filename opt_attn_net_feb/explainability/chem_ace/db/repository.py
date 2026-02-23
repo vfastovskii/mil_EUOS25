@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
-from sqlalchemy import func, select
+from sqlalchemy import func, select, insert
 from sqlalchemy.orm import Session
 
+from ....utils.progress import log_event
 from ..types import CAVRecord, ConceptCandidate, ConceptMembership, PatchEmbeddingRecord, PatchRecord, TCAVRecord, TagAssignment
 from .models import (
     CAVORM,
@@ -142,8 +143,92 @@ class ChemACERepository:
             s.commit()
 
     def upsert_patches(self, patches: Iterable[PatchRecord]) -> None:
-        for patch in patches:
-            self.upsert_patch(patch)
+        if self.engine.dialect.name != "sqlite":
+            for patch in patches:
+                self.upsert_patch(patch)
+            return
+
+        batch_size = 20000
+        progress_every = 200000
+        next_progress = progress_every
+        done = 0
+        batch: list[PatchRecord] = []
+
+        with self.session() as s:
+            for patch in patches:
+                batch.append(patch)
+                if len(batch) >= batch_size:
+                    self._upsert_patch_batch_sqlite(s=s, batch=batch)
+                    s.commit()
+                    done += len(batch)
+                    batch.clear()
+                    if done >= next_progress:
+                        log_event(
+                            "PROGRESS",
+                            "explainability.chem_ace.persist_patches",
+                            done=int(done),
+                        )
+                        next_progress = done + progress_every
+
+            if batch:
+                self._upsert_patch_batch_sqlite(s=s, batch=batch)
+                s.commit()
+                done += len(batch)
+
+    def _upsert_patch_batch_sqlite(self, *, s: Session, batch: Sequence[PatchRecord]) -> None:
+        now = datetime.now(timezone.utc)
+        seen_mols: set[str] = set()
+        seen_confs: set[str] = set()
+        seen_patches: set[str] = set()
+
+        mol_rows: list[dict[str, Any]] = []
+        conf_rows: list[dict[str, Any]] = []
+        patch_rows: list[dict[str, Any]] = []
+
+        for patch in batch:
+            mol_id = str(patch.mol_id)
+            if mol_id not in seen_mols:
+                seen_mols.add(mol_id)
+                mol_rows.append({"id": mol_id})
+
+            if patch.conf_id is not None:
+                conf_id = str(patch.conf_id)
+                conf_pk = f"{mol_id}:{conf_id}"
+                if conf_pk not in seen_confs:
+                    seen_confs.add(conf_pk)
+                    conf_rows.append(
+                        {
+                            "id": conf_pk,
+                            "mol_id": mol_id,
+                            "conf_id": conf_id,
+                        }
+                    )
+
+            patch_id = str(patch.patch_id)
+            if patch_id in seen_patches:
+                continue
+            seen_patches.add(patch_id)
+            patch_rows.append(
+                {
+                    "id": patch_id,
+                    "mol_id": mol_id,
+                    "conf_id": (None if patch.conf_id is None else str(patch.conf_id)),
+                    "patch_type": str(patch.patch_type),
+                    "atom_indices_json": _json_dumps(list(patch.atom_indices)),
+                    "smarts": patch.smarts,
+                    "fragment_repr": patch.fragment_repr,
+                    "feature_metadata_json": _json_dumps(dict(patch.feature_metadata)),
+                    "patch_hash": str(patch.patch_hash),
+                    "created_at": now,
+                }
+            )
+
+        if mol_rows:
+            s.execute(insert(MoleculeORM).prefix_with("OR IGNORE"), mol_rows)
+        if conf_rows:
+            s.execute(insert(ConformerORM).prefix_with("OR IGNORE"), conf_rows)
+        if patch_rows:
+            s.execute(insert(PatchORM).prefix_with("OR IGNORE"), patch_rows)
 
     def upsert_patch_embedding(self, rec: PatchEmbeddingRecord) -> None:
         """Persist embedding metadata (vector path should already exist)."""
@@ -175,34 +260,73 @@ class ChemACERepository:
             s.commit()
 
     def upsert_patch_embeddings(self, recs: Iterable[PatchEmbeddingRecord]) -> None:
-        """Persist embedding metadata for many records in one DB transaction."""
+        """Persist embedding metadata for many records in chunked transactions."""
+        if self.engine.dialect.name != "sqlite":
+            with self.session() as s:
+                for rec in recs:
+                    if rec.embedding_uri is None:
+                        raise ValueError("PatchEmbeddingRecord.embedding_uri is required for DB persistence")
+                    existing = s.execute(
+                        select(PatchEmbeddingORM).where(
+                            PatchEmbeddingORM.patch_id == rec.patch_id,
+                            PatchEmbeddingORM.layer_name == rec.layer_name,
+                            PatchEmbeddingORM.strategy == rec.strategy,
+                        )
+                    ).scalar_one_or_none()
+                    if existing is None:
+                        s.add(
+                            PatchEmbeddingORM(
+                                patch_id=str(rec.patch_id),
+                                layer_name=str(rec.layer_name),
+                                strategy=str(rec.strategy),
+                                embedding_uri=str(rec.embedding_uri),
+                                embedding_dim=int(rec.vector.shape[-1]),
+                                metadata_json=_json_dumps(dict(rec.metadata)),
+                            )
+                        )
+                    else:
+                        existing.embedding_uri = str(rec.embedding_uri)
+                        existing.embedding_dim = int(rec.vector.shape[-1])
+                        existing.metadata_json = _json_dumps(dict(rec.metadata))
+                s.commit()
+            return
+
+        batch_size = 20000
+        progress_every = 200000
+        next_progress = progress_every
+        done = 0
+        batch_rows: list[dict[str, Any]] = []
+
         with self.session() as s:
             for rec in recs:
                 if rec.embedding_uri is None:
                     raise ValueError("PatchEmbeddingRecord.embedding_uri is required for DB persistence")
-                existing = s.execute(
-                    select(PatchEmbeddingORM).where(
-                        PatchEmbeddingORM.patch_id == rec.patch_id,
-                        PatchEmbeddingORM.layer_name == rec.layer_name,
-                        PatchEmbeddingORM.strategy == rec.strategy,
-                    )
-                ).scalar_one_or_none()
-                if existing is None:
-                    s.add(
-                        PatchEmbeddingORM(
-                            patch_id=str(rec.patch_id),
-                            layer_name=str(rec.layer_name),
-                            strategy=str(rec.strategy),
-                            embedding_uri=str(rec.embedding_uri),
-                            embedding_dim=int(rec.vector.shape[-1]),
-                            metadata_json=_json_dumps(dict(rec.metadata)),
+                batch_rows.append(
+                    {
+                        "patch_id": str(rec.patch_id),
+                        "layer_name": str(rec.layer_name),
+                        "strategy": str(rec.strategy),
+                        "embedding_uri": str(rec.embedding_uri),
+                        "embedding_dim": int(rec.vector.shape[-1]),
+                        "metadata_json": _json_dumps(dict(rec.metadata)),
+                    }
+                )
+                if len(batch_rows) >= batch_size:
+                    s.execute(insert(PatchEmbeddingORM).prefix_with("OR REPLACE"), batch_rows)
+                    s.commit()
+                    done += len(batch_rows)
+                    batch_rows.clear()
+                    if done >= next_progress:
+                        log_event(
+                            "PROGRESS",
+                            "explainability.chem_ace.persist_patch_embeddings",
+                            done=int(done),
                         )
-                    )
-                else:
-                    existing.embedding_uri = str(rec.embedding_uri)
-                    existing.embedding_dim = int(rec.vector.shape[-1])
-                    existing.metadata_json = _json_dumps(dict(rec.metadata))
-            s.commit()
+                        next_progress = done + progress_every
+
+            if batch_rows:
+                s.execute(insert(PatchEmbeddingORM).prefix_with("OR REPLACE"), batch_rows)
+                s.commit()
 
     def create_concept_set_snapshot(
         self,

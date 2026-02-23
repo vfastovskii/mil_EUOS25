@@ -67,9 +67,9 @@ class MILTrainDataset(Dataset):
         counts: np.ndarray,
         id2pos: Dict[str, int],
         Xinst_sorted: np.ndarray,
-        conf_sorted: np.ndarray | None = None,
         max_instances: int,
         seed: int,
+        conf_sorted: np.ndarray | None = None,
         include_metadata: bool = False,
     ):
         self.ids = [str(x) for x in ids]

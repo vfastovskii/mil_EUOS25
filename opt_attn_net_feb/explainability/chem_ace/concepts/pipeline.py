@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
+import time
 
 import numpy as np
 
@@ -17,11 +18,11 @@ from ..types import PatchEmbeddingRecord, PatchInputBuilder, PatchRecord
 from .clustering import DiscoveredConceptSet, discover_concepts
 from ..patches import (
     BRICSPatchGenerator,
-    CompositePatchGenerator,
     LocalSubgraphPatchGenerator,
     MurckoPatchGenerator,
     Pharm3DPatchGenerator,
 )
+from ....utils.progress import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,12 @@ class ChemACEPipeline:
             MurckoPatchGenerator(config.patch_generation.murcko),
             Pharm3DPatchGenerator(config.patch_generation.pharm3d),
         ]
-        self.patch_generator = CompositePatchGenerator(generators)
+        self.patch_generators_2d = [
+            g for g in generators if not bool(getattr(g, "requires_conformer", False))
+        ]
+        self.patch_generators_3d = [
+            g for g in generators if bool(getattr(g, "requires_conformer", False))
+        ]
         self.semantic_tagger = SemanticTagger(config.semantics)
 
     def start_run(self, *, task_ids: Sequence[str]) -> str:
@@ -76,40 +82,110 @@ class ChemACEPipeline:
         except Exception:
             return 0
 
+    def _patch_progress_every(self) -> int:
+        try:
+            return max(0, int(getattr(self.config, "progress_log_every_molecules", 250)))
+        except Exception:
+            return 250
+
     def generate_patches(self, *, molecules: Sequence[MoleculeSource]) -> list[PatchRecord]:
         """Generate patches for a set of molecules and persist them."""
         workers = self._cpu_workers()
+        total_molecules = int(len(molecules))
+        progress_every = self._patch_progress_every()
+        t0 = time.perf_counter()
 
         def _gen_for_molecule(item: MoleculeSource) -> list[PatchRecord]:
-            out: list[PatchRecord] = []
-            if item.conf_ids:
-                for conf_id in item.conf_ids:
-                    out.extend(
-                        self.patch_generator.generate(
-                            mol_id=item.mol_id,
-                            mol=item.mol,
-                            conf_id=conf_id,
-                        )
-                    )
-            else:
-                out.extend(
-                    self.patch_generator.generate(
+            out: dict[str, PatchRecord] = {}
+            for generator in self.patch_generators_2d:
+                try:
+                    generated = generator.generate(
                         mol_id=item.mol_id,
                         mol=item.mol,
                         conf_id=None,
                     )
-                )
-            return out
+                except Exception:
+                    logger.exception(
+                        "2D patch generator failed",
+                        extra={"generator": type(generator).__name__, "mol_id": item.mol_id},
+                    )
+                    continue
+                for patch in generated:
+                    out[patch.patch_id] = patch
+
+            if item.conf_ids and self.patch_generators_3d:
+                for conf_id in item.conf_ids:
+                    for generator in self.patch_generators_3d:
+                        try:
+                            generated = generator.generate(
+                                mol_id=item.mol_id,
+                                mol=item.mol,
+                                conf_id=str(conf_id),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "3D patch generator failed",
+                                extra={
+                                    "generator": type(generator).__name__,
+                                    "mol_id": item.mol_id,
+                                    "conf_id": conf_id,
+                                },
+                            )
+                            continue
+                        for patch in generated:
+                            out[patch.patch_id] = patch
+
+            return list(out.values())
+
+        def _emit_progress(done_molecules: int, n_patches: int) -> None:
+            if total_molecules <= 0:
+                return
+            elapsed = max(1e-9, float(time.perf_counter() - t0))
+            rate = float(done_molecules) / elapsed
+            eta_s = float(total_molecules - done_molecules) / rate if rate > 0.0 else None
+            log_event(
+                "PROGRESS",
+                "explainability.chem_ace.generate_patches",
+                done=f"{int(done_molecules)}/{int(total_molecules)}",
+                pct=f"{(100.0 * done_molecules / float(total_molecules)):.1f}",
+                patches=int(n_patches),
+                mol_per_s=f"{rate:.2f}",
+                eta_s=(f"{eta_s:.1f}" if eta_s is not None else "na"),
+                cpu_workers=int(workers),
+            )
 
         all_patches: list[PatchRecord] = []
+        done = 0
         if workers > 1:
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                for patch_list in ex.map(_gen_for_molecule, molecules):
+                futures = [ex.submit(_gen_for_molecule, item) for item in molecules]
+                for fut in as_completed(futures):
+                    patch_list = fut.result()
                     all_patches.extend(patch_list)
+                    done += 1
+                    if done == total_molecules or (
+                        progress_every > 0 and (done % progress_every == 0)
+                    ):
+                        _emit_progress(done, len(all_patches))
         else:
             for item in molecules:
                 all_patches.extend(_gen_for_molecule(item))
+                done += 1
+                if done == total_molecules or (
+                    progress_every > 0 and (done % progress_every == 0)
+                ):
+                    _emit_progress(done, len(all_patches))
+        log_event(
+            "START",
+            "explainability.chem_ace.persist_patches",
+            n_patches=int(len(all_patches)),
+        )
         self.repository.upsert_patches(all_patches)
+        log_event(
+            "DONE",
+            "explainability.chem_ace.persist_patches",
+            n_patches=int(len(all_patches)),
+        )
         logger.info("Generated patches", extra={"n_patches": len(all_patches), "cpu_workers": workers})
         return all_patches
 

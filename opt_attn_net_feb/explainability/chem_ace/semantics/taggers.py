@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
@@ -155,10 +156,13 @@ class SemanticTagger:
             heteroaromatic_flags.append(1 if heteroaromatic else 0)
 
             if mol.GetNumConformers() > 0 and len(atom_ids) >= 3:
-                conf_idx = int(patch.conf_id) if patch.conf_id is not None else -1
-                conf = mol.GetConformer(conf_idx)
-                coords = np.asarray([[conf.GetAtomPosition(i).x, conf.GetAtomPosition(i).y, conf.GetAtomPosition(i).z] for i in atom_ids], dtype=np.float64)
-                planarity_rmsd.append(float(self._planarity_rmsd(coords)))
+                conf_idx = self._resolve_conf_idx(mol=mol, conf_id=patch.conf_id)
+                if conf_idx is not None:
+                    conf = mol.GetConformer(int(conf_idx))
+                    coords = np.asarray([[conf.GetAtomPosition(i).x, conf.GetAtomPosition(i).y, conf.GetAtomPosition(i).z] for i in atom_ids], dtype=np.float64)
+                    planarity_rmsd.append(float(self._planarity_rmsd(coords)))
+                else:
+                    planarity_rmsd.append(float("nan"))
             elif len(atom_ids) >= 3:
                 planarity_rmsd.append(float("nan"))
 
@@ -229,6 +233,35 @@ class SemanticTagger:
         normal = vh[-1]
         d = centered @ normal
         return float(np.sqrt(np.mean(d ** 2)))
+
+    @staticmethod
+    def _resolve_conf_idx(*, mol: Any, conf_id: Optional[str]) -> Optional[int]:
+        if mol.GetNumConformers() <= 0:
+            return None
+        if conf_id is None:
+            return 0
+
+        key = str(conf_id)
+        try:
+            idx = int(key)
+            mol.GetConformer(int(idx))
+            return int(idx)
+        except Exception:
+            pass
+
+        if mol.HasProp("_chemace_conf_id_map"):
+            try:
+                mapping = json.loads(mol.GetProp("_chemace_conf_id_map"))
+                if key in mapping:
+                    idx = int(mapping[key])
+                    mol.GetConformer(int(idx))
+                    return int(idx)
+            except Exception:
+                pass
+
+        if mol.GetNumConformers() == 1:
+            return 0
+        return None
 
     def _charge_tags(self, *, concept_id: str, descriptors: Mapping[str, Any]) -> list[TagAssignment]:
         tags: list[TagAssignment] = []

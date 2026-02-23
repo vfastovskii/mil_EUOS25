@@ -189,6 +189,8 @@ class CLIExplainabilityConfig:
     run_lambda_vol: bool
     run_concept_rl: bool
     curated_smiles_col: str
+    chem_ace_conformer_sdf: str | None
+    chem_ace_sdf_conf_id_prop: str
     chem_ace_output_dir: str | None
     chem_ace_db_uri: str | None
     chem_ace_max_ids: int
@@ -363,6 +365,10 @@ class PipelineConfigFactory:
                 run_lambda_vol=bool(args.run_lambda_vol),
                 run_concept_rl=bool(args.run_concept_rl),
                 curated_smiles_col=str(args.curated_smiles_col),
+                chem_ace_conformer_sdf=(
+                    None if args.chem_ace_conformer_sdf is None else str(args.chem_ace_conformer_sdf)
+                ),
+                chem_ace_sdf_conf_id_prop=str(args.chem_ace_sdf_conf_id_prop),
                 chem_ace_output_dir=(
                     None if args.chem_ace_output_dir is None else str(args.chem_ace_output_dir)
                 ),
@@ -841,6 +847,8 @@ class MILPipelineOrchestrator:
                         run_chem_ace=bool(self.config.explainability.run_chem_ace),
                         run_lambda_vol=bool(self.config.explainability.run_lambda_vol),
                         curated_smiles_col=str(self.config.explainability.curated_smiles_col),
+                        chem_ace_conformer_sdf=self.config.explainability.chem_ace_conformer_sdf,
+                        chem_ace_sdf_conf_id_prop=str(self.config.explainability.chem_ace_sdf_conf_id_prop),
                         cpu_workers=int(env.cpu_workers),
                         chem_ace_output_dir=self.config.explainability.chem_ace_output_dir,
                         chem_ace_db_uri=self.config.explainability.chem_ace_db_uri,
@@ -984,6 +992,19 @@ def _parse_args(argv: Any | None = None):
     ap.add_argument("--run_lambda_vol", action="store_true")
     ap.add_argument("--run_concept_rl", action="store_true")
     ap.add_argument("--curated_smiles_col", default="curated_SMILES")
+    ap.add_argument(
+        "--chem_ace_conformer_sdf",
+        default=None,
+        help=(
+            "Path to precomputed conformer SDF. Entries are matched by conf_id; "
+            "missing conformers are skipped for 3D patching."
+        ),
+    )
+    ap.add_argument(
+        "--chem_ace_sdf_conf_id_prop",
+        default="conf_id",
+        help="SDF property name storing conf_id (fallback: molecule name field).",
+    )
     ap.add_argument("--chem_ace_output_dir", default=None)
     ap.add_argument("--chem_ace_db_uri", default=None)
     ap.add_argument("--chem_ace_max_ids", type=int, default=10000)
