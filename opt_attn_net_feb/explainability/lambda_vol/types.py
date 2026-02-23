@@ -128,6 +128,9 @@ class PressureRunArtifacts:
     alerts_md: str
     recommendations_json: str
     vtk_path: Optional[str]
+    ricci_edges_csv: Optional[str] = None
+    ricci_summary_csv: Optional[str] = None
+    ricci_flow_npz: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -139,6 +142,38 @@ class ConcentrationMetrics:
     topk_mass: float
 
 
+@dataclass(frozen=True)
+class RicciEdgeMetrics:
+    """Per-edge Ricci diagnostics for one task and epoch."""
+
+    epoch: int
+    task_id: str
+    concept_src: str
+    concept_dst: str
+    weight_raw: float
+    curvature: float
+    weight_flow: float
+
+
+@dataclass(frozen=True)
+class RicciTaskSummary:
+    """Task-level curvature summary for one epoch."""
+
+    epoch: int
+    task_id: str
+    n_nodes: int
+    n_edges: int
+    mean_curvature: float
+    std_curvature: float
+    min_curvature: float
+    max_curvature: float
+    negative_edge_fraction: float
+    strong_negative_edge_fraction: float
+    top_negative_src: Optional[str]
+    top_negative_dst: Optional[str]
+    top_negative_curvature: float
+
+
 __all__ = [
     "AlertRecord",
     "ConcentrationMetrics",
@@ -148,6 +183,8 @@ __all__ = [
     "JsonDict",
     "PressureRunArtifacts",
     "PressureTensorIndex",
+    "RicciEdgeMetrics",
+    "RicciTaskSummary",
     "RecommendationRecord",
     "RegimeLabel",
 ]

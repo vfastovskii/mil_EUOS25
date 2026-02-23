@@ -8,6 +8,7 @@ from .data import (  # noqa: F401
     collate_export,
     collate_train,
     export_leaderboard_attention,
+    export_prediction_text_explanations,
 )
 from .losses import MultiTaskFocal  # noqa: F401
 from .models import MILTaskAttnMixerWithAux, TaskAttentionPool  # noqa: F401
@@ -30,6 +31,7 @@ __all__ = [
     "collate_train",
     "collate_export",
     "export_leaderboard_attention",
+    "export_prediction_text_explanations",
     "OptunaPruningCallbackLocal",
     "TASK_COLS",
     "AUX_ABS_COLS",

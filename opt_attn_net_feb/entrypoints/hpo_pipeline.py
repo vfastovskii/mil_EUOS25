@@ -44,6 +44,7 @@ from ..utils.ops import (
     maybe_set_torch_fast_flags,
     set_all_seeds,
 )
+from ..utils.progress import log_event, log_step
 
 
 @dataclass(frozen=True)
@@ -185,6 +186,7 @@ class CLIExplainabilityConfig:
 
     run_chem_ace: bool
     run_lambda_vol: bool
+    run_concept_rl: bool
     curated_smiles_col: str
     chem_ace_output_dir: str | None
     chem_ace_db_uri: str | None
@@ -201,6 +203,22 @@ class CLIExplainabilityConfig:
     lambda_vol_tcav_repeats: int
     lambda_vol_random_counterexamples: int
     lambda_vol_min_concept_samples: int
+    lambda_vol_run_ricci: bool
+    lambda_vol_ricci_edge_keep_quantile: float
+    lambda_vol_ricci_min_edge_weight: float
+    lambda_vol_ricci_top_k_per_node: int
+    lambda_vol_ricci_flow_steps: int
+    lambda_vol_ricci_flow_step_size: float
+    lambda_vol_ricci_use_flow_as_coupling: bool
+    lambda_vol_ricci_coupling_strength: float
+    concept_rl_top_k_per_task: int
+    concept_rl_min_pos_coverage: float
+    concept_rl_init_scale: float
+    concept_rl_max_scale: float
+    concept_rl_policy_lr: float
+    concept_rl_policy_sigma: float
+    concept_rl_reward_alignment_w: float
+    concept_rl_baseline_momentum: float
 
 
 @dataclass(frozen=True)
@@ -340,6 +358,7 @@ class PipelineConfigFactory:
             explainability=CLIExplainabilityConfig(
                 run_chem_ace=bool(args.run_chem_ace),
                 run_lambda_vol=bool(args.run_lambda_vol),
+                run_concept_rl=bool(args.run_concept_rl),
                 curated_smiles_col=str(args.curated_smiles_col),
                 chem_ace_output_dir=(
                     None if args.chem_ace_output_dir is None else str(args.chem_ace_output_dir)
@@ -364,6 +383,22 @@ class PipelineConfigFactory:
                 lambda_vol_tcav_repeats=int(args.lambda_vol_tcav_repeats),
                 lambda_vol_random_counterexamples=int(args.lambda_vol_random_counterexamples),
                 lambda_vol_min_concept_samples=int(args.lambda_vol_min_concept_samples),
+                lambda_vol_run_ricci=bool(args.lambda_vol_run_ricci),
+                lambda_vol_ricci_edge_keep_quantile=float(args.lambda_vol_ricci_edge_keep_quantile),
+                lambda_vol_ricci_min_edge_weight=float(args.lambda_vol_ricci_min_edge_weight),
+                lambda_vol_ricci_top_k_per_node=int(args.lambda_vol_ricci_top_k_per_node),
+                lambda_vol_ricci_flow_steps=int(args.lambda_vol_ricci_flow_steps),
+                lambda_vol_ricci_flow_step_size=float(args.lambda_vol_ricci_flow_step_size),
+                lambda_vol_ricci_use_flow_as_coupling=bool(args.lambda_vol_ricci_use_flow_as_coupling),
+                lambda_vol_ricci_coupling_strength=float(args.lambda_vol_ricci_coupling_strength),
+                concept_rl_top_k_per_task=int(args.concept_rl_top_k_per_task),
+                concept_rl_min_pos_coverage=float(args.concept_rl_min_pos_coverage),
+                concept_rl_init_scale=float(args.concept_rl_init_scale),
+                concept_rl_max_scale=float(args.concept_rl_max_scale),
+                concept_rl_policy_lr=float(args.concept_rl_policy_lr),
+                concept_rl_policy_sigma=float(args.concept_rl_policy_sigma),
+                concept_rl_reward_alignment_w=float(args.concept_rl_reward_alignment_w),
+                concept_rl_baseline_momentum=float(args.concept_rl_baseline_momentum),
             ),
         )
 
@@ -385,33 +420,49 @@ class PipelineEnvironmentFactory:
         self.config = config
 
     def prepare(self, *, argv: Any | None) -> PipelineEnvironment:
-        set_all_seeds(int(self.config.runtime.seed))
-        maybe_set_torch_fast_flags()
+        with log_step(
+            "pipeline.prepare_environment",
+            seed=int(self.config.runtime.seed),
+            study_dir=str(self.config.data_paths.study_dir),
+        ):
+            set_all_seeds(int(self.config.runtime.seed))
+            maybe_set_torch_fast_flags()
 
-        outdir = Path(self.config.data_paths.study_dir)
-        outdir.mkdir(parents=True, exist_ok=True)
+            outdir = Path(self.config.data_paths.study_dir)
+            outdir.mkdir(parents=True, exist_ok=True)
 
-        run_meta = {
-            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "seed": int(self.config.runtime.seed),
-            "nn_accelerator": str(self.config.runtime.nn_accelerator),
-            "nn_devices": int(self.config.runtime.nn_devices),
-            "precision": str(self.config.runtime.precision),
-            "patience": int(self.config.runtime.patience),
-            "run_hpo": bool(self.config.hpo.run_hpo),
-            "best_params_json": self.config.hpo.best_params_json,
-            "run_chem_ace": bool(self.config.explainability.run_chem_ace),
-            "run_lambda_vol": bool(self.config.explainability.run_lambda_vol),
-            "curated_smiles_col": str(self.config.explainability.curated_smiles_col),
-            "argv": " ".join([str(x) for x in (argv if argv is not None else os.sys.argv)]),
-            "weight_cols": WEIGHT_COLS,
-            "model": "MILTaskAttnMixerWithAux (task-specific attention queries)",
-        }
-        (outdir / "run_meta.json").write_text(json.dumps(run_meta, indent=2))
+            run_meta = {
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "seed": int(self.config.runtime.seed),
+                "nn_accelerator": str(self.config.runtime.nn_accelerator),
+                "nn_devices": int(self.config.runtime.nn_devices),
+                "precision": str(self.config.runtime.precision),
+                "patience": int(self.config.runtime.patience),
+                "run_hpo": bool(self.config.hpo.run_hpo),
+                "best_params_json": self.config.hpo.best_params_json,
+                "run_chem_ace": bool(self.config.explainability.run_chem_ace),
+                "run_lambda_vol": bool(self.config.explainability.run_lambda_vol),
+                "run_concept_rl": bool(self.config.explainability.run_concept_rl),
+                "lambda_vol_run_ricci": bool(self.config.explainability.lambda_vol_run_ricci),
+                "curated_smiles_col": str(self.config.explainability.curated_smiles_col),
+                "argv": " ".join([str(x) for x in (argv if argv is not None else os.sys.argv)]),
+                "weight_cols": WEIGHT_COLS,
+                "model": "MILTaskAttnMixerWithAux (task-specific attention queries)",
+            }
+            run_meta_path = outdir / "run_meta.json"
+            run_meta_path.write_text(json.dumps(run_meta, indent=2))
+            log_event("INFO", "pipeline.run_meta_written", path=str(run_meta_path))
 
-        num_workers = self._resolve_num_workers()
-        pin_memory = bool(self.config.runtime.pin_memory) and torch.cuda.is_available()
-        return PipelineEnvironment(outdir=outdir, num_workers=num_workers, pin_memory=pin_memory)
+            num_workers = self._resolve_num_workers()
+            pin_memory = bool(self.config.runtime.pin_memory) and torch.cuda.is_available()
+            log_event(
+                "INFO",
+                "pipeline.dataloader_runtime",
+                num_workers=int(num_workers),
+                pin_memory=bool(pin_memory),
+                precision=str(self.config.runtime.precision),
+            )
+            return PipelineEnvironment(outdir=outdir, num_workers=num_workers, pin_memory=pin_memory)
 
     def _resolve_num_workers(self) -> int:
         if int(self.config.runtime.num_workers) >= 0:
@@ -451,89 +502,115 @@ class HPODataBuilder:
         p = self.config.data_paths
         s = self.config.splits
 
-        df_full = load_labels(p.labels, id_col=c.id_col)
-        df_full[c.id_col] = df_full[c.id_col].astype(str)
-        df_full[c.split_col] = df_full[c.split_col].astype(str)
+        with log_step("hpo_data.build", labels=str(p.labels), use_splits=list(s.use_splits)):
+            with log_step("hpo_data.load_labels"):
+                df_full = load_labels(p.labels, id_col=c.id_col)
+                df_full[c.id_col] = df_full[c.id_col].astype(str)
+                df_full[c.split_col] = df_full[c.split_col].astype(str)
+                log_event("INFO", "hpo_data.labels_loaded", n_rows=int(len(df_full)))
 
-        df_hpo = df_full[df_full[c.split_col].isin(s.use_splits)].copy().reset_index(drop=True)
-        if len(df_hpo) == 0:
-            raise ValueError(f"No rows in labels match use_splits={s.use_splits}")
+            with log_step("hpo_data.filter_splits"):
+                df_hpo = df_full[df_full[c.split_col].isin(s.use_splits)].copy().reset_index(drop=True)
+                if len(df_hpo) == 0:
+                    raise ValueError(f"No rows in labels match use_splits={s.use_splits}")
+                log_event("INFO", "hpo_data.hpo_rows", n_rows=int(len(df_hpo)))
 
-        ids_hpo = df_hpo[c.id_col].astype(str).tolist()
-        ids_2d_file, X2d_file = load_2d(p.feat2d_scaled, id_col=c.id_col)
-        X2d_hpo = align_by_id(ids_2d_file, X2d_file, ids_hpo)
+            with log_step("hpo_data.load_and_align_2d"):
+                ids_hpo = df_hpo[c.id_col].astype(str).tolist()
+                ids_2d_file, X2d_file = load_2d(p.feat2d_scaled, id_col=c.id_col)
+                X2d_hpo = align_by_id(ids_2d_file, X2d_file, ids_hpo)
+                log_event("INFO", "hpo_data.2d_ready", n_ids=int(len(ids_hpo)), dim_2d=int(X2d_hpo.shape[1]))
 
-        y_cls = coerce_binary_labels(df_hpo)
-        w_cls = build_task_weights(df_hpo)
-        y_abs, m_abs, y_fluo, m_fluo = build_aux_targets_and_masks(df_hpo)
-        w_abs, w_fluo = build_aux_weights(df_hpo)
+            with log_step("hpo_data.targets_and_weights"):
+                y_cls = coerce_binary_labels(df_hpo)
+                w_cls = build_task_weights(df_hpo)
+                y_abs, m_abs, y_fluo, m_fluo = build_aux_targets_and_masks(df_hpo)
+                w_abs, w_fluo = build_aux_weights(df_hpo)
 
-        folds = self._resolve_folds(df_hpo)
-        folds_info = fold_indices(df_hpo, c.fold_col, folds)
+            with log_step("hpo_data.resolve_folds"):
+                folds = self._resolve_folds(df_hpo)
+                folds_info = fold_indices(df_hpo, c.fold_col, folds)
+                log_event("INFO", "hpo_data.folds", folds=list(map(int, folds)), n_folds=int(len(folds_info)))
 
-        ids_conf_hpo, conf_ids_hpo, Xinst_hpo = load_and_merge_instances(
-            p.feat3d_scaled,
-            p.feat3d_qm_scaled,
-            allowed_ids=set(ids_hpo),
-            id_col=c.id_col,
-            conf_col=c.conf_col,
-        )
-        _, starts_hpo, counts_hpo, id2pos_hpo, Xinst_sorted_hpo, _ = build_instance_index(
-            ids_conf_hpo,
-            conf_ids_hpo,
-            Xinst_hpo,
-        )
+            with log_step("hpo_data.load_and_merge_instances"):
+                ids_conf_hpo, conf_ids_hpo, Xinst_hpo = load_and_merge_instances(
+                    p.feat3d_scaled,
+                    p.feat3d_qm_scaled,
+                    allowed_ids=set(ids_hpo),
+                    id_col=c.id_col,
+                    conf_col=c.conf_col,
+                )
+                _, starts_hpo, counts_hpo, id2pos_hpo, Xinst_sorted_hpo, _ = build_instance_index(
+                    ids_conf_hpo,
+                    conf_ids_hpo,
+                    Xinst_hpo,
+                )
+                log_event(
+                    "INFO",
+                    "hpo_data.instances_ready",
+                    n_conf=int(Xinst_sorted_hpo.shape[0]),
+                    inst_dim=int(Xinst_sorted_hpo.shape[1]),
+                    n_ids_with_bags=int(len(id2pos_hpo)),
+                )
 
-        have_bag_mask = np.array([(i in id2pos_hpo) for i in ids_hpo], dtype=bool)
-        if not have_bag_mask.all():
-            missing = int((~have_bag_mask).sum())
-            examples = [ids_hpo[i] for i in np.where(~have_bag_mask)[0][:10]]
-            print(
-                f"[WARN] Dropping {missing} HPO IDs with 0 conformers after merge. Examples: {examples}"
+            with log_step("hpo_data.drop_ids_without_bags_if_needed"):
+                have_bag_mask = np.array([(i in id2pos_hpo) for i in ids_hpo], dtype=bool)
+                if not have_bag_mask.all():
+                    missing = int((~have_bag_mask).sum())
+                    examples = [ids_hpo[i] for i in np.where(~have_bag_mask)[0][:10]]
+                    log_event(
+                        "WARN",
+                        "hpo_data.dropping_ids_without_bags",
+                        missing=missing,
+                        examples=examples,
+                    )
+
+                    df_hpo = df_hpo.loc[have_bag_mask].reset_index(drop=True)
+                    ids_hpo = df_hpo[c.id_col].astype(str).tolist()
+                    X2d_hpo = X2d_hpo[have_bag_mask]
+                    y_cls = y_cls[have_bag_mask]
+                    w_cls = w_cls[have_bag_mask]
+                    y_abs = y_abs[have_bag_mask]
+                    m_abs = m_abs[have_bag_mask]
+                    y_fluo = y_fluo[have_bag_mask]
+                    m_fluo = m_fluo[have_bag_mask]
+                    w_abs = w_abs[have_bag_mask]
+                    w_fluo = w_fluo[have_bag_mask]
+                    folds = sorted(df_hpo[c.fold_col].dropna().astype(int).unique().tolist())
+                    folds_info = fold_indices(df_hpo, c.fold_col, folds)
+
+            with log_step("hpo_data.build_cv_container"):
+                cv_data = MILCVData(
+                    X2d_scaled=X2d_hpo,
+                    y_cls=y_cls,
+                    w_cls=w_cls,
+                    y_abs=y_abs,
+                    m_abs=m_abs,
+                    w_abs=w_abs,
+                    y_fluo=y_fluo,
+                    m_fluo=m_fluo,
+                    w_fluo=w_fluo,
+                    ids=ids_hpo,
+                    folds_info=folds_info,
+                    starts=starts_hpo,
+                    counts=counts_hpo,
+                    id2pos=id2pos_hpo,
+                    Xinst_sorted=Xinst_sorted_hpo,
+                )
+                log_event(
+                    "INFO",
+                    "hpo_data.summary",
+                    n_ids=int(len(ids_hpo)),
+                    dim_2d=int(X2d_hpo.shape[1]),
+                    n_conf=int(Xinst_sorted_hpo.shape[0]),
+                    inst_dim=int(Xinst_sorted_hpo.shape[1]),
+                )
+            return PreparedHPOData(
+                df_full=df_full,
+                ids_2d_file=ids_2d_file,
+                X2d_file=X2d_file,
+                cv_data=cv_data,
             )
-
-            df_hpo = df_hpo.loc[have_bag_mask].reset_index(drop=True)
-            ids_hpo = df_hpo[c.id_col].astype(str).tolist()
-            X2d_hpo = X2d_hpo[have_bag_mask]
-            y_cls = y_cls[have_bag_mask]
-            w_cls = w_cls[have_bag_mask]
-            y_abs = y_abs[have_bag_mask]
-            m_abs = m_abs[have_bag_mask]
-            y_fluo = y_fluo[have_bag_mask]
-            m_fluo = m_fluo[have_bag_mask]
-            w_abs = w_abs[have_bag_mask]
-            w_fluo = w_fluo[have_bag_mask]
-            folds = sorted(df_hpo[c.fold_col].dropna().astype(int).unique().tolist())
-            folds_info = fold_indices(df_hpo, c.fold_col, folds)
-
-        print(f"[DATA-HPO] n_ids={len(ids_hpo)} | X2d_dim={X2d_hpo.shape[1]}")
-        print(
-            f"[DATA-HPO] n_conf={Xinst_sorted_hpo.shape[0]} | inst_dim={Xinst_sorted_hpo.shape[1]}"
-        )
-
-        cv_data = MILCVData(
-            X2d_scaled=X2d_hpo,
-            y_cls=y_cls,
-            w_cls=w_cls,
-            y_abs=y_abs,
-            m_abs=m_abs,
-            w_abs=w_abs,
-            y_fluo=y_fluo,
-            m_fluo=m_fluo,
-            w_fluo=w_fluo,
-            ids=ids_hpo,
-            folds_info=folds_info,
-            starts=starts_hpo,
-            counts=counts_hpo,
-            id2pos=id2pos_hpo,
-            Xinst_sorted=Xinst_sorted_hpo,
-        )
-        return PreparedHPOData(
-            df_full=df_full,
-            ids_2d_file=ids_2d_file,
-            X2d_file=X2d_file,
-            cv_data=cv_data,
-        )
 
     def _resolve_folds(self, df_hpo: pd.DataFrame) -> Sequence[int]:
         if self.config.splits.folds is None:
@@ -569,79 +646,98 @@ class MILPipelineOrchestrator:
         self.argv = argv
 
     def run(self) -> None:
-        env = PipelineEnvironmentFactory(self.config).prepare(argv=self.argv)
-        hpo_data = HPODataBuilder(self.config).build()
+        with log_step(
+            "pipeline.run",
+            run_hpo=bool(self.config.hpo.run_hpo),
+            study_dir=str(self.config.data_paths.study_dir),
+        ):
+            with log_step("pipeline.prepare_environment"):
+                env = PipelineEnvironmentFactory(self.config).prepare(argv=self.argv)
+            with log_step("pipeline.build_hpo_data"):
+                hpo_data = HPODataBuilder(self.config).build()
 
-        print(
-            "[DATALOADER] "
-            f"num_workers={env.num_workers} pin_memory={env.pin_memory} "
-            f"precision={self.config.runtime.precision}"
-        )
-        ckpt_root: Path | None = None
-
-        if bool(self.config.hpo.run_hpo):
-            ckpt_root = env.outdir / "_tmp_best_ckpts"
-            ckpt_root.mkdir(parents=True, exist_ok=True)
-            study = self._run_hpo(env=env, hpo_data=hpo_data, ckpt_root=ckpt_root)
-            best_params = dict(study.best_params)
-        else:
-            best_params = self._load_best_params(outdir=env.outdir)
-
-        self._run_final(env=env, hpo_data=hpo_data, best_params=best_params)
-
-        if ckpt_root is not None:
-            try:
-                shutil.rmtree(ckpt_root, ignore_errors=True)
-            except Exception:
-                pass
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-
-    def _run_hpo(self, *, env: PipelineEnvironment, hpo_data: PreparedHPOData, ckpt_root: Path):
-        run_cfg = CVRunConfig(
-            seed=int(self.config.runtime.seed),
-            trainer=TrainerSystemConfig(
-                max_epochs=int(self.config.runtime.max_epochs),
-                patience=int(self.config.runtime.patience),
-                accelerator=str(self.config.runtime.nn_accelerator),
-                devices=int(self.config.runtime.nn_devices),
-                precision=str(self.config.runtime.precision),
-            ),
-            loader=LoaderConfig(
+            log_event(
+                "INFO",
+                "pipeline.dataloader",
                 num_workers=int(env.num_workers),
                 pin_memory=bool(env.pin_memory),
-            ),
-            ckpt_root=ckpt_root,
-        )
-        cross_validator = MILCrossValidator(data=hpo_data.cv_data, run_config=run_cfg)
-        study_runner = MILStudyRunner(
-            config=StudyConfig(
-                outdir=env.outdir,
-                study_name="multimodal_mil_aux_gpu",
-                n_trials=int(self.config.runtime.trials),
+                precision=str(self.config.runtime.precision),
+            )
+            ckpt_root: Path | None = None
+
+            if bool(self.config.hpo.run_hpo):
+                with log_step("pipeline.run_hpo"):
+                    ckpt_root = env.outdir / "_tmp_best_ckpts"
+                    ckpt_root.mkdir(parents=True, exist_ok=True)
+                    study = self._run_hpo(env=env, hpo_data=hpo_data, ckpt_root=ckpt_root)
+                    best_params = dict(study.best_params)
+            else:
+                with log_step("pipeline.load_best_params"):
+                    best_params = self._load_best_params(outdir=env.outdir)
+
+            with log_step("pipeline.run_final"):
+                self._run_final(env=env, hpo_data=hpo_data, best_params=best_params)
+
+            with log_step("pipeline.cleanup"):
+                if ckpt_root is not None:
+                    try:
+                        shutil.rmtree(ckpt_root, ignore_errors=True)
+                    except Exception:
+                        pass
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+
+    def _run_hpo(self, *, env: PipelineEnvironment, hpo_data: PreparedHPOData, ckpt_root: Path):
+        with log_step(
+            "pipeline._run_hpo",
+            n_trials=int(self.config.runtime.trials),
+            max_epochs=int(self.config.runtime.max_epochs),
+        ):
+            run_cfg = CVRunConfig(
                 seed=int(self.config.runtime.seed),
-            ),
-            cross_validator=cross_validator,
-        )
-        return study_runner.run()
+                trainer=TrainerSystemConfig(
+                    max_epochs=int(self.config.runtime.max_epochs),
+                    patience=int(self.config.runtime.patience),
+                    accelerator=str(self.config.runtime.nn_accelerator),
+                    devices=int(self.config.runtime.nn_devices),
+                    precision=str(self.config.runtime.precision),
+                ),
+                loader=LoaderConfig(
+                    num_workers=int(env.num_workers),
+                    pin_memory=bool(env.pin_memory),
+                ),
+                ckpt_root=ckpt_root,
+            )
+            cross_validator = MILCrossValidator(data=hpo_data.cv_data, run_config=run_cfg)
+            study_runner = MILStudyRunner(
+                config=StudyConfig(
+                    outdir=env.outdir,
+                    study_name="multimodal_mil_aux_gpu",
+                    n_trials=int(self.config.runtime.trials),
+                    seed=int(self.config.runtime.seed),
+                ),
+                cross_validator=cross_validator,
+            )
+            return study_runner.run()
 
     def _load_best_params(self, *, outdir: Path) -> dict[str, Any]:
-        explicit = self.config.hpo.best_params_json
-        if explicit is not None:
-            path = Path(explicit)
-        else:
-            path = outdir / "multimodal_mil_aux_gpu_best_params.json"
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Best-params file not found: {path}. "
-                "Run with --run_hpo or provide --best_params_json <file>."
-            )
-        payload = json.loads(path.read_text())
-        if not isinstance(payload, dict):
-            raise ValueError(f"Expected JSON object in {path}, got {type(payload).__name__}")
-        print(f"[HPO] using precomputed params from: {path}")
-        return dict(payload)
+        with log_step("pipeline._load_best_params"):
+            explicit = self.config.hpo.best_params_json
+            if explicit is not None:
+                path = Path(explicit)
+            else:
+                path = outdir / "multimodal_mil_aux_gpu_best_params.json"
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"Best-params file not found: {path}. "
+                    "Run with --run_hpo or provide --best_params_json <file>."
+                )
+            payload = json.loads(path.read_text())
+            if not isinstance(payload, dict):
+                raise ValueError(f"Expected JSON object in {path}, got {type(payload).__name__}")
+            log_event("INFO", "pipeline.best_params_loaded", path=str(path), n_keys=int(len(payload)))
+            return dict(payload)
 
     def _run_final(self, *, env: PipelineEnvironment, hpo_data: PreparedHPOData, best_params: dict[str, Any]):
         c = self.config.columns
@@ -649,77 +745,125 @@ class MILPipelineOrchestrator:
         split = self.config.splits
         df_full = hpo_data.df_full
 
-        allowed_final = set(
-            df_full[df_full[c.split_col].isin(["train", split.leaderboard_split])][c.id_col]
-            .astype(str)
-            .tolist()
-        )
-        ids_conf_all, conf_ids_all, Xinst_all = load_and_merge_instances(
-            p.feat3d_scaled,
-            p.feat3d_qm_scaled,
-            allowed_ids=allowed_final,
-            id_col=c.id_col,
-            conf_col=c.conf_col,
-        )
-        _, starts_all, counts_all, id2pos_all, Xinst_sorted_all, conf_sorted_all = build_instance_index(
-            ids_conf_all,
-            conf_ids_all,
-            Xinst_all,
-        )
+        with log_step("pipeline._run_final", leaderboard_split=str(split.leaderboard_split)):
+            with log_step("pipeline.final.load_instances"):
+                allowed_final = set(
+                    df_full[df_full[c.split_col].isin(["train", split.leaderboard_split])][c.id_col]
+                    .astype(str)
+                    .tolist()
+                )
+                ids_conf_all, conf_ids_all, Xinst_all = load_and_merge_instances(
+                    p.feat3d_scaled,
+                    p.feat3d_qm_scaled,
+                    allowed_ids=allowed_final,
+                    id_col=c.id_col,
+                    conf_col=c.conf_col,
+                )
+                _, starts_all, counts_all, id2pos_all, Xinst_sorted_all, conf_sorted_all = build_instance_index(
+                    ids_conf_all,
+                    conf_ids_all,
+                    Xinst_all,
+                )
+                log_event(
+                    "INFO",
+                    "pipeline.final.instances_ready",
+                    n_ids_with_bags=int(len(id2pos_all)),
+                    n_conf=int(Xinst_sorted_all.shape[0]),
+                    inst_dim=int(Xinst_sorted_all.shape[1]),
+                )
 
-        final_data = MILFinalData(
-            df_full=df_full,
-            id_col=c.id_col,
-            split_col=c.split_col,
-            leaderboard_split=split.leaderboard_split,
-            X2d_file_ids=hpo_data.ids_2d_file,
-            X2d_file=hpo_data.X2d_file,
-            starts=starts_all,
-            counts=counts_all,
-            id2pos=id2pos_all,
-            Xinst_sorted=Xinst_sorted_all,
-            conf_sorted=conf_sorted_all,
-        )
-        final_cfg = FinalTrainConfig(
-            seed=int(self.config.runtime.seed),
-            trainer=TrainerSystemConfig(
-                max_epochs=int(self.config.runtime.max_epochs),
-                patience=int(self.config.runtime.patience),
-                accelerator=str(self.config.runtime.nn_accelerator),
-                devices=int(self.config.runtime.nn_devices),
-                precision=str(self.config.runtime.precision),
-            ),
-            loader=LoaderConfig(
-                num_workers=int(env.num_workers),
-                pin_memory=bool(env.pin_memory),
-            ),
-            attn_out=self.config.export.attn_out,
-            explainability=FinalExplainabilityConfig(
-                run_chem_ace=bool(self.config.explainability.run_chem_ace),
-                run_lambda_vol=bool(self.config.explainability.run_lambda_vol),
-                curated_smiles_col=str(self.config.explainability.curated_smiles_col),
-                chem_ace_output_dir=self.config.explainability.chem_ace_output_dir,
-                chem_ace_db_uri=self.config.explainability.chem_ace_db_uri,
-                chem_ace_max_ids=int(self.config.explainability.chem_ace_max_ids),
-                chem_ace_max_confs_per_id=int(self.config.explainability.chem_ace_max_confs_per_id),
-                chem_ace_max_2d_dim=int(self.config.explainability.chem_ace_max_2d_dim),
-                chem_ace_max_3dqm_dim=int(self.config.explainability.chem_ace_max_3dqm_dim),
-                chem_ace_top_concepts=int(self.config.explainability.chem_ace_top_concepts),
-                lambda_vol_output_dir=self.config.explainability.lambda_vol_output_dir,
-                lambda_vol_db_uri=self.config.explainability.lambda_vol_db_uri,
-                lambda_vol_layer_name=str(self.config.explainability.lambda_vol_layer_name),
-                lambda_vol_top_concepts=int(self.config.explainability.lambda_vol_top_concepts),
-                lambda_vol_monitor_max_samples=int(self.config.explainability.lambda_vol_monitor_max_samples),
-                lambda_vol_tcav_repeats=int(self.config.explainability.lambda_vol_tcav_repeats),
-                lambda_vol_random_counterexamples=int(self.config.explainability.lambda_vol_random_counterexamples),
-                lambda_vol_min_concept_samples=int(self.config.explainability.lambda_vol_min_concept_samples),
-            ),
-        )
-        MILFinalTrainer(config=final_cfg).run(
-            outdir=env.outdir,
-            best_params=dict(best_params),
-            data=final_data,
-        )
+            with log_step("pipeline.final.build_config"):
+                final_data = MILFinalData(
+                    df_full=df_full,
+                    id_col=c.id_col,
+                    split_col=c.split_col,
+                    leaderboard_split=split.leaderboard_split,
+                    X2d_file_ids=hpo_data.ids_2d_file,
+                    X2d_file=hpo_data.X2d_file,
+                    starts=starts_all,
+                    counts=counts_all,
+                    id2pos=id2pos_all,
+                    Xinst_sorted=Xinst_sorted_all,
+                    conf_sorted=conf_sorted_all,
+                )
+                final_cfg = FinalTrainConfig(
+                    seed=int(self.config.runtime.seed),
+                    trainer=TrainerSystemConfig(
+                        max_epochs=int(self.config.runtime.max_epochs),
+                        patience=int(self.config.runtime.patience),
+                        accelerator=str(self.config.runtime.nn_accelerator),
+                        devices=int(self.config.runtime.nn_devices),
+                        precision=str(self.config.runtime.precision),
+                    ),
+                    loader=LoaderConfig(
+                        num_workers=int(env.num_workers),
+                        pin_memory=bool(env.pin_memory),
+                    ),
+                    attn_out=self.config.export.attn_out,
+                    explainability=FinalExplainabilityConfig(
+                        run_chem_ace=bool(self.config.explainability.run_chem_ace),
+                        run_lambda_vol=bool(self.config.explainability.run_lambda_vol),
+                        curated_smiles_col=str(self.config.explainability.curated_smiles_col),
+                        chem_ace_output_dir=self.config.explainability.chem_ace_output_dir,
+                        chem_ace_db_uri=self.config.explainability.chem_ace_db_uri,
+                        chem_ace_max_ids=int(self.config.explainability.chem_ace_max_ids),
+                        chem_ace_max_confs_per_id=int(self.config.explainability.chem_ace_max_confs_per_id),
+                        chem_ace_max_2d_dim=int(self.config.explainability.chem_ace_max_2d_dim),
+                        chem_ace_max_3dqm_dim=int(self.config.explainability.chem_ace_max_3dqm_dim),
+                        chem_ace_top_concepts=int(self.config.explainability.chem_ace_top_concepts),
+                        lambda_vol_output_dir=self.config.explainability.lambda_vol_output_dir,
+                        lambda_vol_db_uri=self.config.explainability.lambda_vol_db_uri,
+                        lambda_vol_layer_name=str(self.config.explainability.lambda_vol_layer_name),
+                        lambda_vol_top_concepts=int(self.config.explainability.lambda_vol_top_concepts),
+                        lambda_vol_monitor_max_samples=int(self.config.explainability.lambda_vol_monitor_max_samples),
+                        lambda_vol_tcav_repeats=int(self.config.explainability.lambda_vol_tcav_repeats),
+                        lambda_vol_random_counterexamples=int(self.config.explainability.lambda_vol_random_counterexamples),
+                        lambda_vol_min_concept_samples=int(self.config.explainability.lambda_vol_min_concept_samples),
+                        lambda_vol_run_ricci=bool(self.config.explainability.lambda_vol_run_ricci),
+                        lambda_vol_ricci_edge_keep_quantile=float(
+                            self.config.explainability.lambda_vol_ricci_edge_keep_quantile
+                        ),
+                        lambda_vol_ricci_min_edge_weight=float(
+                            self.config.explainability.lambda_vol_ricci_min_edge_weight
+                        ),
+                        lambda_vol_ricci_top_k_per_node=int(
+                            self.config.explainability.lambda_vol_ricci_top_k_per_node
+                        ),
+                        lambda_vol_ricci_flow_steps=int(
+                            self.config.explainability.lambda_vol_ricci_flow_steps
+                        ),
+                        lambda_vol_ricci_flow_step_size=float(
+                            self.config.explainability.lambda_vol_ricci_flow_step_size
+                        ),
+                        lambda_vol_ricci_use_flow_as_coupling=bool(
+                            self.config.explainability.lambda_vol_ricci_use_flow_as_coupling
+                        ),
+                        lambda_vol_ricci_coupling_strength=float(
+                            self.config.explainability.lambda_vol_ricci_coupling_strength
+                        ),
+                        run_concept_rl=bool(self.config.explainability.run_concept_rl),
+                        concept_rl_top_k_per_task=int(self.config.explainability.concept_rl_top_k_per_task),
+                        concept_rl_min_pos_coverage=float(
+                            self.config.explainability.concept_rl_min_pos_coverage
+                        ),
+                        concept_rl_init_scale=float(self.config.explainability.concept_rl_init_scale),
+                        concept_rl_max_scale=float(self.config.explainability.concept_rl_max_scale),
+                        concept_rl_policy_lr=float(self.config.explainability.concept_rl_policy_lr),
+                        concept_rl_policy_sigma=float(self.config.explainability.concept_rl_policy_sigma),
+                        concept_rl_reward_alignment_w=float(
+                            self.config.explainability.concept_rl_reward_alignment_w
+                        ),
+                        concept_rl_baseline_momentum=float(
+                            self.config.explainability.concept_rl_baseline_momentum
+                        ),
+                    ),
+                )
+            with log_step("pipeline.final.train_and_eval"):
+                MILFinalTrainer(config=final_cfg).run(
+                    outdir=env.outdir,
+                    best_params=dict(best_params),
+                    data=final_data,
+                )
 
 
 def _parse_args(argv: Any | None = None):
@@ -794,6 +938,7 @@ def _parse_args(argv: Any | None = None):
     # Explainability integrations: Chem-ACE + Lambda-Vol
     ap.add_argument("--run_chem_ace", action="store_true")
     ap.add_argument("--run_lambda_vol", action="store_true")
+    ap.add_argument("--run_concept_rl", action="store_true")
     ap.add_argument("--curated_smiles_col", default="curated_SMILES")
     ap.add_argument("--chem_ace_output_dir", default=None)
     ap.add_argument("--chem_ace_db_uri", default=None)
@@ -810,6 +955,32 @@ def _parse_args(argv: Any | None = None):
     ap.add_argument("--lambda_vol_tcav_repeats", type=int, default=2)
     ap.add_argument("--lambda_vol_random_counterexamples", type=int, default=96)
     ap.add_argument("--lambda_vol_min_concept_samples", type=int, default=8)
+    ap.add_argument(
+        "--lambda_vol_run_ricci",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    ap.add_argument("--lambda_vol_ricci_edge_keep_quantile", type=float, default=0.75)
+    ap.add_argument("--lambda_vol_ricci_min_edge_weight", type=float, default=0.05)
+    ap.add_argument("--lambda_vol_ricci_top_k_per_node", type=int, default=4)
+    ap.add_argument("--lambda_vol_ricci_flow_steps", type=int, default=8)
+    ap.add_argument("--lambda_vol_ricci_flow_step_size", type=float, default=0.12)
+    ap.add_argument(
+        "--lambda_vol_ricci_use_flow_as_coupling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    ap.add_argument("--lambda_vol_ricci_coupling_strength", type=float, default=0.05)
+
+    # Concept-RL guidance (final train only; relies on Chem-ACE concepts)
+    ap.add_argument("--concept_rl_top_k_per_task", type=int, default=8)
+    ap.add_argument("--concept_rl_min_pos_coverage", type=float, default=0.02)
+    ap.add_argument("--concept_rl_init_scale", type=float, default=0.02)
+    ap.add_argument("--concept_rl_max_scale", type=float, default=0.20)
+    ap.add_argument("--concept_rl_policy_lr", type=float, default=0.05)
+    ap.add_argument("--concept_rl_policy_sigma", type=float, default=0.02)
+    ap.add_argument("--concept_rl_reward_alignment_w", type=float, default=0.25)
+    ap.add_argument("--concept_rl_baseline_momentum", type=float, default=0.90)
 
     return ap.parse_args(argv)
 
@@ -831,8 +1002,8 @@ def _normalize_compat_args(args) -> None:
     """
     if args.trials_mil is not None:
         args.trials = int(args.trials_mil)
-    if bool(args.run_lambda_vol):
-        # Lambda-Vol relies on concept families from Chem-ACE.
+    if bool(args.run_lambda_vol) or bool(args.run_concept_rl):
+        # Lambda-Vol and concept RL both rely on concept families from Chem-ACE.
         args.run_chem_ace = True
 
 
@@ -852,10 +1023,20 @@ def main(argv: Any | None = None) -> None:
     Returns:
         None
     """
-    args = _parse_args(argv)
-    _normalize_compat_args(args)
-    config = PipelineConfigFactory.from_args(args)
-    MILPipelineOrchestrator(config=config, argv=argv).run()
+    with log_step("pipeline.main"):
+        args = _parse_args(argv)
+        _normalize_compat_args(args)
+        config = PipelineConfigFactory.from_args(args)
+        log_event(
+            "INFO",
+            "pipeline.main.args",
+            run_hpo=bool(config.hpo.run_hpo),
+            study_dir=str(config.data_paths.study_dir),
+            run_chem_ace=bool(config.explainability.run_chem_ace),
+            run_lambda_vol=bool(config.explainability.run_lambda_vol),
+            run_concept_rl=bool(config.explainability.run_concept_rl),
+        )
+        MILPipelineOrchestrator(config=config, argv=argv).run()
 
 
 if __name__ == "__main__":

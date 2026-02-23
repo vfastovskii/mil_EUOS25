@@ -16,6 +16,12 @@ This module adds a training-time monitoring/control layer for concept reliance d
   - runaway pressure
   - concentration/collapse (`top-k mass`, entropy drop)
   - blocked concept positive drift
+- Ricci geometry diagnostics + flow (new):
+  - per-task concept graph construction from `rho/attention/prevalence + TCAV-history corr`
+  - Forman-Ricci edge curvature per epoch
+  - Ricci-flow-style edge reweighting
+  - bridge/bottleneck alerts from negative-curvature structure
+  - optional coupling of flowed concept graph into Λ-Vol dynamics
 - Intervention recommendations:
   - concept-balanced batching
   - hard-negative mining
@@ -66,6 +72,9 @@ This produces:
 - `/tmp/lambda_vol_demo/<run_id>/metadata.json`
 - `/tmp/lambda_vol_demo/<run_id>/alerts.json`
 - `/tmp/lambda_vol_demo/<run_id>/recommendations.json`
+- `/tmp/lambda_vol_demo/<run_id>/ricci_edges_long.csv`
+- `/tmp/lambda_vol_demo/<run_id>/ricci_task_summary.csv`
+- `/tmp/lambda_vol_demo/<run_id>/ricci_flow_tensors.npz`
 - `/tmp/lambda_vol_demo/<run_id>/pressure_lattice.html` (if Plotly installed)
 - `/tmp/lambda_vol_demo/<run_id>/concept_manifold_<task>.html` (if Plotly installed)
 - `/tmp/lambda_vol_demo/lambda_vol_demo_summary.json`
@@ -94,6 +103,25 @@ Use `/Users/vfastovskii/Desktop/mil_explainability_2026/opt_attn_net_feb/explain
 
 - Implement `LightningFrameProvider.collect_epoch_frames(...)` to return DataFrames.
 - Attach `LambdaVolLightningCallback` to `Trainer(callbacks=[...])`.
+
+## Ricci controls (pipeline)
+
+When running `hpo_pipeline.py` / `opt_net_fast.py`, Ricci monitoring is available via:
+
+- `--lambda_vol_run_ricci` / `--no-lambda_vol_run_ricci`
+- `--lambda_vol_ricci_edge_keep_quantile`
+- `--lambda_vol_ricci_min_edge_weight`
+- `--lambda_vol_ricci_top_k_per_node`
+- `--lambda_vol_ricci_flow_steps`
+- `--lambda_vol_ricci_flow_step_size`
+- `--lambda_vol_ricci_use_flow_as_coupling` / `--no-lambda_vol_ricci_use_flow_as_coupling`
+- `--lambda_vol_ricci_coupling_strength`
+
+By default, Ricci is enabled for Lambda-Vol runs and exported as:
+
+- `ricci_edges_long.csv`
+- `ricci_task_summary.csv`
+- `ricci_flow_tensors.npz`
 
 ## Query API examples
 

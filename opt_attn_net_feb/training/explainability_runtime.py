@@ -29,11 +29,12 @@ from ..explainability.chem_ace.optional_deps import OptionalDependencyError, req
 from ..explainability.chem_ace.types import ModelTaskAdapter, PatchEmbeddingRecord, PatchRecord
 from ..explainability.lambda_vol import LambdaVolConfig
 from ..explainability.lambda_vol.config import ExportConfig as LambdaVolExportConfig
-from ..explainability.lambda_vol.config import PolicyConfig, StoreConfig, TrackerConfig
+from ..explainability.lambda_vol.config import PolicyConfig, RicciConfig, StoreConfig, TrackerConfig
 from ..explainability.lambda_vol.integrations import LambdaVolLightningCallback, LightningEpochFrames
 from ..explainability.lambda_vol.monitor import LambdaVolMonitor
 from ..training.builders import DataLoaderBuilder, LoaderConfig
 from ..utils.constants import TASK_COLS
+from ..utils.progress import log_event, log_step
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,25 @@ class FinalExplainabilityConfig:
     lambda_vol_tcav_repeats: int = 2
     lambda_vol_random_counterexamples: int = 96
     lambda_vol_min_concept_samples: int = 8
+    lambda_vol_run_ricci: bool = True
+    lambda_vol_ricci_edge_keep_quantile: float = 0.75
+    lambda_vol_ricci_min_edge_weight: float = 0.05
+    lambda_vol_ricci_top_k_per_node: int = 4
+    lambda_vol_ricci_flow_steps: int = 8
+    lambda_vol_ricci_flow_step_size: float = 0.12
+    lambda_vol_ricci_use_flow_as_coupling: bool = True
+    lambda_vol_ricci_coupling_strength: float = 0.05
+
+    # Concept RL guidance (applied during final training).
+    run_concept_rl: bool = False
+    concept_rl_top_k_per_task: int = 8
+    concept_rl_min_pos_coverage: float = 0.02
+    concept_rl_init_scale: float = 0.02
+    concept_rl_max_scale: float = 0.20
+    concept_rl_policy_lr: float = 0.05
+    concept_rl_policy_sigma: float = 0.02
+    concept_rl_reward_alignment_w: float = 0.25
+    concept_rl_baseline_momentum: float = 0.90
 
 
 @dataclass(frozen=True)
@@ -77,6 +97,69 @@ class ChemACEBundle:
     concept_support: Mapping[str, int]
     concept_mol_map: Mapping[str, set[str]]
     concept_conf_map: Mapping[str, set[tuple[str, str]]]
+
+
+def build_positive_concept_targets(
+    *,
+    config: FinalExplainabilityConfig,
+    ids_train: Sequence[str],
+    y_cls_train: np.ndarray,
+    chem_bundle: ChemACEBundle,
+) -> dict[int, tuple[str, ...]]:
+    """
+    Select target concept sets per task from concepts frequent in positive train samples.
+
+    Returns mapping:
+      task_index -> tuple(concept_id, ...)
+    """
+    if (not bool(config.run_concept_rl)) or len(ids_train) == 0:
+        return {}
+
+    y = np.asarray(y_cls_train, dtype=np.float32)
+    if y.ndim != 2 or y.shape[1] != len(TASK_COLS):
+        raise ValueError(
+            f"y_cls_train must be [N,{len(TASK_COLS)}], got shape={tuple(y.shape)}"
+        )
+
+    ids = [str(x) for x in ids_train]
+    concept_ids = [str(x) for x in chem_bundle.concept_ids]
+    concept_mol_map = {
+        str(k): {str(x) for x in v}
+        for k, v in chem_bundle.concept_mol_map.items()
+    }
+
+    out: dict[int, tuple[str, ...]] = {}
+    top_k = max(1, int(config.concept_rl_top_k_per_task))
+    min_cov = float(max(0.0, config.concept_rl_min_pos_coverage))
+
+    for ti in range(len(TASK_COLS)):
+        pos_ids = [ids[i] for i in range(len(ids)) if float(y[i, ti]) > 0.5]
+        pos_set = set(pos_ids)
+        n_pos = max(1, len(pos_set))
+        if len(pos_set) == 0:
+            out[int(ti)] = tuple()
+            continue
+
+        scored: list[tuple[int, float, str]] = []
+        for cid in concept_ids:
+            hits = int(len(pos_set.intersection(concept_mol_map.get(cid, set()))))
+            cov = float(hits) / float(n_pos)
+            if cov >= min_cov:
+                scored.append((hits, cov, str(cid)))
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+        chosen = [cid for _, _, cid in scored[:top_k]]
+        out[int(ti)] = tuple(chosen)
+
+    logger.info(
+        "Built concept RL targets",
+        extra={
+            "task_target_sizes": {int(k): int(len(v)) for k, v in out.items()},
+            "top_k": int(top_k),
+            "min_pos_coverage": float(min_cov),
+        },
+    )
+    return out
 
 
 class _MILTaskAdapter(ModelTaskAdapter):
@@ -357,6 +440,7 @@ def prepare_chem_ace_bundle(
     """Build Chem-ACE concepts from curated SMILES + fused 2D/3D/QM features."""
     if not bool(config.run_chem_ace):
         return None
+    log_event("START", "explainability.prepare_chem_ace_bundle", outdir=str(outdir))
 
     try:
         require_rdkit()
@@ -387,6 +471,7 @@ def prepare_chem_ace_bundle(
     )
     pipeline = ChemACEPipeline(config=ace_cfg)
     run_id = pipeline.start_run(task_ids=TASK_COLS)
+    log_event("INFO", "explainability.chem_ace.run_started", run_id=str(run_id), db_uri=str(db_uri))
 
     ids_unique = sorted({str(x) for x in ids_scope})
     max_ids = int(config.chem_ace_max_ids)
@@ -431,30 +516,36 @@ def prepare_chem_ace_bundle(
         molecules.append(MoleculeSource(mol_id=str(mol_id), mol=mol, conf_ids=conf_ids))
         molecules_by_id[str(mol_id)] = mol
 
-    patches = pipeline.generate_patches(molecules=molecules)
+    with log_step("explainability.chem_ace.generate_patches", n_molecules=int(len(molecules))):
+        patches = pipeline.generate_patches(molecules=molecules)
     if len(patches) == 0:
         raise RuntimeError("Chem-ACE generated zero patches; cannot continue")
+    log_event("INFO", "explainability.chem_ace.patches_ready", n_patches=int(len(patches)))
 
-    embeddings = _build_feature_patch_embeddings(
-        pipeline=pipeline,
-        patches=patches,
-        molecules_by_id=molecules_by_id,
-        x2d_by_id=x2d_by_id,
-        xinst_by_pair=inst_map,
-        xinst_mean_by_id=inst_mean_map,
-        max_2d_dim=int(config.chem_ace_max_2d_dim),
-        max_3dqm_dim=int(config.chem_ace_max_3dqm_dim),
-    )
+    with log_step("explainability.chem_ace.embed_patches"):
+        embeddings = _build_feature_patch_embeddings(
+            pipeline=pipeline,
+            patches=patches,
+            molecules_by_id=molecules_by_id,
+            x2d_by_id=x2d_by_id,
+            xinst_by_pair=inst_map,
+            xinst_mean_by_id=inst_mean_map,
+            max_2d_dim=int(config.chem_ace_max_2d_dim),
+            max_3dqm_dim=int(config.chem_ace_max_3dqm_dim),
+        )
+    log_event("INFO", "explainability.chem_ace.embeddings_ready", n_embeddings=int(len(embeddings)))
 
-    concept_set, concept_set_id = pipeline.discover_and_store_concepts(
-        run_id=run_id,
-        embeddings=embeddings,
-    )
-    tagging = pipeline.tag_and_store_concepts(
-        concept_set=concept_set,
-        patches=patches,
-        molecules_by_id=molecules_by_id,
-    )
+    with log_step("explainability.chem_ace.discover_concepts"):
+        concept_set, concept_set_id = pipeline.discover_and_store_concepts(
+            run_id=run_id,
+            embeddings=embeddings,
+        )
+    with log_step("explainability.chem_ace.tag_concepts"):
+        tagging = pipeline.tag_and_store_concepts(
+            concept_set=concept_set,
+            patches=patches,
+            molecules_by_id=molecules_by_id,
+        )
 
     concept_mol_map, concept_conf_map = _build_concept_membership_maps(
         concept_set=concept_set,
@@ -508,6 +599,13 @@ def prepare_chem_ace_bundle(
             "n_patches": len(patches),
         },
     )
+    log_event(
+        "DONE",
+        "explainability.prepare_chem_ace_bundle",
+        run_id=str(run_id),
+        concept_set_id=str(concept_set_id),
+        n_concepts=int(len(ordered_concepts)),
+    )
 
     return ChemACEBundle(
         output_dir=str(ace_out_dir),
@@ -534,8 +632,10 @@ def build_lambda_vol_callback(
     """Create Lambda-Vol Lightning callback bound to MIL monitoring providers."""
     if not bool(config.run_lambda_vol):
         return None
+    log_event("START", "explainability.build_lambda_vol_callback")
     if not chem_bundle.concept_ids:
         logger.warning("Lambda-Vol requested but no Chem-ACE concepts are available")
+        log_event("WARN", "explainability.build_lambda_vol_callback.no_concepts")
         return None
 
     top_k = int(config.lambda_vol_top_concepts)
@@ -556,6 +656,16 @@ def build_lambda_vol_callback(
         run_name="lambda_vol_final_pipeline",
         seed=int(seed),
         tracker=TrackerConfig(alpha=0.6, tcav_ema_beta=0.8, drift_clip=5.0),
+        ricci=RicciConfig(
+            enabled=bool(config.lambda_vol_run_ricci),
+            edge_keep_quantile=float(config.lambda_vol_ricci_edge_keep_quantile),
+            min_edge_weight=float(config.lambda_vol_ricci_min_edge_weight),
+            top_k_per_node=int(config.lambda_vol_ricci_top_k_per_node),
+            flow_steps=int(config.lambda_vol_ricci_flow_steps),
+            flow_step_size=float(config.lambda_vol_ricci_flow_step_size),
+            use_flow_as_concept_coupling=bool(config.lambda_vol_ricci_use_flow_as_coupling),
+            coupling_strength=float(config.lambda_vol_ricci_coupling_strength),
+        ),
         policy=PolicyConfig(enabled=True, auto_action=False),
         exporter=LambdaVolExportConfig(
             output_dir=str(lv_out),
@@ -587,11 +697,18 @@ def build_lambda_vol_callback(
         seed=int(seed),
     )
 
-    return LambdaVolLightningCallback(
+    cb = LambdaVolLightningCallback(
         monitor=monitor,
         frame_provider=frame_provider,
         export_on_fit_end=True,
     )
+    log_event(
+        "DONE",
+        "explainability.build_lambda_vol_callback",
+        n_concepts=int(len(concept_ids)),
+        outdir=str(lv_out),
+    )
+    return cb
 
 
 
@@ -608,6 +725,12 @@ def make_monitor_loader(
     seed: int,
     loader_cfg: LoaderConfig,
 ) -> DataLoader:
+    log_event(
+        "START",
+        "explainability.make_monitor_loader",
+        n_ids=int(len(ids)),
+        batch_size=int(batch_size),
+    )
     ds = MILExportDataset(
         ids=[str(x) for x in ids],
         X2d=np.asarray(x2d, dtype=np.float32),
@@ -619,11 +742,13 @@ def make_monitor_loader(
         max_instances=0,
         seed=int(seed),
     )
-    return DataLoaderBuilder(loader_cfg).eval_loader(
+    dl = DataLoaderBuilder(loader_cfg).eval_loader(
         ds,
         batch_size=int(max(1, batch_size)),
         collate_fn=collate_export,
     )
+    log_event("DONE", "explainability.make_monitor_loader")
+    return dl
 
 
 
@@ -936,6 +1061,7 @@ __all__ = [
     "ChemACEBundle",
     "FinalExplainabilityConfig",
     "MILLambdaVolFrameProvider",
+    "build_positive_concept_targets",
     "build_lambda_vol_callback",
     "make_monitor_loader",
     "prepare_chem_ace_bundle",

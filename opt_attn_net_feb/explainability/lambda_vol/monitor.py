@@ -14,6 +14,7 @@ from .dynamics import LinearConceptDynamicsModel
 from .exporters import LambdaVolArtifactExporter
 from .policy import RecommendationEngine
 from .providers import AttentionProvider, TCAVProvider, TrainingMetricsProvider
+from .ricci import ConceptRicciFlowAnalyzer, RicciEpochOutput
 from .regime import HybridRegimeInferer, RuleBasedRegimeInferer
 from .tracker import ConceptPressureTracker
 from .types import (
@@ -21,6 +22,8 @@ from .types import (
     EpochConceptMetrics,
     EpochTaskMetrics,
     PressureRunArtifacts,
+    RicciEdgeMetrics,
+    RicciTaskSummary,
     RecommendationRecord,
     RegimeLabel,
 )
@@ -96,6 +99,15 @@ class LambdaVolMonitor:
         self.detector = ConceptPressureDetector(self.config.detector)
         self.policy = RecommendationEngine(self.config.policy)
         self.exporter = LambdaVolArtifactExporter(config=self.config.exporter)
+        self.ricci_analyzer = (
+            ConceptRicciFlowAnalyzer(
+                task_ids=self.task_ids,
+                concept_ids=self.concept_ids,
+                config=self.config.ricci,
+            )
+            if bool(self.config.ricci.enabled)
+            else None
+        )
 
         self._task_history_df = pd.DataFrame()
         self._last_regime: Optional[RegimeLabel] = None
@@ -105,6 +117,8 @@ class LambdaVolMonitor:
         self._task_rows: list[EpochTaskMetrics] = []
         self._alerts: list[AlertRecord] = []
         self._recommendations: list[RecommendationRecord] = []
+        self._ricci_edges: list[RicciEdgeMetrics] = []
+        self._ricci_summaries: list[RicciTaskSummary] = []
         self._detector_outputs: dict[int, DetectorOutput] = {}
 
         logger.info(
@@ -131,6 +145,14 @@ class LambdaVolMonitor:
     @property
     def recommendations(self) -> Sequence[RecommendationRecord]:
         return tuple(self._recommendations)
+
+    @property
+    def ricci_edges(self) -> Sequence[RicciEdgeMetrics]:
+        return tuple(self._ricci_edges)
+
+    @property
+    def ricci_summaries(self) -> Sequence[RicciTaskSummary]:
+        return tuple(self._ricci_summaries)
 
     def step_from_frames(
         self,
@@ -176,6 +198,24 @@ class LambdaVolMonitor:
             context_covariates=context_covariates,
         )
 
+        ricci_out: Optional[RicciEpochOutput] = None
+        if self.ricci_analyzer is not None:
+            ricci_out = self.ricci_analyzer.analyze_epoch(
+                epoch=ep,
+                rho=state.rho,
+                attention_support=state.attention_support,
+                prevalence=state.prevalence,
+                tcav_history_by_task=self._tcav_history_by_task(),
+            )
+            self._ricci_edges.extend(ricci_out.edge_rows)
+            self._ricci_summaries.extend(ricci_out.task_summaries)
+            if bool(self.config.ricci.use_flow_as_concept_coupling):
+                coupling = LinearConceptDynamicsModel.make_similarity_coupling(
+                    ricci_out.mean_flowed_similarity,
+                    strength=float(self.config.ricci.coupling_strength),
+                )
+                self.dynamics.set_concept_coupling(coupling)
+
         decomp = self.dynamics.predict_next(
             rho=state.rho,
             context_covariates=state.context_covariates,
@@ -196,6 +236,7 @@ class LambdaVolMonitor:
             dissipation=decomp.dissipation,
             blocked_concepts=self.config.blocked_concepts,
             prev_concentration=self._prev_concentration,
+            ricci_summaries=(None if ricci_out is None else ricci_out.task_summaries),
         )
         self._prev_concentration = det_out.concentration_by_task
         self._detector_outputs[ep] = det_out
@@ -232,6 +273,7 @@ class LambdaVolMonitor:
                 "regime": regime.value,
                 "n_alerts": len(det_out.alerts),
                 "n_recommendations": len(recommendations),
+                "n_ricci_edges": (0 if ricci_out is None else len(ricci_out.edge_rows)),
                 "rho_mean": float(np.mean(state.rho)),
                 "rho_max": float(np.max(state.rho)),
             },
@@ -289,6 +331,8 @@ class LambdaVolMonitor:
             recommendations=self._recommendations,
             concept_metadata=self.concept_metadata,
             concept_coupling=self.dynamics.concept_coupling,
+            ricci_edges=self._ricci_edges,
+            ricci_task_summaries=self._ricci_summaries,
         )
 
     def _prev_drift(self) -> Optional[np.ndarray]:
@@ -303,6 +347,16 @@ class LambdaVolMonitor:
             return None
         mats = np.stack([s.rho for s in states[:-1]], axis=0)
         return np.mean(mats, axis=0).astype(np.float32)
+
+    def _tcav_history_by_task(self) -> dict[str, np.ndarray]:
+        states = self.tracker.states
+        if len(states) == 0:
+            return {}
+        out: dict[str, np.ndarray] = {}
+        for ti, task_id in enumerate(self.task_ids):
+            hist = np.stack([s.tcav[ti] for s in states], axis=0).astype(np.float32)
+            out[str(task_id)] = hist
+        return out
 
     def _attach_dynamics(
         self,

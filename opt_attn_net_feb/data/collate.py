@@ -44,6 +44,7 @@ def collate_train(batch):
         None
     """
     B = len(batch)
+    has_metadata = (len(batch[0]) >= 12)
     x2d_np = np.stack([b[0] for b in batch], axis=0).astype(np.float32)
     bags_np = [b[1] for b in batch]
     lens = np.array([int(x.shape[0]) for x in bags_np], dtype=np.int64)
@@ -74,7 +75,19 @@ def collate_train(batch):
     m_fluo = torch.stack([b[8] for b in batch], dim=0)
     w_fluo = torch.stack([b[9] for b in batch], dim=0)
 
-    return x2d, x3d, kpm_t, y_cls, w_cls, y_abs, m_abs, w_abs, y_fluo, m_fluo, w_fluo
+    out = (x2d, x3d, kpm_t, y_cls, w_cls, y_abs, m_abs, w_abs, y_fluo, m_fluo, w_fluo)
+    if not has_metadata:
+        return out
+
+    mol_ids = [str(b[10]) for b in batch]
+    conf_lists = [b[11] for b in batch]
+    conf_pad = np.empty((B, max_len), dtype=object)
+    conf_pad[:] = ""
+    for i in range(B):
+        L = int(lens[i])
+        conf_i = [str(x) for x in conf_lists[i][:L]]
+        conf_pad[i, :L] = conf_i
+    return (*out, mol_ids, conf_pad)
 
 
 def collate_export(batch):

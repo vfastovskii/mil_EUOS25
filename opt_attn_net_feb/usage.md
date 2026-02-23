@@ -22,6 +22,16 @@ Expected file in this mode:
 
 - `<study_dir>/multimodal_mil_aux_gpu_best_params.json`
 
+## Pipeline step logs (crash localization)
+
+The pipeline now prints structured progress lines for every major stage:
+
+- `[YYYY-mm-dd HH:MM:SS] [START] <step> ...`
+- `[YYYY-mm-dd HH:MM:SS] [DONE] <step> elapsed_s=...`
+- `[YYYY-mm-dd HH:MM:SS] [FAIL] <step> elapsed_s=... error=...`
+
+If a crash happens, check the last printed `START/INFO` step and the corresponding `FAIL` line to pinpoint where it failed.
+
 ## Run Chem-ACE demo (concept discovery + TCAV + SQLite)
 
 ```bash
@@ -67,9 +77,38 @@ Useful controls:
 - `--lambda_vol_monitor_max_samples 512`
 - `--lambda_vol_tcav_repeats 2`
 - `--lambda_vol_output_dir /path/to/lambda_vol_out`
+- `--lambda_vol_run_ricci` / `--no-lambda_vol_run_ricci`
+- `--lambda_vol_ricci_edge_keep_quantile 0.75`
+- `--lambda_vol_ricci_flow_steps 8`
+- `--lambda_vol_ricci_flow_step_size 0.12`
+- `--lambda_vol_ricci_use_flow_as_coupling` / `--no-lambda_vol_ricci_use_flow_as_coupling`
+
+## Enable concept-guided RL control during final training
+
+```bash
+python -m entrypoints.hpo_pipeline ... \
+  --run_hpo \
+  --run_concept_rl
+```
+
+`--run_concept_rl` automatically enables Chem-ACE concept preparation.
+
+Useful controls:
+
+- `--concept_rl_top_k_per_task 8`
+- `--concept_rl_min_pos_coverage 0.02`
+- `--concept_rl_init_scale 0.02`
+- `--concept_rl_max_scale 0.20`
+- `--concept_rl_policy_lr 0.05`
+- `--concept_rl_policy_sigma 0.02`
+- `--concept_rl_reward_alignment_w 0.25`
+- `--concept_rl_baseline_momentum 0.90`
 
 Final outputs include:
 
 - `<study_dir>/final_best_train_vs_leaderboard/explainability_artifacts.json`
 - Chem-ACE DB/artifacts in `chem_ace_output_dir` (or `<study_dir>/chem_ace`)
 - Lambda-Vol tensor/log/html artifacts in `lambda_vol_output_dir` (or `<study_dir>/lambda_vol`)
+- Concept-RL policy history JSON (`concept_rl_policy_history.json`) inside final run directory when enabled
+- Ricci artifacts (`ricci_edges_long.csv`, `ricci_task_summary.csv`, `ricci_flow_tensors.npz`) inside Lambda-Vol output
+- Prediction explanations CSV (`*_explained.csv`) with per-task text explanations when Chem-ACE is enabled

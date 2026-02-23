@@ -16,6 +16,32 @@ class TrackerConfig:
 
 
 @dataclass(frozen=True)
+class RicciConfig:
+    """Discrete graph-Ricci diagnostics and flow settings."""
+
+    enabled: bool = True
+    edge_keep_quantile: float = 0.75
+    min_edge_weight: float = 0.05
+    top_k_per_node: int = 4
+
+    w_rho: float = 0.40
+    w_attention: float = 0.30
+    w_prevalence: float = 0.15
+    w_tcav_corr: float = 0.15
+
+    negative_curvature_threshold: float = -0.15
+    strong_negative_curvature_threshold: float = -0.35
+
+    flow_enabled: bool = True
+    flow_steps: int = 8
+    flow_step_size: float = 0.12
+    flow_eps: float = 1e-4
+
+    use_flow_as_concept_coupling: bool = True
+    coupling_strength: float = 0.05
+
+
+@dataclass(frozen=True)
 class RegimeConfig:
     """Rule-based regime inference settings."""
 
@@ -57,6 +83,9 @@ class DetectorConfig:
     concentration_entropy_drop_alert: float = 0.10
     concentration_topk_mass_alert: float = 0.75
     blocked_concept_positive_drift: float = 0.05
+    ricci_negative_edge_fraction_alert: float = 0.40
+    ricci_min_curvature_alert: float = -0.45
+    ricci_strong_negative_fraction_alert: float = 0.20
 
 
 @dataclass(frozen=True)
@@ -93,6 +122,7 @@ class LambdaVolConfig:
     seed: int = 0
     blocked_concepts: tuple[str, ...] = ()
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
+    ricci: RicciConfig = field(default_factory=RicciConfig)
     regime: RegimeConfig = field(default_factory=RegimeConfig)
     dynamics: DynamicsConfig = field(default_factory=DynamicsConfig)
     detector: DetectorConfig = field(default_factory=DetectorConfig)
@@ -116,6 +146,7 @@ __all__ = [
     "ExportConfig",
     "LambdaVolConfig",
     "PolicyConfig",
+    "RicciConfig",
     "RegimeConfig",
     "StoreConfig",
     "TrackerConfig",

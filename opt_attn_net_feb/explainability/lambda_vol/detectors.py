@@ -7,7 +7,7 @@ from typing import Mapping, Optional, Sequence
 import numpy as np
 
 from .config import DetectorConfig
-from .types import AlertRecord, ConcentrationMetrics
+from .types import AlertRecord, ConcentrationMetrics, RicciTaskSummary
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,7 @@ class ConceptPressureDetector:
         dissipation: np.ndarray,
         blocked_concepts: Sequence[str],
         prev_concentration: Optional[Mapping[str, ConcentrationMetrics]] = None,
+        ricci_summaries: Optional[Sequence[RicciTaskSummary]] = None,
     ) -> DetectorOutput:
         """Detect runaway/collapse signals and return alerts."""
         task_ids = tuple(str(x) for x in task_ids)
@@ -173,6 +174,76 @@ class ConceptPressureDetector:
                             details={
                                 "drift": float(drift_m[ti, ci]),
                                 "rho": float(rho_m[ti, ci]),
+                            },
+                        )
+                    )
+
+        if ricci_summaries is not None:
+            for summary in ricci_summaries:
+                if float(summary.negative_edge_fraction) >= float(self.config.ricci_negative_edge_fraction_alert):
+                    alerts.append(
+                        AlertRecord(
+                            run_id=str(run_id),
+                            epoch=int(epoch),
+                            code="ricci_negative_curvature_surge",
+                            severity="high",
+                            task_id=str(summary.task_id),
+                            concept_id=None,
+                            score=float(summary.negative_edge_fraction),
+                            message=(
+                                f"Task '{summary.task_id}' has high negative-curvature edge fraction "
+                                f"({summary.negative_edge_fraction:.3f})."
+                            ),
+                            details={
+                                "negative_edge_fraction": float(summary.negative_edge_fraction),
+                                "strong_negative_edge_fraction": float(summary.strong_negative_edge_fraction),
+                                "mean_curvature": float(summary.mean_curvature),
+                            },
+                        )
+                    )
+
+                if float(summary.strong_negative_edge_fraction) >= float(self.config.ricci_strong_negative_fraction_alert):
+                    alerts.append(
+                        AlertRecord(
+                            run_id=str(run_id),
+                            epoch=int(epoch),
+                            code="ricci_bridge_concentration",
+                            severity="high",
+                            task_id=str(summary.task_id),
+                            concept_id=None,
+                            score=float(summary.strong_negative_edge_fraction),
+                            message=(
+                                f"Task '{summary.task_id}' has concentrated strong-negative curvature bridges "
+                                f"({summary.strong_negative_edge_fraction:.3f})."
+                            ),
+                            details={
+                                "strong_negative_edge_fraction": float(summary.strong_negative_edge_fraction),
+                                "min_curvature": float(summary.min_curvature),
+                                "top_negative_src": summary.top_negative_src,
+                                "top_negative_dst": summary.top_negative_dst,
+                            },
+                        )
+                    )
+
+                if float(summary.min_curvature) <= float(self.config.ricci_min_curvature_alert):
+                    alerts.append(
+                        AlertRecord(
+                            run_id=str(run_id),
+                            epoch=int(epoch),
+                            code="ricci_extreme_negative_bridge",
+                            severity="critical",
+                            task_id=str(summary.task_id),
+                            concept_id=None,
+                            score=float(summary.min_curvature),
+                            message=(
+                                f"Task '{summary.task_id}' has an extreme negative-curvature bridge edge "
+                                f"({summary.top_negative_src}->{summary.top_negative_dst}, "
+                                f"k={summary.min_curvature:.3f})."
+                            ),
+                            details={
+                                "min_curvature": float(summary.min_curvature),
+                                "top_negative_src": summary.top_negative_src,
+                                "top_negative_dst": summary.top_negative_dst,
                             },
                         )
                     )

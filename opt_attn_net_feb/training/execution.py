@@ -13,9 +13,10 @@ import pandas as pd
 import torch
 from optuna.trial import Trial
 
+from ..callbacks.concept_rl import ConceptRLControllerCallback, ConceptRLPolicyConfig
 from ..data.collate import collate_export, collate_train
 from ..data.datasets import MILExportDataset, MILTrainDataset
-from ..data.exports import export_leaderboard_attention
+from ..data.exports import export_leaderboard_attention, export_prediction_text_explanations
 from ..utils.constants import TASK_COLS
 from ..utils.data_io import align_by_id
 from ..utils.ops import (
@@ -32,10 +33,12 @@ from ..utils.ops import (
     pos_weight_per_task,
     set_all_seeds,
 )
+from ..utils.progress import log_event, log_step
 from .builders import DataLoaderBuilder, LoaderConfig, MILModelBuilder
 from .configs import HPOConfig
 from .explainability_runtime import (
     FinalExplainabilityConfig,
+    build_positive_concept_targets,
     build_lambda_vol_callback,
     make_monitor_loader,
     prepare_chem_ace_bundle,
@@ -351,9 +354,18 @@ class MILFoldTrainer:
         fold_id: int,
     ) -> Tuple[float, Dict[str, Any]]:
         cfg = self.hpo_config
+        log_event(
+            "START",
+            "hpo.fold.run",
+            trial=int(self.trial.number),
+            fold=int(fold_id),
+            n_train=int(len(train_idx)),
+            n_val=int(len(val_idx)),
+        )
 
         set_all_seeds(int(self.run_config.seed) + 5000 * int(fold_id) + int(self.trial.number))
 
+        log_event("INFO", "hpo.fold.compute_loss_weighting", trial=int(self.trial.number), fold=int(fold_id))
         lam = compute_lam(cfg.loss, y_train=self.data.y_cls[train_idx])
         posw = pos_weight_per_task(
             self.data.y_cls[train_idx],
@@ -361,6 +373,7 @@ class MILFoldTrainer:
         )
         gamma_t = compute_gamma(cfg.loss)
 
+        log_event("INFO", "hpo.fold.standardize_aux_targets", trial=int(self.trial.number), fold=int(fold_id))
         mu_abs, sd_abs = fit_standardizer(self.data.y_abs, self.data.m_abs, train_idx)
         mu_f, sd_f = fit_standardizer(self.data.y_fluo, self.data.m_fluo, train_idx)
         y_abs_sc = apply_standardizer(self.data.y_abs, mu_abs, sd_abs)
@@ -378,6 +391,14 @@ class MILFoldTrainer:
         ids_tr = [self.data.ids[i] for i in train_idx]
         ids_va = [self.data.ids[i] for i in val_idx]
 
+        log_event(
+            "INFO",
+            "hpo.fold.build_datasets",
+            trial=int(self.trial.number),
+            fold=int(fold_id),
+            n_train_ids=int(len(ids_tr)),
+            n_val_ids=int(len(ids_va)),
+        )
         ds_tr = MILTrainDataset(
             ids_tr,
             self.data.X2d_scaled[train_idx],
@@ -415,6 +436,14 @@ class MILFoldTrainer:
             seed=int(self.run_config.seed) + 999 + int(fold_id),
         )
 
+        log_event(
+            "INFO",
+            "hpo.fold.build_dataloaders",
+            trial=int(self.trial.number),
+            fold=int(fold_id),
+            batch_size=int(cfg.runtime.batch_size),
+            balanced_sampler=bool(cfg.sampler.use_balanced_batch_sampler),
+        )
         if bool(cfg.sampler.use_balanced_batch_sampler):
             batch_sampler = make_balanced_batch_sampler(
                 self.data.y_cls[train_idx],
@@ -465,6 +494,7 @@ class MILFoldTrainer:
             class_weight_cap=float(cfg.loss.bitmask_group_weight_cap),
         )
 
+        log_event("INFO", "hpo.fold.build_model", trial=int(self.trial.number), fold=int(fold_id))
         model = MILModelBuilder.build(
             config=cfg,
             mol_dim=int(self.data.X2d_scaled.shape[1]),
@@ -493,7 +523,8 @@ class MILFoldTrainer:
             ckpt_dir=str(fold_ckpt_dir),
             trial=self.trial,
         )
-        trainer.fit(model, dl_tr, dl_va)
+        with log_step("hpo.fold.fit", trial=int(self.trial.number), fold=int(fold_id)):
+            trainer.fit(model, dl_tr, dl_va)
 
         epochs_trained = int(trainer.current_epoch) + 1
 
@@ -506,7 +537,8 @@ class MILFoldTrainer:
                 model.load_state_dict(ckpt["state_dict"], strict=True)
 
         evaluator = ModelEvaluator(device=self.eval_device)
-        best_macro, best_aps, best_macro_auc, best_aucs = evaluator.eval_best_epoch(model, dl_va)
+        with log_step("hpo.fold.eval", trial=int(self.trial.number), fold=int(fold_id)):
+            best_macro, best_aps, best_macro_auc, best_aucs = evaluator.eval_best_epoch(model, dl_va)
         best_min = float(np.min(best_aps))
 
         min_w = float(cfg.objective.min_w)
@@ -517,6 +549,16 @@ class MILFoldTrainer:
             f"best_epoch={best_epoch} best_macro_pr_auc={best_macro:.6f} min_pr_auc={best_min:.6f} "
             f"best_macro_roc_auc={best_macro_auc:.6f} pr_aucs={best_aps} roc_aucs={best_aucs} "
             f"score={fold_score:.6f} mode={cfg.objective.mode} min_w={min_w:.2f}"
+        )
+        log_event(
+            "INFO",
+            "hpo.fold.metrics",
+            trial=int(self.trial.number),
+            fold=int(fold_id),
+            score=f"{fold_score:.6f}",
+            macro_pr_auc=f"{best_macro:.6f}",
+            macro_roc_auc=f"{best_macro_auc:.6f}",
+            min_pr_auc=f"{best_min:.6f}",
         )
 
         detail = {
@@ -555,6 +597,13 @@ class MILFoldTrainer:
             torch.cuda.empty_cache()
         gc.collect()
 
+        log_event(
+            "DONE",
+            "hpo.fold.run",
+            trial=int(self.trial.number),
+            fold=int(fold_id),
+            score=f"{fold_score:.6f}",
+        )
         return fold_score, detail
 
 
@@ -579,6 +628,7 @@ class MILCrossValidator:
         self.run_config = run_config
 
     def evaluate_trial(self, trial: Trial) -> float:
+        log_event("START", "hpo.trial.evaluate", trial=int(trial.number))
         params = search_space(trial)
         cfg = HPOConfig.from_params(params)
         if str(cfg.objective.mode) != "macro_plus_min":
@@ -596,6 +646,13 @@ class MILCrossValidator:
         scores: List[float] = []
         fold_detail: Dict[str, Any] = {}
         for step, (tr, va, fold_id) in enumerate(self.data.folds_info):
+            log_event(
+                "INFO",
+                "hpo.trial.fold_start",
+                trial=int(trial.number),
+                step=int(step),
+                fold=int(fold_id),
+            )
             fold_score, detail = fold_runner.run_fold(
                 train_idx=np.asarray(tr, dtype=np.int64),
                 val_idx=np.asarray(va, dtype=np.int64),
@@ -606,10 +663,24 @@ class MILCrossValidator:
 
             trial.report(float(np.mean(scores)), step=step)
             if trial.should_prune():
+                log_event(
+                    "WARN",
+                    "hpo.trial.pruned",
+                    trial=int(trial.number),
+                    step=int(step),
+                    mean_score=f"{float(np.mean(scores)):.6f}",
+                )
                 raise optuna.TrialPruned()
 
         trial.set_user_attr("fold_detail", fold_detail)
-        return float(np.mean(scores))
+        mean_score = float(np.mean(scores))
+        log_event(
+            "DONE",
+            "hpo.trial.evaluate",
+            trial=int(trial.number),
+            mean_score=f"{mean_score:.6f}",
+        )
+        return mean_score
 
 
 class StudyArtifactsWriter:
@@ -665,46 +736,54 @@ class MILStudyRunner:
         return f"sqlite:///{(self.config.outdir / f'{self.config.study_name}.sqlite3').as_posix()}"
 
     def run(self) -> optuna.Study:
-        self.config.outdir.mkdir(parents=True, exist_ok=True)
-        sampler = optuna.samplers.TPESampler(seed=int(self.config.seed))
-        if str(self.config.pruner_kind).lower() == "median":
-            pruner = optuna.pruners.MedianPruner(
-                n_startup_trials=int(self.config.pruner_startup_trials),
-                n_warmup_steps=int(self.config.pruner_warmup_steps),
-            )
-        else:
-            # Default: less aggressive than median pruning for sparse multitask AP.
-            pruner = optuna.pruners.PercentilePruner(
-                percentile=float(self.config.pruner_percentile),
-                n_startup_trials=int(self.config.pruner_startup_trials),
-                n_warmup_steps=int(self.config.pruner_warmup_steps),
-            )
-        study = optuna.create_study(
-            direction=str(self.config.direction),
-            sampler=sampler,
-            pruner=pruner,
+        with log_step(
+            "hpo.study.run",
             study_name=str(self.config.study_name),
-            storage=self._make_storage(),
-            load_if_exists=True,
-        )
-        study.optimize(
-            self.cross_validator.evaluate_trial,
             n_trials=int(self.config.n_trials),
-            gc_after_trial=True,
-            catch=(RuntimeError, ValueError, FloatingPointError),
-        )
-        StudyArtifactsWriter.save_study_artifacts(
-            outdir=self.config.outdir,
-            study=study,
-            prefix=self.config.study_name,
-        )
-        StudyArtifactsWriter.save_best_fold_metrics(
-            outdir=self.config.outdir,
-            prefix=self.config.study_name,
-            fold_metrics=study.best_trial.user_attrs.get("fold_detail", {}),
-        )
-        print(f"[HPO] best macro AP (CV mean) = {study.best_value:.6f}")
-        return study
+            pruner=str(self.config.pruner_kind),
+        ):
+            self.config.outdir.mkdir(parents=True, exist_ok=True)
+            sampler = optuna.samplers.TPESampler(seed=int(self.config.seed))
+            if str(self.config.pruner_kind).lower() == "median":
+                pruner = optuna.pruners.MedianPruner(
+                    n_startup_trials=int(self.config.pruner_startup_trials),
+                    n_warmup_steps=int(self.config.pruner_warmup_steps),
+                )
+            else:
+                # Default: less aggressive than median pruning for sparse multitask AP.
+                pruner = optuna.pruners.PercentilePruner(
+                    percentile=float(self.config.pruner_percentile),
+                    n_startup_trials=int(self.config.pruner_startup_trials),
+                    n_warmup_steps=int(self.config.pruner_warmup_steps),
+                )
+            study = optuna.create_study(
+                direction=str(self.config.direction),
+                sampler=sampler,
+                pruner=pruner,
+                study_name=str(self.config.study_name),
+                storage=self._make_storage(),
+                load_if_exists=True,
+            )
+            log_event("INFO", "hpo.study.optimize.start")
+            study.optimize(
+                self.cross_validator.evaluate_trial,
+                n_trials=int(self.config.n_trials),
+                gc_after_trial=True,
+                catch=(RuntimeError, ValueError, FloatingPointError),
+            )
+            log_event("INFO", "hpo.study.optimize.done", best_value=f"{float(study.best_value):.6f}")
+            StudyArtifactsWriter.save_study_artifacts(
+                outdir=self.config.outdir,
+                study=study,
+                prefix=self.config.study_name,
+            )
+            StudyArtifactsWriter.save_best_fold_metrics(
+                outdir=self.config.outdir,
+                prefix=self.config.study_name,
+                fold_metrics=study.best_trial.user_attrs.get("fold_detail", {}),
+            )
+            print(f"[HPO] best macro AP (CV mean) = {study.best_value:.6f}")
+            return study
 
 
 class MILFinalTrainer:
@@ -740,6 +819,13 @@ class MILFinalTrainer:
         self.eval_device = _resolve_device(config.trainer.accelerator)
 
     def run(self, *, outdir: Path, best_params: Dict[str, Any], data: MILFinalData) -> None:
+        log_event(
+            "START",
+            "final.run",
+            outdir=str(outdir),
+            leaderboard_split=str(data.leaderboard_split),
+            n_best_params=int(len(best_params)),
+        )
         cfg = HPOConfig.from_params(
             best_params,
             fallback_lambda_power=1.0,
@@ -748,6 +834,7 @@ class MILFinalTrainer:
             fallback_pos_weight_clip=50.0,
         )
 
+        log_event("INFO", "final.prepare_splits")
         df_tr = data.df_full[data.df_full[data.split_col] == "train"].copy().reset_index(drop=True)
         df_lb = (
             data.df_full[data.df_full[data.split_col] == data.leaderboard_split]
@@ -756,13 +843,16 @@ class MILFinalTrainer:
         )
         if len(df_lb) == 0:
             raise ValueError(f"No rows with split == '{data.leaderboard_split}'")
+        log_event("INFO", "final.split_counts", n_train=int(len(df_tr)), n_lb=int(len(df_lb)))
 
         ids_tr = df_tr[data.id_col].astype(str).tolist()
         ids_lb = df_lb[data.id_col].astype(str).tolist()
 
+        log_event("INFO", "final.align_2d_features")
         X2d_tr = align_by_id(data.X2d_file_ids, data.X2d_file, ids_tr)
         X2d_lb = align_by_id(data.X2d_file_ids, data.X2d_file, ids_lb)
 
+        log_event("INFO", "final.drop_ids_without_bags")
         ids_tr, X2d_tr, df_tr = drop_ids_without_bags(
             ids=ids_tr,
             X2d=X2d_tr,
@@ -777,7 +867,9 @@ class MILFinalTrainer:
             id2pos=data.id2pos,
             id_col=data.id_col,
         )
+        log_event("INFO", "final.ids_after_drop", n_train=int(len(ids_tr)), n_lb=int(len(ids_lb)))
 
+        log_event("INFO", "final.build_targets_and_weights")
         y_tr = coerce_binary_labels(df_tr)
         w_tr = build_task_weights(df_tr)
         y_abs_tr, m_abs_tr, y_fluo_tr, m_fluo_tr = build_aux_targets_and_masks(df_tr)
@@ -788,6 +880,7 @@ class MILFinalTrainer:
         y_abs_lb, m_abs_lb, y_fluo_lb, m_fluo_lb = build_aux_targets_and_masks(df_lb)
         w_abs_lb, w_fluo_lb = build_aux_weights(df_lb)
 
+        log_event("INFO", "final.standardize_aux_targets")
         tr_idx = np.arange(len(df_tr), dtype=np.int64)
         mu_abs, sd_abs = fit_standardizer(y_abs_tr, m_abs_tr, tr_idx)
         mu_f, sd_f = fit_standardizer(y_fluo_tr, m_fluo_tr, tr_idx)
@@ -796,6 +889,7 @@ class MILFinalTrainer:
         y_fluo_tr_sc = apply_standardizer(y_fluo_tr, mu_f, sd_f)
         y_fluo_lb_sc = apply_standardizer(y_fluo_lb, mu_f, sd_f)
 
+        log_event("INFO", "final.compute_loss_weighting")
         lam = compute_lam(
             cfg.loss,
             y_train=y_tr,
@@ -823,6 +917,67 @@ class MILFinalTrainer:
             class_weight_cap=float(cfg.loss.bitmask_group_weight_cap),
         )
 
+        log_event(
+            "INFO",
+            "final.explainability_flags",
+            run_chem_ace=bool(self.config.explainability.run_chem_ace if self.config.explainability else False),
+            run_lambda_vol=bool(self.config.explainability.run_lambda_vol if self.config.explainability else False),
+            run_concept_rl=bool(self.config.explainability.run_concept_rl if self.config.explainability else False),
+        )
+        explain_cfg = self.config.explainability
+        if (
+            explain_cfg is not None
+            and (bool(explain_cfg.run_lambda_vol) or bool(explain_cfg.run_concept_rl))
+            and not bool(explain_cfg.run_chem_ace)
+        ):
+            explain_cfg = replace(explain_cfg, run_chem_ace=True)
+
+        chem_bundle = None
+        if explain_cfg is not None and bool(explain_cfg.run_chem_ace):
+            log_event("INFO", "final.prepare_chem_ace_bundle.start")
+            ids_scope = sorted(set(ids_tr).union(set(ids_lb)))
+            chem_bundle = prepare_chem_ace_bundle(
+                config=explain_cfg,
+                outdir=outdir,
+                seed=int(self.config.seed),
+                df_full=data.df_full,
+                id_col=data.id_col,
+                ids_scope=ids_scope,
+                ids_2d_file=data.X2d_file_ids,
+                X2d_file=data.X2d_file,
+                starts=data.starts,
+                counts=data.counts,
+                id2pos=data.id2pos,
+                conf_sorted=data.conf_sorted,
+                Xinst_sorted=data.Xinst_sorted,
+            )
+            log_event(
+                "INFO",
+                "final.prepare_chem_ace_bundle.done",
+                n_concepts=int(len(chem_bundle.concept_ids)),
+            )
+
+        concept_rl_targets: dict[int, tuple[str, ...]] = {}
+        if explain_cfg is not None and bool(explain_cfg.run_concept_rl) and chem_bundle is not None:
+            log_event("INFO", "final.concept_rl.build_targets")
+            concept_rl_targets = build_positive_concept_targets(
+                config=explain_cfg,
+                ids_train=ids_tr,
+                y_cls_train=y_tr,
+                chem_bundle=chem_bundle,
+            )
+
+        rl_active = bool(
+            explain_cfg is not None
+            and bool(explain_cfg.run_concept_rl)
+            and (chem_bundle is not None)
+            and any(len(v) > 0 for v in concept_rl_targets.values())
+        )
+        if bool(explain_cfg is not None and bool(explain_cfg.run_concept_rl) and not rl_active):
+            print("[FINAL][CONCEPT-RL] requested but disabled (no target concepts available).")
+        log_event("INFO", "final.concept_rl.status", rl_active=bool(rl_active))
+
+        log_event("INFO", "final.build_datasets")
         ds_tr = MILTrainDataset(
             ids_tr,
             X2d_tr,
@@ -838,8 +993,10 @@ class MILFinalTrainer:
             data.counts,
             data.id2pos,
             data.Xinst_sorted,
+            conf_sorted=(data.conf_sorted if rl_active else None),
             max_instances=0,
             seed=int(self.config.seed),
+            include_metadata=bool(rl_active),
         )
         ds_lb = MILTrainDataset(
             ids_lb,
@@ -860,29 +1017,12 @@ class MILFinalTrainer:
             seed=int(self.config.seed) + 999,
         )
 
-        explain_cfg = self.config.explainability
-        if explain_cfg is not None and bool(explain_cfg.run_lambda_vol) and not bool(explain_cfg.run_chem_ace):
-            explain_cfg = replace(explain_cfg, run_chem_ace=True)
-
-        chem_bundle = None
-        if explain_cfg is not None and bool(explain_cfg.run_chem_ace):
-            ids_scope = sorted(set(ids_tr).union(set(ids_lb)))
-            chem_bundle = prepare_chem_ace_bundle(
-                config=explain_cfg,
-                outdir=outdir,
-                seed=int(self.config.seed),
-                df_full=data.df_full,
-                id_col=data.id_col,
-                ids_scope=ids_scope,
-                ids_2d_file=data.X2d_file_ids,
-                X2d_file=data.X2d_file,
-                starts=data.starts,
-                counts=data.counts,
-                id2pos=data.id2pos,
-                conf_sorted=data.conf_sorted,
-                Xinst_sorted=data.Xinst_sorted,
-            )
-
+        log_event(
+            "INFO",
+            "final.build_dataloaders",
+            batch_size=int(cfg.runtime.batch_size),
+            balanced_sampler=bool(cfg.sampler.use_balanced_batch_sampler),
+        )
         if bool(cfg.sampler.use_balanced_batch_sampler):
             sampler_tr = make_balanced_batch_sampler(
                 y_tr,
@@ -927,6 +1067,7 @@ class MILFinalTrainer:
 
         lambda_vol_cb = None
         if explain_cfg is not None and bool(explain_cfg.run_lambda_vol) and (chem_bundle is not None):
+            log_event("INFO", "final.lambda_vol.build_callback.start")
             monitor_loader = make_monitor_loader(
                 ids=ids_lb,
                 x2d=X2d_lb,
@@ -946,7 +1087,9 @@ class MILFinalTrainer:
                 monitor_loader=monitor_loader,
                 chem_bundle=chem_bundle,
             )
+            log_event("INFO", "final.lambda_vol.build_callback.done")
 
+        log_event("INFO", "final.build_model")
         model = MILModelBuilder.build(
             config=cfg,
             mol_dim=int(X2d_tr.shape[1]),
@@ -958,8 +1101,51 @@ class MILFinalTrainer:
             bitmask_group_class_weight=bitmask_group_class_weight,
         )
 
+        if rl_active and explain_cfg is not None and chem_bundle is not None:
+            model.configure_rl_concept_guidance(
+                task_target_concepts=concept_rl_targets,
+                concept_conf_map=dict(chem_bundle.concept_conf_map),
+                concept_mol_map=dict(chem_bundle.concept_mol_map),
+                init_scale=float(explain_cfg.concept_rl_init_scale),
+                max_scale=float(explain_cfg.concept_rl_max_scale),
+            )
+            print(
+                "[FINAL][CONCEPT-RL] enabled "
+                f"(targets_per_task={[len(v) for _, v in sorted(concept_rl_targets.items())]})."
+            )
+            log_event(
+                "INFO",
+                "final.concept_rl.enabled",
+                targets_per_task=[len(v) for _, v in sorted(concept_rl_targets.items())],
+            )
+
         final_dir = outdir / "final_best_train_vs_leaderboard"
         final_dir.mkdir(parents=True, exist_ok=True)
+        log_event("INFO", "final.output_dir_ready", final_dir=str(final_dir))
+
+        rl_cb = None
+        rl_policy_path = None
+        if rl_active and explain_cfg is not None:
+            rl_policy_path = final_dir / "concept_rl_policy_history.json"
+            rl_cb = ConceptRLControllerCallback(
+                config=ConceptRLPolicyConfig(
+                    init_mean=float(explain_cfg.concept_rl_init_scale),
+                    sigma=float(explain_cfg.concept_rl_policy_sigma),
+                    learning_rate=float(explain_cfg.concept_rl_policy_lr),
+                    max_scale=float(explain_cfg.concept_rl_max_scale),
+                    reward_alignment_w=float(explain_cfg.concept_rl_reward_alignment_w),
+                    baseline_momentum=float(explain_cfg.concept_rl_baseline_momentum),
+                    reward_key="val_macro_ap",
+                    alignment_key="train_concept_alignment",
+                ),
+                out_json_path=str(rl_policy_path),
+            )
+
+        extra_callbacks = []
+        if lambda_vol_cb is not None:
+            extra_callbacks.append(lambda_vol_cb)
+        if rl_cb is not None:
+            extra_callbacks.append(rl_cb)
 
         trainer_cfg = LightningTrainerConfig(
             max_epochs=int(self.config.trainer.max_epochs),
@@ -975,9 +1161,10 @@ class MILFinalTrainer:
         trainer, ckpt_cb = LightningTrainerFactory(trainer_cfg).build(
             ckpt_dir=str(final_dir),
             trial=None,
-            extra_callbacks=([lambda_vol_cb] if lambda_vol_cb is not None else None),
+            extra_callbacks=(extra_callbacks if extra_callbacks else None),
         )
-        trainer.fit(model, dl_tr, dl_val)
+        with log_step("final.trainer.fit"):
+            trainer.fit(model, dl_tr, dl_val)
 
         best_epoch = None
         best_ckpt_path = None
@@ -989,8 +1176,10 @@ class MILFinalTrainer:
                 best_ckpt_path = str(best_path)
                 model.load_state_dict(ckpt["state_dict"], strict=True)
                 print(f"[FINAL] loaded best ckpt: {best_path}")
+                log_event("INFO", "final.best_ckpt_loaded", path=str(best_path), best_epoch=best_epoch)
 
         evaluator = ModelEvaluator(device=self.eval_device)
+        log_event("INFO", "final.eval.start")
         macro_ap_lb, aps_lb, macro_auc_lb, aucs_lb = evaluator.eval_best_epoch(model, dl_val)
         eval_json = {
             "macro_ap": float(macro_ap_lb),
@@ -1016,6 +1205,13 @@ class MILFinalTrainer:
             f"[FINAL] leaderboard eval: macro_pr_auc={macro_ap_lb:.6f} macro_roc_auc={macro_auc_lb:.6f} "
             f"pr_aucs={aps_lb} roc_aucs={aucs_lb}"
         )
+        log_event(
+            "INFO",
+            "final.eval.metrics",
+            macro_pr_auc=f"{macro_ap_lb:.6f}",
+            macro_roc_auc=f"{macro_auc_lb:.6f}",
+            best_epoch=best_epoch,
+        )
 
         pd.DataFrame(
             {
@@ -1040,8 +1236,35 @@ class MILFinalTrainer:
             batch_size=min(64, int(cfg.runtime.batch_size)),
             collate_fn=collate_export,
         )
+        log_event("INFO", "final.export.attention.start")
         out_path = Path(self.config.attn_out) if self.config.attn_out else (outdir / "leaderboard_attn.csv")
-        export_leaderboard_attention(model, export_dl, device=self.eval_device, out_path=out_path)
+        written_attn_path = export_leaderboard_attention(
+            model,
+            export_dl,
+            device=self.eval_device,
+            out_path=out_path,
+        )
+        log_event("INFO", "final.export.attention.done", path=str(written_attn_path))
+
+        lv_art = getattr(lambda_vol_cb, "last_artifacts", None) if lambda_vol_cb is not None else None
+
+        explained_pred_path: Path | None = None
+        if chem_bundle is not None:
+            log_event("INFO", "final.export.text_explanations.start")
+            explained_pred_path = written_attn_path.with_name(f"{written_attn_path.stem}_explained.csv")
+            explained_pred_path = export_prediction_text_explanations(
+                pred_table_path=written_attn_path,
+                out_path=explained_pred_path,
+                concept_ids=chem_bundle.concept_ids,
+                concept_metadata=chem_bundle.concept_metadata,
+                concept_mol_map=chem_bundle.concept_mol_map,
+                concept_conf_map=chem_bundle.concept_conf_map,
+                task_cols=TASK_COLS,
+                ricci_edges_csv=(None if lv_art is None else lv_art.ricci_edges_csv),
+                top_k=3,
+                bridge_threshold=0.20,
+            )
+            log_event("INFO", "final.export.text_explanations.done", path=str(explained_pred_path))
 
         explainability_payload: dict[str, Any] = {}
         if chem_bundle is not None:
@@ -1052,9 +1275,11 @@ class MILFinalTrainer:
                 "concept_set_id": str(chem_bundle.concept_set_id),
                 "n_concepts": int(len(chem_bundle.concept_ids)),
                 "concept_ids": [str(x) for x in chem_bundle.concept_ids],
+                "prediction_explanations_csv": (
+                    None if explained_pred_path is None else str(explained_pred_path)
+                ),
             }
         if lambda_vol_cb is not None:
-            lv_art = getattr(lambda_vol_cb, "last_artifacts", None)
             if lv_art is not None:
                 explainability_payload["lambda_vol"] = {
                     "tensor_npz": str(lv_art.tensor_npz),
@@ -1064,12 +1289,28 @@ class MILFinalTrainer:
                     "alerts_json": str(lv_art.alerts_json),
                     "recommendations_json": str(lv_art.recommendations_json),
                     "manifold_html_by_task": dict(lv_art.manifold_html_by_task),
+                    "ricci_edges_csv": lv_art.ricci_edges_csv,
+                    "ricci_summary_csv": lv_art.ricci_summary_csv,
+                    "ricci_flow_npz": lv_art.ricci_flow_npz,
                 }
+        if rl_cb is not None and rl_policy_path is not None and rl_policy_path.exists():
+            explainability_payload["concept_rl"] = {
+                "policy_history_json": str(rl_policy_path),
+                "target_concepts_by_task": {
+                    str(int(k)): [str(x) for x in v] for k, v in concept_rl_targets.items()
+                },
+            }
 
         if explainability_payload:
             (final_dir / "explainability_artifacts.json").write_text(
                 json.dumps(explainability_payload, indent=2)
             )
+            log_event(
+                "INFO",
+                "final.export.explainability_payload",
+                path=str(final_dir / "explainability_artifacts.json"),
+            )
+        log_event("DONE", "final.run", final_dir=str(final_dir))
 
 
 __all__ = [

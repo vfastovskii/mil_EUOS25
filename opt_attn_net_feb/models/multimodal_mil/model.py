@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pytorch_lightning as pl
@@ -298,6 +298,101 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self._val_y: List[np.ndarray] = []
         self._val_w: List[np.ndarray] = []
 
+        # Optional concept-guidance RL controls (configured externally for final runs).
+        self.rl_enabled: bool = False
+        self.rl_guidance_scale: float = 0.0
+        self.rl_guidance_scale_max: float = 0.2
+        self.rl_task_target_concepts: list[tuple[str, ...]] = [tuple() for _ in range(NUM_TASKS)]
+        self.rl_target_conf_pairs_by_task: list[set[tuple[str, str]]] = [set() for _ in range(NUM_TASKS)]
+        self.rl_target_mols_by_task: list[set[str]] = [set() for _ in range(NUM_TASKS)]
+
+    def configure_rl_concept_guidance(
+        self,
+        *,
+        task_target_concepts: Dict[int, Sequence[str]],
+        concept_conf_map: Dict[str, Set[Tuple[str, str]]],
+        concept_mol_map: Dict[str, Set[str]],
+        init_scale: float = 0.02,
+        max_scale: float = 0.20,
+    ) -> None:
+        """Attach concept-target guidance maps used by the RL controller callback."""
+        self.rl_task_target_concepts = [tuple() for _ in range(NUM_TASKS)]
+        self.rl_target_conf_pairs_by_task = [set() for _ in range(NUM_TASKS)]
+        self.rl_target_mols_by_task = [set() for _ in range(NUM_TASKS)]
+
+        any_target = False
+        for ti in range(NUM_TASKS):
+            concept_ids = [str(x) for x in task_target_concepts.get(int(ti), [])]
+            self.rl_task_target_concepts[ti] = tuple(concept_ids)
+            if concept_ids:
+                any_target = True
+            conf_pairs = self.rl_target_conf_pairs_by_task[ti]
+            mols = self.rl_target_mols_by_task[ti]
+            for cid in concept_ids:
+                for mol_id, conf_id in concept_conf_map.get(str(cid), set()):
+                    conf_pairs.add((str(mol_id), str(conf_id)))
+                for mol_id in concept_mol_map.get(str(cid), set()):
+                    mols.add(str(mol_id))
+
+        self.rl_enabled = bool(any_target)
+        self.rl_guidance_scale_max = float(max(0.0, max_scale))
+        self.set_rl_guidance_scale(float(init_scale))
+
+    def set_rl_guidance_scale(self, value: float) -> None:
+        """Update concept-guidance strength used in training loss."""
+        v = float(value)
+        if not np.isfinite(v):
+            return
+        self.rl_guidance_scale = float(np.clip(v, 0.0, max(self.rl_guidance_scale_max, 0.0)))
+
+    def _concept_alignment_score(
+        self,
+        *,
+        y_cls: torch.Tensor,
+        attn: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+        mol_ids: Sequence[str],
+        conf_pad: np.ndarray,
+    ) -> torch.Tensor:
+        """Average attention mass on task-target concepts for positive labels."""
+        if (not self.rl_enabled) or attn is None:
+            return torch.zeros((), dtype=y_cls.dtype, device=y_cls.device)
+
+        total = torch.zeros((), dtype=attn.dtype, device=attn.device)
+        denom = 0
+        bsz = int(y_cls.shape[0])
+
+        for b in range(bsz):
+            mol_id = str(mol_ids[b])
+            valid = ~key_padding_mask[b]
+            L = int(valid.sum().item())
+            if L <= 0:
+                continue
+            confs = [str(x) for x in conf_pad[b, :L].tolist()]
+
+            for t in range(NUM_TASKS):
+                if float(y_cls[b, t].detach().item()) <= 0.5:
+                    continue
+                denom += 1
+                w = attn[b, t, :L]
+                w = w / (w.sum() + 1e-8)
+
+                target_pairs = self.rl_target_conf_pairs_by_task[t]
+                target_mols = self.rl_target_mols_by_task[t]
+                idx = [i for i, cid in enumerate(confs) if (mol_id, str(cid)) in target_pairs]
+                if idx:
+                    idx_t = torch.tensor(idx, dtype=torch.long, device=attn.device)
+                    score = w.index_select(0, idx_t).sum()
+                elif mol_id in target_mols:
+                    score = torch.ones((), dtype=attn.dtype, device=attn.device)
+                else:
+                    score = torch.zeros((), dtype=attn.dtype, device=attn.device)
+                total = total + score
+
+        if denom <= 0:
+            return torch.zeros((), dtype=attn.dtype, device=attn.device)
+        return total / float(denom)
+
     def forward(
         self,
         x2d: torch.Tensor,              # [B,F2]
@@ -381,14 +476,28 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         return self.mixer_post_norm(z_tasks)
 
     def training_step(self, batch, batch_idx):
-        x2d, x3d, kpm, y_cls, w_cls, y_abs, m_abs, w_abs, y_fluo, m_fluo, w_fluo = batch
-        logits, abs_out, fluo_out, bitmask_logits = self(
-            x2d,
-            x3d,
-            kpm,
-            return_attn=False,
-            return_bitmask=True,
-        )
+        x2d, x3d, kpm, y_cls, w_cls, y_abs, m_abs, w_abs, y_fluo, m_fluo, w_fluo = batch[:11]
+        mol_ids = batch[11] if len(batch) >= 13 else None
+        conf_pad = batch[12] if len(batch) >= 13 else None
+        use_attn_guidance = bool(self.rl_enabled and mol_ids is not None and conf_pad is not None)
+
+        if use_attn_guidance:
+            logits, abs_out, fluo_out, bitmask_logits, attn = self(
+                x2d,
+                x3d,
+                kpm,
+                return_attn=True,
+                return_bitmask=True,
+            )
+        else:
+            logits, abs_out, fluo_out, bitmask_logits = self(
+                x2d,
+                x3d,
+                kpm,
+                return_attn=False,
+                return_bitmask=True,
+            )
+            attn = None
         bitmask_targets = self._bitmask_group_targets(y_cls)
 
         with autocast(enabled=False):
@@ -418,9 +527,21 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 lambda_aux_fluo=self.lambda_aux_fluo,
                 lambda_aux_bitmask=self.lambda_aux_bitmask,
             )
+            concept_alignment = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
+            concept_bonus = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
+            if use_attn_guidance and attn is not None and float(self.rl_guidance_scale) > 0.0:
+                concept_alignment = self._concept_alignment_score(
+                    y_cls=y_cls,
+                    attn=attn,
+                    key_padding_mask=kpm,
+                    mol_ids=[str(x) for x in mol_ids],
+                    conf_pad=conf_pad,
+                )
+                concept_bonus = float(self.rl_guidance_scale) * concept_alignment
+            total_loss = losses.total - concept_bonus
 
         bs = int(y_cls.shape[0])
-        self.log("train_loss", losses.total, on_step=False, on_epoch=True, batch_size=bs)
+        self.log("train_loss", total_loss, on_step=False, on_epoch=True, batch_size=bs)
         self.log("train_cls_loss", losses.cls, on_step=False, on_epoch=True, batch_size=bs)
         self.log("train_bitmask_loss", losses.bitmask, on_step=False, on_epoch=True, batch_size=bs)
         self.log("train_per_task_loss_mean", losses.per_task.mean(), on_step=False, on_epoch=True, batch_size=bs)
@@ -431,7 +552,10 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             on_epoch=True,
             batch_size=bs,
         )
-        return losses.total
+        self.log("train_concept_alignment", concept_alignment, on_step=False, on_epoch=True, batch_size=bs)
+        self.log("train_concept_bonus", concept_bonus, on_step=False, on_epoch=True, batch_size=bs)
+        self.log("train_rl_guidance_scale", float(self.rl_guidance_scale), on_step=False, on_epoch=True, batch_size=bs)
+        return total_loss
 
     def on_validation_epoch_start(self):
         self._val_p, self._val_y, self._val_w = [], [], []

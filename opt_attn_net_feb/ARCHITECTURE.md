@@ -20,6 +20,7 @@ The system is a multimodal MIL (Multiple Instance Learning) pipeline for 4-task 
 - Explainability (optional):
   - Chem-ACE (concept discovery + semantic tagging)
   - Lambda-Vol (concept-pressure dynamics across epochs)
+  - Concept-guided RL controller (final training only)
 
 High-level flow:
 1. Parse CLI + build typed config objects.
@@ -30,7 +31,7 @@ High-level flow:
    - train on split `train`
    - evaluate on split `leaderboard`
    - export leaderboard attention/predictions CSV
-   - optional explainability outputs.
+   - optional explainability outputs and optional concept-guided RL control.
 
 ---
 
@@ -1041,17 +1042,23 @@ Query APIs include:
 
 When enabled in final run:
 1. Chem-ACE bundle prepared from train+leaderboard IDs.
-2. Lambda-Vol callback attached to Lightning trainer.
-3. On each validation epoch end:
+2. Optional concept-guided RL controller prepared:
+   - target concepts are selected per task from concepts frequent in positive train samples
+   - train dataset enables molecule/conformer metadata for attention-to-concept alignment
+   - model loss gets a guidance bonus term: `L_total = L_base - s_t * alignment_t`
+   - `s_t` is policy action (guidance scale) sampled/updated by REINFORCE callback
+3. Optional Lambda-Vol callback attached to Lightning trainer.
+4. On each validation epoch end:
    - monitor loader sampled from leaderboard set
    - per-epoch frames collected (TCAV + attention + task metrics)
    - monitor step updates rho/regime/dynamics/alerts/recommendations and DB
-4. On fit end:
+5. On fit end:
    - Lambda-Vol exports finalized artifacts
-5. Final JSON summary:
+   - Concept-RL policy history is exported when enabled
+6. Final JSON summary:
    - `final_best_train_vs_leaderboard/explainability_artifacts.json`
 
-Payload includes paths for Chem-ACE and Lambda-Vol artifacts.
+Payload includes paths for Chem-ACE, Lambda-Vol, and Concept-RL artifacts (when enabled).
 
 ---
 
@@ -1075,6 +1082,20 @@ Key controls:
 - Explainability:
   - Chem-ACE flags and limits
   - Lambda-Vol flags and monitoring limits
+  - Concept-RL flags:
+    - `--run_concept_rl`
+    - `--concept_rl_top_k_per_task`
+    - `--concept_rl_min_pos_coverage`
+    - `--concept_rl_init_scale`
+    - `--concept_rl_max_scale`
+    - `--concept_rl_policy_lr`
+    - `--concept_rl_policy_sigma`
+    - `--concept_rl_reward_alignment_w`
+    - `--concept_rl_baseline_momentum`
+
+Automatic dependency normalization:
+- `--run_lambda_vol` implies `--run_chem_ace`
+- `--run_concept_rl` implies `--run_chem_ace`
 
 Compatibility flags still accepted:
 - `--do_mil` (MIL-only pipeline)
@@ -1398,3 +1419,38 @@ python ../opt_net_fast.py ... --run_hpo --run_lambda_vol
 ```
 
 (`--run_lambda_vol` auto-enables Chem-ACE.)
+## Ricci Geometry Layer (Lambda-Vol Integration)
+
+The explainability pack now includes a discrete graph-Ricci module integrated into Lambda-Vol epoch monitoring:
+
+- Build per-task concept graph from `rho`, `attention_support`, `prevalence`, and absolute TCAV-history correlation.
+- Compute Forman-Ricci curvature on concept edges.
+- Run Ricci-flow-style edge reweighting (iterative length update; similarity is inverse length).
+- Export per-edge/per-task geometry artifacts:
+  - `ricci_edges_long.csv`
+  - `ricci_task_summary.csv`
+  - `ricci_flow_tensors.npz`
+- Emit curvature-driven alerts:
+  - `ricci_negative_curvature_surge`
+  - `ricci_bridge_concentration`
+  - `ricci_extreme_negative_bridge`
+- Feed flowed concept graph into Λ-Vol concept coupling when enabled (`use_flow_as_concept_coupling`).
+
+This geometry layer is an additional control signal and does not replace TCAV/attention/prevalence. It is designed to flag concept bottlenecks and shortcut-like bridge structure during training.
+
+### Prediction + Text Explanation Link
+
+Final prediction export is linked with Chem-ACE semantic concepts and optional Ricci bridge diagnostics:
+
+- Base table: `leaderboard_attn.csv` (or requested path) with `pred_*`, `pred_label_*`, `attn_*`.
+- Enriched table: `*_explained.csv` with:
+  - `top_concepts_<task>`
+  - `top_concept_labels_<task>`
+  - `prediction_explanation_<task>`
+  - `prediction_explanation`
+
+Explanation text is built from:
+- concept activation at molecule/conformer level (`concept_mol_map`, `concept_conf_map`),
+- semantic naming/tags (`label_auto`, concept tags),
+- task attention weight at that row,
+- optional Ricci bridge score from latest epoch (`ricci_edges_long.csv`).

@@ -9,6 +9,7 @@ from .constants import (  # noqa: F401
     TASK_COLS,
     WEIGHT_COLS,
 )
+from .progress import log_event, log_step  # noqa: F401
 
 __all__ = [
     "TASK_COLS",
@@ -18,4 +19,6 @@ __all__ = [
     "NONFEAT_2D",
     "NONFEAT_3D",
     "NONFEAT_QM",
+    "log_event",
+    "log_step",
 ]

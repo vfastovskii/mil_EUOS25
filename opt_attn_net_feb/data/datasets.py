@@ -67,8 +67,10 @@ class MILTrainDataset(Dataset):
         counts: np.ndarray,
         id2pos: Dict[str, int],
         Xinst_sorted: np.ndarray,
+        conf_sorted: np.ndarray | None = None,
         max_instances: int,
         seed: int,
+        include_metadata: bool = False,
     ):
         self.ids = [str(x) for x in ids]
         self.X2d = np.asarray(X2d, dtype=np.float32)
@@ -86,9 +88,14 @@ class MILTrainDataset(Dataset):
         self.counts = counts
         self.id2pos = id2pos
         self.Xinst = Xinst_sorted
+        self.conf = (None if conf_sorted is None else np.asarray(conf_sorted))
 
         self.max_instances = int(max_instances)
         self.rng = np.random.default_rng(seed)
+        self.include_metadata = bool(include_metadata)
+
+        if self.include_metadata and self.conf is None:
+            raise ValueError("conf_sorted is required when include_metadata=True")
 
         if len(self.ids) != self.X2d.shape[0]:
             raise ValueError(f"MILTrainDataset: len(ids)={len(self.ids)} != X2d rows={self.X2d.shape[0]}")
@@ -102,12 +109,15 @@ class MILTrainDataset(Dataset):
         s = int(self.starts[p])
         c = int(self.counts[p])
         bag = self.Xinst[s : s + c]
+        conf = (None if self.conf is None else self.conf[s : s + c].tolist())
 
         if self.max_instances > 0 and bag.shape[0] > self.max_instances:
             idx = self.rng.choice(bag.shape[0], size=self.max_instances, replace=False)
             bag = bag[idx]
+            if conf is not None:
+                conf = [conf[j] for j in idx.tolist()]
 
-        return (
+        core = (
             self.X2d[i],  # np float32 [F2]
             bag,  # np float32 [Ni,F3]
             self.y_cls[i],
@@ -119,6 +129,9 @@ class MILTrainDataset(Dataset):
             self.m_fluo[i],
             self.w_fluo[i],  # [4]
         )
+        if not self.include_metadata:
+            return core
+        return (*core, str(mol_id), [str(x) for x in (conf or [])])
 
 
 class MILExportDataset(Dataset):

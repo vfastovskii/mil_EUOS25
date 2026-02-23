@@ -129,6 +129,44 @@ class RecommendationEngine:
                         ),
                     ]
                 )
+            elif alert.code in {
+                "ricci_negative_curvature_surge",
+                "ricci_bridge_concentration",
+                "ricci_extreme_negative_bridge",
+            }:
+                recs.extend(
+                    [
+                        self._mk(
+                            run_id=run_id,
+                            epoch=epoch,
+                            recommendation_type="enable_concept_graph_rebalancing",
+                            action_level="analysis",
+                            task_id=alert.task_id,
+                            concept_id=alert.concept_id,
+                            rationale=(
+                                "Ricci curvature indicates bottleneck-like concept bridges; "
+                                "apply stronger concept rebalancing and monitor bridge families."
+                            ),
+                            params={
+                                "edge_focus": "negative_curvature_bridges",
+                                "task_id": alert.task_id,
+                            },
+                        ),
+                        self._mk(
+                            run_id=run_id,
+                            epoch=epoch,
+                            recommendation_type="increase_hard_negative_mining_for_bridge_families",
+                            action_level="data",
+                            task_id=alert.task_id,
+                            concept_id=alert.concept_id,
+                            rationale=(
+                                "Bridge-heavy concept geometry can cause shortcut reliance; "
+                                "mine counterexamples around affected concept families."
+                            ),
+                            params={"priority": "high", "task_id": alert.task_id},
+                        ),
+                    ]
+                )
 
         dedup: dict[tuple[str, Optional[str], Optional[str], str], RecommendationRecord] = {}
         for rec in recs:

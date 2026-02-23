@@ -6,6 +6,7 @@ from .config import (
     ExportConfig,
     LambdaVolConfig,
     PolicyConfig,
+    RicciConfig,
     RegimeConfig,
     StoreConfig,
     TrackerConfig,
@@ -13,6 +14,7 @@ from .config import (
 from .analytics import LambdaVolQueryService
 from .integrations import LambdaVolLightningCallback, LambdaVolPyTorchAdapter
 from .monitor import EpochFrames, EpochStepResult, LambdaVolMonitor
+from .ricci import ConceptRicciFlowAnalyzer, RicciEpochOutput
 from .types import (
     AlertRecord,
     ConcentrationMetrics,
@@ -21,6 +23,8 @@ from .types import (
     EpochTaskMetrics,
     PressureRunArtifacts,
     PressureTensorIndex,
+    RicciEdgeMetrics,
+    RicciTaskSummary,
     RecommendationRecord,
     RegimeLabel,
 )
@@ -44,6 +48,11 @@ __all__ = [
     "PolicyConfig",
     "PressureRunArtifacts",
     "PressureTensorIndex",
+    "ConceptRicciFlowAnalyzer",
+    "RicciConfig",
+    "RicciEdgeMetrics",
+    "RicciEpochOutput",
+    "RicciTaskSummary",
     "RecommendationRecord",
     "RegimeConfig",
     "RegimeLabel",

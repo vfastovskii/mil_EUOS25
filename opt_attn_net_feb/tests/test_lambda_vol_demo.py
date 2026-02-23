@@ -10,7 +10,10 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 if str(PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(PKG_ROOT))
 
-from ..entrypoints.lambda_vol_demo import main as lambda_vol_demo_main
+try:
+    from ..entrypoints.lambda_vol_demo import main as lambda_vol_demo_main
+except Exception:  # pragma: no cover
+    from entrypoints.lambda_vol_demo import main as lambda_vol_demo_main
 
 
 class LambdaVolDemoSmokeTest(unittest.TestCase):

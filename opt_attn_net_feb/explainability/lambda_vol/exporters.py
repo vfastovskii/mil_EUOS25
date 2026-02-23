@@ -13,7 +13,15 @@ from sklearn.decomposition import PCA
 from .config import ExportConfig
 from .detectors import summarize_alerts_markdown
 from .optional_deps import has_plotly, has_pyarrow, has_pyvista
-from .types import AlertRecord, EpochConceptMetrics, EpochTaskMetrics, PressureRunArtifacts, RecommendationRecord
+from .types import (
+    AlertRecord,
+    EpochConceptMetrics,
+    EpochTaskMetrics,
+    PressureRunArtifacts,
+    RecommendationRecord,
+    RicciEdgeMetrics,
+    RicciTaskSummary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +46,8 @@ class LambdaVolArtifactExporter:
         recommendations: Sequence[RecommendationRecord],
         concept_metadata: Optional[Mapping[str, Mapping[str, Any]]] = None,
         concept_coupling: Optional[np.ndarray] = None,
+        ricci_edges: Optional[Sequence[RicciEdgeMetrics]] = None,
+        ricci_task_summaries: Optional[Sequence[RicciTaskSummary]] = None,
     ) -> PressureRunArtifacts:
         out_dir = Path(self.config.output_dir).resolve() / str(run_id)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -50,6 +60,25 @@ class LambdaVolArtifactExporter:
 
         task_csv = out_dir / "task_metrics_long.csv"
         task_df.to_csv(task_csv, index=False)
+
+        ricci_edge_df = self._ricci_edges_df(ricci_edges or ())
+        ricci_summary_df = self._ricci_summary_df(ricci_task_summaries or ())
+        ricci_edges_csv: Optional[Path] = None
+        ricci_summary_csv: Optional[Path] = None
+        ricci_flow_npz: Optional[Path] = None
+        if not ricci_edge_df.empty:
+            ricci_edges_csv = out_dir / "ricci_edges_long.csv"
+            ricci_edge_df.to_csv(ricci_edges_csv, index=False)
+            ricci_flow_npz = out_dir / "ricci_flow_tensors.npz"
+            self._save_ricci_flow_npz(
+                path=ricci_flow_npz,
+                edge_df=ricci_edge_df,
+                task_ids=task_ids,
+                concept_ids=concept_ids,
+            )
+        if not ricci_summary_df.empty:
+            ricci_summary_csv = out_dir / "ricci_task_summary.csv"
+            ricci_summary_df.to_csv(ricci_summary_csv, index=False)
 
         long_parquet: Optional[Path] = None
         if bool(self.config.export_parquet) and has_pyarrow():
@@ -163,6 +192,9 @@ class LambdaVolArtifactExporter:
                 "recommendations_json": str(recommendations_json),
                 "diagnostics_md": str(diagnostics_md),
                 "heatmap_dir": str(out_dir / "heatmaps"),
+                "ricci_edges_csv": (None if ricci_edges_csv is None else str(ricci_edges_csv)),
+                "ricci_summary_csv": (None if ricci_summary_csv is None else str(ricci_summary_csv)),
+                "ricci_flow_npz": (None if ricci_flow_npz is None else str(ricci_flow_npz)),
             },
         }
         metadata_json = out_dir / "metadata.json"
@@ -176,6 +208,8 @@ class LambdaVolArtifactExporter:
                 "n_epochs": len(index),
                 "n_alerts": len(alerts),
                 "n_recommendations": len(recommendations),
+                "n_ricci_edges": int(len(ricci_edge_df)),
+                "n_ricci_task_summaries": int(len(ricci_summary_df)),
             },
         )
 
@@ -191,6 +225,9 @@ class LambdaVolArtifactExporter:
             alerts_md=str(alerts_md),
             recommendations_json=str(recommendations_json),
             vtk_path=(None if vtk_path is None else str(vtk_path)),
+            ricci_edges_csv=(None if ricci_edges_csv is None else str(ricci_edges_csv)),
+            ricci_summary_csv=(None if ricci_summary_csv is None else str(ricci_summary_csv)),
+            ricci_flow_npz=(None if ricci_flow_npz is None else str(ricci_flow_npz)),
         )
 
     @staticmethod
@@ -248,6 +285,99 @@ class LambdaVolArtifactExporter:
             )
             out = out.drop(columns=["extra"])
         return out.sort_values(["epoch", "task_id"]).reset_index(drop=True)
+
+    @staticmethod
+    def _ricci_edges_df(rows: Sequence[RicciEdgeMetrics]) -> pd.DataFrame:
+        if not rows:
+            return pd.DataFrame(
+                columns=[
+                    "epoch",
+                    "task_id",
+                    "concept_src",
+                    "concept_dst",
+                    "weight_raw",
+                    "curvature",
+                    "weight_flow",
+                ]
+            )
+        return pd.DataFrame([asdict(r) for r in rows]).sort_values(
+            ["epoch", "task_id", "concept_src", "concept_dst"]
+        ).reset_index(drop=True)
+
+    @staticmethod
+    def _ricci_summary_df(rows: Sequence[RicciTaskSummary]) -> pd.DataFrame:
+        if not rows:
+            return pd.DataFrame(
+                columns=[
+                    "epoch",
+                    "task_id",
+                    "n_nodes",
+                    "n_edges",
+                    "mean_curvature",
+                    "std_curvature",
+                    "min_curvature",
+                    "max_curvature",
+                    "negative_edge_fraction",
+                    "strong_negative_edge_fraction",
+                    "top_negative_src",
+                    "top_negative_dst",
+                    "top_negative_curvature",
+                ]
+            )
+        return pd.DataFrame([asdict(r) for r in rows]).sort_values(
+            ["epoch", "task_id"]
+        ).reset_index(drop=True)
+
+    @staticmethod
+    def _save_ricci_flow_npz(
+        *,
+        path: Path,
+        edge_df: pd.DataFrame,
+        task_ids: Sequence[str],
+        concept_ids: Sequence[str],
+    ) -> None:
+        if edge_df.empty:
+            return
+
+        epochs = tuple(sorted(int(x) for x in edge_df["epoch"].unique().tolist()))
+        n_tasks = len(task_ids)
+        n_concepts = len(concept_ids)
+        n_epochs = len(epochs)
+
+        t_to_idx = {str(t): i for i, t in enumerate(task_ids)}
+        c_to_idx = {str(c): j for j, c in enumerate(concept_ids)}
+        e_to_idx = {int(e): k for k, e in enumerate(epochs)}
+
+        flow = np.zeros((n_tasks, n_concepts, n_concepts, n_epochs), dtype=np.float32)
+        curv = np.zeros((n_tasks, n_concepts, n_concepts, n_epochs), dtype=np.float32)
+        raw = np.zeros((n_tasks, n_concepts, n_concepts, n_epochs), dtype=np.float32)
+
+        for row in edge_df.itertuples(index=False):
+            ti = t_to_idx.get(str(row.task_id))
+            ci = c_to_idx.get(str(row.concept_src))
+            cj = c_to_idx.get(str(row.concept_dst))
+            ei = e_to_idx.get(int(row.epoch))
+            if ti is None or ci is None or cj is None or ei is None:
+                continue
+            wf = float(row.weight_flow)
+            cr = float(row.curvature)
+            wr = float(row.weight_raw)
+            flow[ti, ci, cj, ei] = wf
+            flow[ti, cj, ci, ei] = wf
+            curv[ti, ci, cj, ei] = cr
+            curv[ti, cj, ci, ei] = cr
+            raw[ti, ci, cj, ei] = wr
+            raw[ti, cj, ci, ei] = wr
+
+        np.savez_compressed(
+            path,
+            ricci_weight_flow=flow,
+            ricci_curvature=curv,
+            ricci_weight_raw=raw,
+            task_ids=np.asarray([str(x) for x in task_ids], dtype=object),
+            concept_ids=np.asarray([str(x) for x in concept_ids], dtype=object),
+            epochs=np.asarray([int(x) for x in epochs], dtype=np.int64),
+        )
 
     @staticmethod
     def _build_tensors(

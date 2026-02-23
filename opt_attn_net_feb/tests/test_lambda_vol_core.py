@@ -12,11 +12,18 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 if str(PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(PKG_ROOT))
 
-from ..explainability.lambda_vol.config import DetectorConfig, ExportConfig, LambdaVolConfig, StoreConfig, TrackerConfig
-from ..explainability.lambda_vol.detectors import ConceptPressureDetector, concentration_metrics
-from ..explainability.lambda_vol.monitor import LambdaVolMonitor
-from ..explainability.lambda_vol.tracker import ConceptPressureTracker
-from ..explainability.lambda_vol.types import RegimeLabel
+try:
+    from ..explainability.lambda_vol.config import DetectorConfig, ExportConfig, LambdaVolConfig, StoreConfig, TrackerConfig
+    from ..explainability.lambda_vol.detectors import ConceptPressureDetector, concentration_metrics
+    from ..explainability.lambda_vol.monitor import LambdaVolMonitor
+    from ..explainability.lambda_vol.tracker import ConceptPressureTracker
+    from ..explainability.lambda_vol.types import RegimeLabel
+except Exception:  # pragma: no cover
+    from explainability.lambda_vol.config import DetectorConfig, ExportConfig, LambdaVolConfig, StoreConfig, TrackerConfig
+    from explainability.lambda_vol.detectors import ConceptPressureDetector, concentration_metrics
+    from explainability.lambda_vol.monitor import LambdaVolMonitor
+    from explainability.lambda_vol.tracker import ConceptPressureTracker
+    from explainability.lambda_vol.types import RegimeLabel
 
 
 class LambdaVolCoreTest(unittest.TestCase):
@@ -189,6 +196,12 @@ class LambdaVolCoreTest(unittest.TestCase):
             self.assertTrue(Path(artifacts.metadata_json).exists())
             self.assertTrue(Path(artifacts.alerts_json).exists())
             self.assertTrue(Path(artifacts.recommendations_json).exists())
+            self.assertIsNotNone(artifacts.ricci_edges_csv)
+            self.assertIsNotNone(artifacts.ricci_summary_csv)
+            self.assertIsNotNone(artifacts.ricci_flow_npz)
+            self.assertTrue(Path(str(artifacts.ricci_edges_csv)).exists())
+            self.assertTrue(Path(str(artifacts.ricci_summary_csv)).exists())
+            self.assertTrue(Path(str(artifacts.ricci_flow_npz)).exists())
 
 
 if __name__ == "__main__":
