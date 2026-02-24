@@ -14,7 +14,17 @@ from ..db.models import ConceptORM, ConceptTagORM, MILConceptEpochORM, TCAVEpoch
 
 @dataclass(frozen=True)
 class ConceptQueryService:
-    """Query/analytics service for Chem-ACE concept database."""
+    """
+    A service providing various methods for querying and analyzing concept-based data, particularly for tasks
+    related to TCAV metrics, concept attention, and associated statistics.
+
+    This class utilizes SQLAlchemy sessions for data retrieval and manipulation across tasks and epochs. It provides
+    capabilities to fetch specific metrics, identify trends, and compute statistics related to TCAV (Testing with
+    Concept Activation Vectors) scores and related information for various concepts.
+
+    Attributes:
+        session_factory (sessionmaker[Session]): A factory function to create SQLAlchemy Session objects.
+    """
 
     session_factory: sessionmaker[Session]
 

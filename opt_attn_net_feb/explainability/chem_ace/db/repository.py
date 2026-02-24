@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from hashlib import sha1
 import json
@@ -31,13 +31,65 @@ from .models import (
 from .session import build_engine, initialize_database, make_session_factory
 
 
+def _json_default(value: Any) -> Any:
+    if is_dataclass(value):
+        return asdict(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, set):
+        return sorted(value)
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+
+
 def _json_dumps(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    """
+    Serializes a Python object into a JSON formatted string.
+
+    This function converts a given Python object into a JSON string format,
+    ensuring consistent key ordering, compact representation by stripping
+    extra spaces, and ASCII-safe encoding. It is intended for producing a
+    deterministic and compact JSON serialization.
+
+    Args:
+        value: The Python object to serialize into JSON.
+
+    Returns:
+        str: A JSON formatted string representation of the input object.
+    """
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        default=_json_default,
+    )
 
 
 @dataclass(frozen=True)
 class MILConceptEpochMetric:
-    """Optional MIL-specific concept metrics per epoch."""
+    """
+    Represents the metrics of a single epoch for a MIL (Multiple Instance Learning) concept.
+
+    This class is used to encapsulate the information and metrics associated with one epoch
+    for a specific concept in a MIL context. The metrics include information like attention
+    support, witness rate, attention entropy, and prevalence. Additionally, metadata is
+    provided for flexibility in storing extra information related to the concept or epoch.
+
+    Attributes:
+        run_id: Identifier for the specific run.
+        epoch: The epoch number corresponding to the metrics.
+        concept_id: Identifier for the concept being evaluated.
+        task_id: Identifier for the task associated with the concept.
+        attention_support: Float representing the attention support metric.
+        witness_rate: Float representing the witness rate metric.
+        attention_entropy: Float representing the attention entropy metric.
+        prevalence: Float representing the prevalence metric.
+        metadata: Additional information provided as a mapping of key-value pairs.
+    """
 
     run_id: str
     epoch: int
@@ -51,7 +103,17 @@ class MILConceptEpochMetric:
 
 
 class ChemACERepository:
-    """Persistence layer for Chem-ACE metadata and artifacts."""
+    """
+    Manages the storage and retrieval of data for chemical ACE (Automated Chemical Exploration).
+
+    The purpose of this class is to provide methods for working with a database and file-based
+    artifacts in a consistent manner. It facilitates operations like creating database sessions,
+    persisting entities, managing embeddings, and handling large batches of data.
+
+    Attributes:
+        db_uri (str): Database connection URI used for database operations.
+        artifact_dir (Path): Directory for storing artifact files.
+    """
 
     def __init__(self, *, db_uri: str, artifact_dir: str):
         self.db_uri = str(db_uri)

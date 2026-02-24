@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from hashlib import sha1
 import logging
@@ -31,7 +31,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class MoleculeSource:
-    """Input molecule descriptor for Chem-ACE batch processing."""
+    """
+    Represents a source of molecular data.
+
+    This class is used to store information about a molecule, including its
+    identifier, its structure, and optionally the IDs of its conformers.
+
+    Attributes:
+        mol_id: A unique identifier for the molecule.
+        mol: The molecular structure. The type of this attribute allows flexibility
+            for various representations.
+        conf_ids: A tuple of identifiers for conformers associated with the molecule.
+    """
 
     mol_id: str
     mol: Any
@@ -39,7 +50,27 @@ class MoleculeSource:
 
 
 class ChemACEPipeline:
-    """End-to-end Chem-ACE orchestration service."""
+    """
+    Represents a processing pipeline for ChemACE, a tool for chemical structure-based
+    explainable AI. This pipeline orchestrates molecule patch generation, caching,
+    semantic tagging, and repository management.
+
+    The class initializes necessary components such as patch generators, embedding cache,
+    and a semantic tagger while handling input configuration and repository management.
+    It supports 2D and 3D molecular patch generation and ensures patches are constrained
+    by user-defined or automatically calculated limits.
+
+    Attributes:
+        config: ChemACE configuration object containing all essential settings for the pipeline.
+        repository: Optional repository for managing database interactions and artifacts.
+                    If not provided, a default repository is initialized.
+        embedding_cache: Manages caching for embeddings used in the analytics pipeline.
+        patch_generators_2d: List of 2D patch generators deployed in the pipeline.
+        patch_generators_3d: List of 3D patch generators deployed for processing molecules
+                             with conformer data.
+        semantic_tagger: Processes and tags molecules semantically based on the provided
+                         configuration.
+    """
 
     def __init__(self, *, config: ChemACEConfig, repository: Optional[ChemACERepository] = None):
         self.config = config
@@ -356,8 +387,8 @@ class ChemACEPipeline:
             run_id=run_id,
             layer_name=concept_set.layer_name,
             config={
-                "discovery": self.config.discovery.__dict__,
-                "embedding": self.config.embedding.__dict__,
+                "discovery": asdict(self.config.discovery),
+                "embedding": asdict(self.config.embedding),
             },
             metadata=concept_set.metadata,
         )

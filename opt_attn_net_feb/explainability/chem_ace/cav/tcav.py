@@ -22,7 +22,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class CAVFitResult:
-    """Container for fitted CAV direction and train statistics."""
+    """
+    Represents the result of a Concept Activation Vector (CAV) fit process.
+
+    This class encapsulates the results of fitting a CAV, including the
+    CAV direction vector, the intercept term, and the accuracy of the CAV
+    on the training dataset.
+    """
 
     cav_vector: np.ndarray
     intercept: float
@@ -31,7 +37,26 @@ class CAVFitResult:
 
 @dataclass(frozen=True)
 class TCAVSummary:
-    """Aggregate summary across repeated CAV runs."""
+    """
+    Represents a summary of TCAV (Testing with Concept Activation Vectors) results.
+
+    The class provides a structured representation of TCAV analysis outcome for a given
+    concept and task under evaluation, including statistical metrics and associated
+    metadata.
+
+    Attributes:
+        concept_id: Identifier for the concept analyzed.
+        task_id: Identifier for the task related to the analysis.
+        layer_name: Name of the neural network layer used for the analysis.
+        epoch: Epoch number during which the evaluation is conducted.
+        mean_sign_rate: Average sign rate computed for the analysis.
+        std_sign_rate: Standard deviation of the sign rate.
+        mean_directional_derivative: Average directional derivative value.
+        std_directional_derivative: Standard deviation of the directional derivative.
+        p_value_mean_sign_rate: Statistical p-value associated with the mean sign rate;
+            optional.
+        n_repeats: Number of repetitions for the statistical evaluation.
+    """
 
     concept_id: str
     task_id: str
@@ -54,6 +79,30 @@ def _fit_linear_separator(
     seed: int,
     max_iter: int,
 ) -> CAVFitResult:
+    """
+    Fits a linear separator (either SVM or Logistic Regression) to distinguish between two groups
+    of data: concept and random. Returns the fitted CAV (Concept Activation Vector), model intercept,
+    and training accuracy.
+
+    Sections for handling the linear classifier type (e.g., SVM or Logistic Regression) are included,
+    with specific preprocessing and computation steps for each classifier type. The method
+    normalizes the computed coefficients of the model to generate the CAV. Accuracy of the training is
+    also computed by comparing predictions against the ground truth labels.
+
+    Args:
+        x_concept (np.ndarray): Positive samples belonging to the concept group.
+        x_random (np.ndarray): Negative samples, considered random, for differentiation.
+        classifier (str): Type of linear classifier to use ("svm" or "logistic").
+        seed (int): Seed for the random state to ensure reproducibility.
+        max_iter (int): Maximum number of iterations allowed for training the classifier.
+
+    Returns:
+        CAVFitResult: Object that encapsulates the fitted CAV (Concept Activation Vector),
+        its intercept, and the training accuracy.
+
+    Raises:
+        ValueError: If the provided classifier type is not "svm" or "logistic".
+    """
     x_pos = np.asarray(x_concept, dtype=np.float64)
     x_neg = np.asarray(x_random, dtype=np.float64)
     y_pos = np.ones((x_pos.shape[0],), dtype=np.int64)
@@ -90,7 +139,28 @@ def _fit_linear_separator(
 
 
 def _binom_two_sided_p_value(k: int, n: int, p0: float = 0.5) -> float:
-    """Exact two-sided binomial p-value without scipy dependency."""
+    """
+    Calculate the two-sided p-value for a binomial test.
+
+    This function computes the two-sided p-value for a binomial test, which is
+    used to determine whether the number of successes in a sequence of n
+    independent Bernoulli trials is consistent with a given probability of
+    success under the null hypothesis.
+
+    Parameters:
+    k : int
+        The observed number of successes.
+    n : int
+        The total number of trials (must be greater than 0 to perform the test).
+    p0 : float, optional
+        The hypothesized probability of success under the null hypothesis,
+        with a default value of 0.5.
+
+    Returns:
+    float
+        The two-sided p-value for the given binomial test. This value is
+        clipped to lie within the range [0.0, 1.0].
+    """
     if n <= 0:
         return 1.0
     probs = np.asarray([comb(n, i) * (p0 ** i) * ((1.0 - p0) ** (n - i)) for i in range(n + 1)], dtype=np.float64)
@@ -100,7 +170,28 @@ def _binom_two_sided_p_value(k: int, n: int, p0: float = 0.5) -> float:
 
 
 def directional_stats(cav_vector: np.ndarray, gradients: np.ndarray) -> tuple[float, float]:
-    """Compute TCAV sign-rate and mean directional derivative from gradients."""
+    """
+    Calculates directional statistics based on the given Concept Activation Vector (CAV) and
+    a set of gradients. The function computes the proportion of gradients having positive
+    alignment towards the CAV (sign rate) and the mean projection of the gradients on the CAV.
+
+    Parameters:
+    cav_vector (np.ndarray): A Concept Activation Vector (CAV) used for directional alignment
+                             calculation. Expected to be a 1-dimensional vector.
+    gradients (np.ndarray): A 2-dimensional numpy array representing a set of gradients
+                            with shape [N, D], where N is the number of gradient vectors,
+                            and D is their dimensionality.
+
+    Returns:
+    tuple[float, float]: A tuple containing the following values:
+                         - `sign_rate` (float): The proportion of gradients having a
+                           positive alignment with the CAV.
+                         - `mean_projection` (float): The mean projection value of the gradients
+                           on the CAV.
+
+    Raises:
+    ValueError: If the gradients array does not have 2 dimensions.
+    """
     cav = np.asarray(cav_vector, dtype=np.float64)
     g = np.asarray(gradients, dtype=np.float64)
     if g.ndim != 2:
@@ -124,7 +215,37 @@ def run_tcav_from_arrays(
     config: CAVConfig,
     seed: int,
 ) -> tuple[list[CAVRecord], list[TCAVRecord], TCAVSummary]:
-    """Run repeated CAV/TCAV from activation and gradient arrays."""
+    """
+    Executes the TCAV (Testing with Concept Activation Vectors) analysis using provided arrays and configuration.
+
+    This function conducts TCAV analysis to understand the impact of conceptual directions on
+    a target model's gradient. It involves calculating CAV (Concept Activation Vectors) and
+    their respective statistics such as sign rates and directional derivatives. Results are
+    stored in form of CAV records, TCAV records, and a summary of the TCAV analysis for the
+    concepts, tasks, and layers being analyzed.
+
+    Parameters:
+    run_id: Unique identifier for the TCAV run.
+    epoch: The epoch number at which TCAV is being calculated.
+    concept_id: Identifier for the concept under analysis.
+    task_id: Identifier for the task being studied.
+    layer_name: Name of the neural network layer being analyzed.
+    concept_embeddings: Numpy array of embeddings representing the concept in shape [N, D].
+    random_pool_embeddings: Numpy array of random embeddings used as counterexamples in shape [N, D].
+    target_gradients: Numpy array of gradients for the target variable in shape [N, D].
+    config: Configuration object of type CAVConfig for TCAV analysis.
+    seed: Random seed used for reproducibility.
+
+    Returns:
+    A tuple containing:
+    1. List of CAVRecord objects representing CAV details for each repeat of the analysis.
+    2. List of TCAVRecord objects representing TCAV analysis results for each repeat.
+    3. A TCAVSummary object summarizing the analysis across all repeats.
+
+    Raises:
+    ValueError: If the dimensions of the provided embeddings or gradients do not match the
+    expected format or are inconsistent with each other.
+    """
     rng = np.random.default_rng(int(seed))
 
     x_pos = np.asarray(concept_embeddings, dtype=np.float32)
@@ -219,6 +340,23 @@ def run_tcav_from_arrays(
 
 
 def _collapse_to_feature_vectors(t) -> np.ndarray:
+    """
+    Converts a tensor to a 2D feature vector representation.
+
+    This function accepts a tensor in various shapes and converts it to a
+    2D array representation by collapsing dimensions appropriately. If the
+    tensor has three or more dimensions, it is collapsed into a batch of
+    mean feature vectors.
+
+    Parameters:
+        t (Tensor): Input tensor to be processed.
+
+    Returns:
+        np.ndarray: A 2D array representation of the input tensor. The result
+        will be of shape (1, x) if the input was 1D, of shape (b, x) if the
+        input was 3D or higher (collapsed along the extra dimensions), or
+        unchanged if the input was already 2D.
+    """
     arr = t.detach().cpu().float().numpy()
     if arr.ndim == 1:
         return arr.reshape(1, -1)
@@ -238,7 +376,48 @@ def collect_gradients_for_layer(
     model_inputs: Iterable[Any],
     device: str = "cpu",
 ) -> np.ndarray:
-    """Collect d(task)/d(h) vectors for inputs, projected to feature axis."""
+    """
+    Collects gradients for a specified layer in the provided model using model inputs.
+
+    This function is intended for gathering gradients to calculate Tensor Concept Activation
+    Vectors (TCAV). It works by registering a hook on the requested layer to capture its
+    activations, performing a forward pass using the model adapter, and then calculating
+    gradients with respect to the model's input(s). The resulting gradients are collapsed
+    into feature vectors for further analysis.
+
+    Parameters
+    ----------
+    model: The model object on which the layer is present and gradients are to be
+           collected.
+    layer_name: str
+        The name of the layer for which gradients need to be captured.
+    task_id: str
+        The task identifier used by the `adapter` to determine task-specific outputs.
+    adapter: ModelTaskAdapter
+        Adapter object to abstract operations like forwarding the model and obtaining
+        task-specific scalars required for gradient calculation.
+    model_inputs: Iterable[Any]
+        An iterable containing the inputs to the model. Each input in the iterable can either
+        be a dictionary, tuple, list, or tensor.
+    device: str, optional
+        The device on which the model and inputs should be placed during the gradient
+        computation. Defaults to 'cpu'.
+
+    Returns
+    -------
+    np.ndarray
+        Concatenated gradients for the specified layer's activations. If no gradients
+        could be collected, returns an empty numpy array with shape (0, 0) and dtype
+        float32.
+
+    Raises
+    ------
+    RuntimeError
+        If PyTorch library is not available or the specified layer's activations could
+        not be captured.
+    TypeError
+        If the task scalar obtained from the adapter is not a `torch.Tensor`.
+    """
     if torch is None:
         raise RuntimeError("PyTorch is required for collect_gradients_for_layer")
 

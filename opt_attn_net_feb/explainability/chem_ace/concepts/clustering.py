@@ -18,7 +18,23 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class DiscoveredConceptSet:
-    """Output container for a single concept-discovery snapshot."""
+    """
+    Represents a discovered concept set in a specific neural network layer.
+
+    This class is used to encapsulate information about a concept set that has
+    been discovered. It includes the layer name, candidate concepts, membership
+    information, and any additional metadata associated with the discovered
+    concepts.
+
+    Attributes:
+        layer_name: The name of the neural network layer associated with the
+            concept set.
+        candidates: A list of candidate concepts in the discovered concept set.
+        memberships: A list of concept membership details that associate
+            instances to the discovered concepts.
+        metadata: A dictionary containing additional metadata for the
+            discovered concept set.
+    """
 
     layer_name: str
     candidates: list[ConceptCandidate]
@@ -28,23 +44,83 @@ class DiscoveredConceptSet:
 
 
 def _coherence_from_points(points: np.ndarray, centroid: np.ndarray) -> float:
+    """
+    Calculates the coherence score from the given set of points and a centroid.
+
+    The coherence score is determined based on the average distance of points
+    from the centroid. A lower average distance results in a higher coherence score.
+
+    Parameters:
+    points (np.ndarray): A NumPy array representing the points in a multidimensional
+        space.
+    centroid (np.ndarray): A NumPy array representing the centroid in the same
+        dimensional space as the points.
+
+    Returns:
+    float: The calculated coherence score, inversely proportional to the average
+        distance of the points to the centroid.
+    """
     dists = np.linalg.norm(points - centroid.reshape(1, -1), axis=1)
     return float(1.0 / (1.0 + float(np.mean(dists))))
 
 
 
 def _centroid(points: np.ndarray) -> np.ndarray:
+    """
+    Computes the centroid of a given set of points by calculating the mean along the
+    specified axis.
+
+    Parameters:
+    points (np.ndarray): A NumPy array containing the points for which the centroid
+        is to be computed.
+
+    Returns:
+    np.ndarray: A NumPy array containing the centroid coordinates as floating-point
+        numbers.
+    """
     return points.mean(axis=0).astype(np.float32)
 
 
 
 def _medoid_index(points: np.ndarray, centroid: np.ndarray) -> int:
+    """
+    Finds the index of the medoid closest to the given centroid.
+
+    A medoid is the most centrally located point in a dataset. This function
+    computes the distance of each point in the dataset from the given centroid
+    and returns the index of the point with the smallest distance.
+
+    Parameters:
+    points (np.ndarray): A 2D array of points, where each row represents a point
+        in n-dimensional space.
+    centroid (np.ndarray): A 1D array representing the centroid in n-dimensional
+        space.
+
+    Returns:
+    int: The index of the medoid point in the dataset.
+    """
     dists = np.linalg.norm(points - centroid.reshape(1, -1), axis=1)
     return int(np.argmin(dists))
 
 
 
 def _cluster_with_kmeans(x: np.ndarray, k: int, seed: int) -> np.ndarray:
+    """
+    Clusters data using the KMeans clustering algorithm.
+
+    This function utilizes the KMeans algorithm from the scikit-learn library to cluster the input
+    data into the specified number of clusters. The function ensures that the number of clusters
+    is constrained between 2 and the number of data points in the input.
+
+    Args:
+        x (np.ndarray): A 2D NumPy array representing the data to be clustered.
+        k (int): The desired number of clusters.
+        seed (int): The random seed for reproducibility of results.
+
+    Returns:
+        np.ndarray: An array of cluster labels, where each element corresponds to the cluster index
+        assigned to the respective data point.
+    """
     kk = max(2, min(int(k), int(x.shape[0])))
     model = KMeans(n_clusters=kk, random_state=int(seed), n_init=10)
     return model.fit_predict(x)
@@ -58,6 +134,22 @@ def _cluster_with_kmeans_adaptive(
     minibatch_over: int,
     minibatch_size: int,
 ) -> np.ndarray:
+    """
+    Clusters data using KMeans algorithm, with an adaptive approach for larger datasets.
+    If the number of data points exceeds a threshold, MiniBatchKMeans is utilized for
+    improved performance on larger datasets. Otherwise, a standard KMeans clustering
+    is applied.
+
+    Parameters:
+        x (np.ndarray): Input data to be clustered.
+        k (int): Target number of clusters.
+        seed (int): Random seed for reproducibility.
+        minibatch_over (int): Minimum data size to switch to MiniBatchKMeans.
+        minibatch_size (int): Batch size for MiniBatchKMeans.
+
+    Returns:
+        np.ndarray: Array of cluster labels for each point in the input data.
+    """
     n = int(x.shape[0])
     kk = max(2, min(int(k), n))
     if n >= int(max(2, minibatch_over)):
@@ -74,6 +166,23 @@ def _cluster_with_kmeans_adaptive(
 
 
 def _estimated_pdist_bytes(n_samples: int) -> int:
+    """
+    Calculates the estimated memory usage in bytes for storing condensed pairwise
+    distances when using scipy.spatial.distance.pdist.
+
+    This calculation is based on the number of samples provided and assumes the
+    distances are stored as float64 data type. The result represents the memory
+    requirement for an array containing all pairwise distances.
+
+    Parameters:
+    n_samples: int
+        The number of samples for which pairwise distances will be computed.
+
+    Returns:
+    int
+        The estimated memory usage in bytes required to store the condensed
+        pairwise distances.
+    """
     # scipy.spatial.distance.pdist allocates condensed pairwise distances (float64).
     n = int(max(0, n_samples))
     return (n * (n - 1) // 2) * int(np.dtype(np.float64).itemsize)
@@ -87,6 +196,33 @@ def _cluster_with_hierarchical(
     max_samples: int,
     max_pairwise_gb: float,
 ) -> np.ndarray:
+    """
+    Clusters data points using hierarchical clustering.
+
+    This function applies hierarchical clustering on the given data based
+    on the specified distance threshold. Hierarchical clustering builds a dendrogram
+    based on pairwise distances and allows determination of clusters by cutting
+    the tree at a specific distance.
+
+    Attributes representing type parameters must be passed with correct types;
+    otherwise, computational or operational errors may arise.
+
+    Raises RuntimeError if either the number of samples exceeds the maximum allowable
+    samples for hierarchical clustering or the estimated memory for pairwise distances
+    exceeds the configuration limit.
+
+    Parameters:
+        x (np.ndarray): The input data matrix of shape (n_samples, n_features).
+        distance_threshold (float): The distance threshold to determine cluster formation.
+        max_samples (int): The maximum number of samples allowed for hierarchical clustering.
+        max_pairwise_gb (float): The maximum allowable memory in gigabytes for pairwise
+            distance estimation.
+
+    Returns:
+        np.ndarray: Cluster labels for each data point, where each cluster is assigned
+            a unique integer starting from 0.
+
+    """
     n = int(x.shape[0])
     if n > int(max_samples):
         raise RuntimeError(
@@ -105,6 +241,26 @@ def _cluster_with_hierarchical(
 
 
 def _cluster_with_hdbscan(x: np.ndarray, min_cluster_size: int) -> np.ndarray:
+    """
+    Clusters data points using the HDBSCAN clustering algorithm, which is suitable
+    for clustering datasets with varying densities. The function applies the
+    HDBSCAN algorithm to the input data and returns the cluster labels for each
+    data point.
+
+    Parameters:
+    x: np.ndarray
+        The input data array where rows represent data points and columns
+        represent features.
+    min_cluster_size: int
+        The minimum size of clusters. Cluster sizes smaller than this value
+        will not be considered valid clusters.
+
+    Returns:
+    np.ndarray
+        An array of cluster labels assigned to each data point. The labels
+        indicate which cluster each point belongs to, or -1 if the data point
+        is considered noise.
+    """
     hdbscan = require_hdbscan()
     model = hdbscan.HDBSCAN(min_cluster_size=max(2, int(min_cluster_size)))
     return model.fit_predict(x)
@@ -117,6 +273,29 @@ def _algorithm_labels(
     config: ConceptDiscoveryConfig,
     seed: int,
 ) -> Dict[str, np.ndarray]:
+    """
+    Generates cluster labels for input data using specified clustering algorithms.
+
+    This function applies various clustering algorithms as defined in the provided
+    configuration to the input data. It handles specific parameters for each
+    algorithm, processes the data accordingly, and logs any issues encountered
+    during execution, such as skipped algorithms or errors.
+
+    Arguments:
+        x (np.ndarray): The input data for clustering, represented as a NumPy array.
+        config (ConceptDiscoveryConfig): Configuration object specifying the clustering
+            algorithms to use and their respective parameters.
+        seed (int): Random seed used for reproducibility in stochastic clustering algorithms.
+
+    Returns:
+        Dict[str, np.ndarray]: A dictionary where the keys are algorithm names (in lowercase)
+        and the values are the corresponding cluster labels as NumPy arrays.
+
+    Raises:
+        MemoryError: Raised when a clustering algorithm exceeds available memory.
+        RuntimeError: Raised when an algorithm is skipped due to a specific guardrail condition.
+        Exception: General exception handling for unexpected failures during clustering processes.
+    """
     out: Dict[str, np.ndarray] = {}
     for algo in config.algorithms:
         key = str(algo).lower()
@@ -179,6 +358,21 @@ def _algorithm_labels(
 
 
 def _concept_id(layer_name: str, algorithm: str, patch_ids: list[str]) -> str:
+    """
+    Generates a unique concept identifier based on given layer name, algorithm, and patch IDs.
+
+    This function creates a SHA-1 hash by combining the provided layer name, algorithm, and a sorted list
+    of patch IDs in a specific format. The purpose of this identifier is to represent a unique combination
+    of these inputs.
+
+    Args:
+        layer_name: The name of the layer for which the identifier is being generated.
+        algorithm: The algorithm applied to generate or process the concept.
+        patch_ids: A list of patch IDs, which will be sorted before hashing.
+
+    Returns:
+        A hexadecimal SHA-1 hash string representing the unique identifier of the concept.
+    """
     payload = f"{layer_name}|{algorithm}|{'|'.join(sorted(patch_ids))}"
     return sha1(payload.encode("utf-8")).hexdigest()
 
@@ -193,6 +387,36 @@ def _build_from_labels(
     labels: np.ndarray,
     config: ConceptDiscoveryConfig,
 ) -> tuple[list[ConceptCandidate], list[ConceptMembership]]:
+    """
+    Builds concept candidates and their memberships from labeled data.
+
+    This function processes clustering labels and data points to identify meaningful
+    concept candidates. Each candidate is generated based on its cluster's coherence,
+    support, and centroid, while memberships are computed based on distances to the
+    cluster's centroid.
+
+    Parameters:
+    x : np.ndarray
+        The data points array, where each row represents a point in higher-dimensional space.
+    patch_ids : list[str]
+        List of strings representing ID for each data point.
+    layer_name : str
+        The name of the layer in which the clustering applies.
+    algorithm : str
+        The algorithm used to generate the clustering labels.
+    labels : np.ndarray
+        Array of clustering labels corresponding to the data points.
+    config : ConceptDiscoveryConfig
+        Configuration instance specifying constraints like minimum support
+        and minimum coherence for concept generation.
+
+    Returns:
+    tuple[list[ConceptCandidate], list[ConceptMembership]]
+        A tuple containing:
+        - A list of concept candidates that satisfy the constraints.
+        - A list of memberships detailing the association of data points
+          with identified concepts.
+    """
     candidates: list[ConceptCandidate] = []
     memberships: list[ConceptMembership] = []
 
@@ -256,6 +480,26 @@ def _deduplicate_concepts(
     memberships: list[ConceptMembership],
     similarity_threshold: float,
 ) -> tuple[list[ConceptCandidate], list[ConceptMembership]]:
+    """
+    Deduplicates a list of concept candidates and their memberships based on a similarity threshold.
+
+    This function processes a list of concept candidates and removes duplicates by evaluating
+    their similarity scores. Candidates with similarity scores above the specified threshold
+    are grouped together. Their associated memberships are remapped to reflect the remaining
+    unique candidates, ensuring consistency. The function outputs the filtered list of candidates
+    and memberships.
+
+    Arguments:
+        candidates (list[ConceptCandidate]): A list of concept candidate objects to process.
+        memberships (list[ConceptMembership]): A list of memberships associated with the candidates.
+        similarity_threshold (float): A threshold indicating the acceptable similarity level
+            above which candidates are considered duplicates.
+
+    Returns:
+        tuple[list[ConceptCandidate], list[ConceptMembership]]: A tuple containing:
+            - A list of deduplicated concept candidates.
+            - A list of updated concept memberships associated with the deduplicated candidates.
+    """
     if len(candidates) <= 1:
         return candidates, memberships
 
@@ -311,7 +555,30 @@ def discover_concepts(
     config: ConceptDiscoveryConfig,
     seed: int,
 ) -> DiscoveredConceptSet:
-    """Run ACE-style concept discovery from patch embeddings."""
+    """
+    Discover concepts from given embeddings using specified configuration and seed.
+
+    This function performs concept discovery by clustering the provided patch
+    embeddings using algorithms specified in the configuration. It verifies that
+    all embeddings belong to the same layer, processes the embeddings, applies
+    clustering, and deduplicates the resulting concepts based on the given
+    criteria. The resulting conceptual structures include candidates, their
+    memberships, and additional metadata summarizing the discovery.
+
+    Arguments:
+        embeddings: An Iterable of PatchEmbeddingRecord representing patches
+            and their corresponding embeddings to be processed.
+        config: An instance of ConceptDiscoveryConfig containing configuration
+            details for the clustering process.
+        seed: An integer seed for ensuring reproducibility during clustering.
+
+    Returns:
+        A DiscoveredConceptSet containing discovered concepts, their memberships,
+        and metadata summarizing the process.
+
+    Raises:
+        ValueError: If embeddings come from different layer_names.
+    """
     emb_list = list(embeddings)
     if len(emb_list) == 0:
         return DiscoveredConceptSet(layer_name="", candidates=[], memberships=[], metadata={"n_embeddings": 0})
