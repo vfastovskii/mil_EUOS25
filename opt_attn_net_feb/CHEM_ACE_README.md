@@ -309,7 +309,9 @@ In this repository's final runtime integration, patch vectors are currently buil
 
 Per patch vector is:
 
-1. 2D molecular vector (truncate/pad to `chem_ace_max_2d_dim`)
+1. 2D molecular vector (truncate/pad to resolved 2D dim)
+   - `chem_ace_max_2d_dim > 0`: use that cap
+   - `chem_ace_max_2d_dim <= 0`: auto-use full 2D raw dimension
 2. 3D+QM vector:
    - use conformer-specific `(mol_id, conf_id)` when available
    - else use molecule-level mean across conformers
@@ -593,7 +595,7 @@ From `entrypoints/hpo_pipeline.py`:
 - `--chem_ace_local_radii`
 - `--chem_ace_patch_cap_per_mol`
 - `--chem_ace_target_total_patches`
-- `--chem_ace_max_2d_dim`
+- `--chem_ace_max_2d_dim` (`<=0` means auto-use full 2D raw dimension)
 - `--chem_ace_max_3dqm_dim` (`<=0` means auto-use full merged 3D+QM raw dimension)
 - `--chem_ace_top_concepts`
 - `--cpu_workers`

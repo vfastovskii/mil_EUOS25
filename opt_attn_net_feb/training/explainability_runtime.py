@@ -73,7 +73,8 @@ class FinalExplainabilityConfig:
     # <= 0 enables dynamic cap by chem_ace_target_total_patches / n_molecules.
     chem_ace_patch_cap_per_mol: int = 0
     chem_ace_target_total_patches: int = 1200000
-    chem_ace_max_2d_dim: int = 256
+    # <=0 means use full available 2D feature dimension.
+    chem_ace_max_2d_dim: int = 0
     # <=0 means use full available merged 3D+QM feature dimension.
     chem_ace_max_3dqm_dim: int = 0
     chem_ace_top_concepts: int = 64

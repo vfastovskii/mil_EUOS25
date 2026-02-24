@@ -816,7 +816,9 @@ Patch IDs/hashes are deterministic SHA1 signatures over:
 ### 14.4 Patch embedding in integrated final pipeline
 
 For each patch, integrated runtime creates feature-level vector:
-- `v2d = take_or_pad(x2d, chem_ace_max_2d_dim)`
+- `v2d = take_or_pad(x2d, resolved_chem_ace_2d_dim)`
+  - where `resolved_chem_ace_2d_dim = chem_ace_max_2d_dim` if `chem_ace_max_2d_dim > 0`
+  - else `resolved_chem_ace_2d_dim = full 2D raw dimension` from `X2d_file.shape[1]`
 - `v3dqm = take_or_pad(conf-specific instance vector or molecule mean, resolved_chem_ace_3dqm_dim)`
   - where `resolved_chem_ace_3dqm_dim = chem_ace_max_3dqm_dim` if `chem_ace_max_3dqm_dim > 0`
   - else `resolved_chem_ace_3dqm_dim = full merged 3D+QM raw dimension` from `Xinst_sorted.shape[1]`
@@ -826,7 +828,7 @@ For each patch, integrated runtime creates feature-level vector:
 
 Final patch vector:
 - `vec = concat([v2d, v3dqm, descriptors])`
-- dimension = `chem_ace_max_2d_dim + resolved_chem_ace_3dqm_dim + 15`
+- dimension = `resolved_chem_ace_2d_dim + resolved_chem_ace_3dqm_dim + 15`
 
 Stored with metadata via embedding cache and DB.
 
@@ -1410,7 +1412,7 @@ This section lists defaults exactly as defined in typed configs and CLI parser, 
 - `chem_ace_db_uri = None`
 - `chem_ace_max_ids = 0` (`0` means use all IDs in scope)
 - `chem_ace_max_confs_per_id = 0` (`<=0` means use all conformers)
-- `chem_ace_max_2d_dim = 256`
+- `chem_ace_max_2d_dim = 0` (`<=0` means auto-use full 2D raw dimension)
 - `chem_ace_max_3dqm_dim = 0` (`<=0` means auto-use full merged 3D+QM raw dimension)
 - `chem_ace_top_concepts = 64`
 - `lambda_vol_output_dir = None`
@@ -1458,7 +1460,7 @@ Explainability:
 - `--chem_ace_db_uri None`
 - `--chem_ace_max_ids 0` (`0` means use all IDs in scope)
 - `--chem_ace_max_confs_per_id 0` (`<=0` means use all conformers)
-- `--chem_ace_max_2d_dim 256`
+- `--chem_ace_max_2d_dim 0` (`<=0` means auto-use full 2D raw dimension)
 - `--chem_ace_max_3dqm_dim 0` (`<=0` means auto-use full merged 3D+QM raw dimension)
 - `--chem_ace_top_concepts 64`
 - `--lambda_vol_output_dir None`
