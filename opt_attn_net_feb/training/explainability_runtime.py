@@ -77,6 +77,8 @@ class FinalExplainabilityConfig:
     chem_ace_max_2d_dim: int = 0
     # <=0 means use full available merged 3D+QM feature dimension.
     chem_ace_max_3dqm_dim: int = 0
+    # If False, keep patch embeddings only in memory for this run (no per-patch npy/json, no DB rows).
+    chem_ace_persist_patch_embeddings: bool = False
     chem_ace_top_concepts: int = 64
     # <=0 disables distance gating for inference-time nearest-centroid assignment.
     chem_ace_infer_max_distance: float = -1.0
@@ -857,6 +859,7 @@ def prepare_chem_ace_bundle(
         local_radii=",".join(str(x) for x in local_radii),
         patch_cap_per_mol=int(config.chem_ace_patch_cap_per_mol),
         target_total_patches=int(config.chem_ace_target_total_patches),
+        persist_patch_embeddings=bool(config.chem_ace_persist_patch_embeddings),
     )
 
     ace_cfg = ChemACEConfig(
@@ -1067,6 +1070,7 @@ def prepare_chem_ace_bundle(
             xinst_mean_by_id=inst_mean_map,
             max_2d_dim=int(dim_2d_used),
             max_3dqm_dim=int(dim_3dqm_used),
+            persist_embeddings=bool(config.chem_ace_persist_patch_embeddings),
             n_workers=max(0, int(config.cpu_workers)),
         )
     log_event(
@@ -1148,6 +1152,7 @@ def prepare_chem_ace_bundle(
                     xinst_mean_by_id=inst_mean_map,
                     max_2d_dim=int(dim_2d_used),
                     max_3dqm_dim=int(dim_3dqm_used),
+                    persist_embeddings=bool(config.chem_ace_persist_patch_embeddings),
                     n_workers=max(0, int(config.cpu_workers)),
                 )
             n_embeddings_infer = int(len(embeddings_infer))
@@ -1583,6 +1588,7 @@ def _build_feature_patch_embeddings(
     xinst_mean_by_id: Mapping[str, np.ndarray],
     max_2d_dim: int,
     max_3dqm_dim: int,
+    persist_embeddings: bool = False,
     n_workers: int = 0,
 ) -> list[PatchEmbeddingRecord]:
     emb_recs: list[PatchEmbeddingRecord] = []
@@ -1633,18 +1639,29 @@ def _build_feature_patch_embeddings(
                 if item is None:
                     continue
                 patch, vec, md = item
-                rec = pipeline.embedding_cache.save(
-                    patch=patch,
-                    layer_name="feature_fusion_2d3dqm",
-                    strategy="feature_projection",
-                    vector=vec,
-                    metadata={
-                        "strategy": "feature_projection",
-                        "d2": int(md["d2"]),
-                        "d3qm": int(md["d3qm"]),
-                        "ddesc": int(md["ddesc"]),
-                    },
-                )
+                rec_md = {
+                    "strategy": "feature_projection",
+                    "d2": int(md["d2"]),
+                    "d3qm": int(md["d3qm"]),
+                    "ddesc": int(md["ddesc"]),
+                }
+                if bool(persist_embeddings):
+                    rec = pipeline.embedding_cache.save(
+                        patch=patch,
+                        layer_name="feature_fusion_2d3dqm",
+                        strategy="feature_projection",
+                        vector=vec,
+                        metadata=rec_md,
+                    )
+                else:
+                    rec = PatchEmbeddingRecord(
+                        patch_id=str(patch.patch_id),
+                        layer_name="feature_fusion_2d3dqm",
+                        strategy="feature_projection",
+                        vector=np.asarray(vec, dtype=np.float32),
+                        embedding_uri=None,
+                        metadata=rec_md,
+                    )
                 emb_recs.append(rec)
     else:
         for i, patch in enumerate(patches, start=1):
@@ -1660,35 +1677,54 @@ def _build_feature_patch_embeddings(
             if item is None:
                 continue
             patch_rec, vec, md = item
-            rec = pipeline.embedding_cache.save(
-                patch=patch_rec,
-                layer_name="feature_fusion_2d3dqm",
-                strategy="feature_projection",
-                vector=vec,
-                metadata={
-                    "strategy": "feature_projection",
-                    "d2": int(md["d2"]),
-                    "d3qm": int(md["d3qm"]),
-                    "ddesc": int(md["ddesc"]),
-                },
-            )
+            rec_md = {
+                "strategy": "feature_projection",
+                "d2": int(md["d2"]),
+                "d3qm": int(md["d3qm"]),
+                "ddesc": int(md["ddesc"]),
+            }
+            if bool(persist_embeddings):
+                rec = pipeline.embedding_cache.save(
+                    patch=patch_rec,
+                    layer_name="feature_fusion_2d3dqm",
+                    strategy="feature_projection",
+                    vector=vec,
+                    metadata=rec_md,
+                )
+            else:
+                rec = PatchEmbeddingRecord(
+                    patch_id=str(patch_rec.patch_id),
+                    layer_name="feature_fusion_2d3dqm",
+                    strategy="feature_projection",
+                    vector=np.asarray(vec, dtype=np.float32),
+                    embedding_uri=None,
+                    metadata=rec_md,
+                )
             emb_recs.append(rec)
 
-    log_event(
-        "START",
-        "explainability.chem_ace.persist_patch_embeddings",
-        n_embeddings=int(len(emb_recs)),
-    )
-    if hasattr(pipeline.repository, "upsert_patch_embeddings"):
-        pipeline.repository.upsert_patch_embeddings(emb_recs)
+    if bool(persist_embeddings):
+        log_event(
+            "START",
+            "explainability.chem_ace.persist_patch_embeddings",
+            n_embeddings=int(len(emb_recs)),
+        )
+        if hasattr(pipeline.repository, "upsert_patch_embeddings"):
+            pipeline.repository.upsert_patch_embeddings(emb_recs)
+        else:
+            for rec in emb_recs:
+                pipeline.repository.upsert_patch_embedding(rec)
+        log_event(
+            "DONE",
+            "explainability.chem_ace.persist_patch_embeddings",
+            n_embeddings=int(len(emb_recs)),
+        )
     else:
-        for rec in emb_recs:
-            pipeline.repository.upsert_patch_embedding(rec)
-    log_event(
-        "DONE",
-        "explainability.chem_ace.persist_patch_embeddings",
-        n_embeddings=int(len(emb_recs)),
-    )
+        log_event(
+            "INFO",
+            "explainability.chem_ace.persist_patch_embeddings.skipped",
+            reason="disabled",
+            n_embeddings=int(len(emb_recs)),
+        )
 
     if not emb_recs:
         raise RuntimeError("Chem-ACE feature projection produced zero patch embeddings")

@@ -122,6 +122,7 @@ python3 "$WORKDIR/opt_net_fast.py" \
   --run_lambda_vol \
   --lambda_vol_run_ricci \
   --run_concept_rl \
+  --no-chem_ace_persist_patch_embeddings \
   --curated_smiles_col curated_SMILES \
   --chem_ace_conformer_sdf "$WORKDIR/$(basename "$CONF_SDF")" \
   --chem_ace_sdf_conf_id_prop "$CONF_ID_PROP" \

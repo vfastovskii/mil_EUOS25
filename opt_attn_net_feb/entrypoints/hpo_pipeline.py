@@ -200,6 +200,7 @@ class CLIExplainabilityConfig:
     chem_ace_target_total_patches: int
     chem_ace_max_2d_dim: int
     chem_ace_max_3dqm_dim: int
+    chem_ace_persist_patch_embeddings: bool
     chem_ace_top_concepts: int
     chem_ace_infer_max_distance: float
     lambda_vol_output_dir: str | None
@@ -386,6 +387,7 @@ class PipelineConfigFactory:
                 chem_ace_target_total_patches=int(args.chem_ace_target_total_patches),
                 chem_ace_max_2d_dim=int(args.chem_ace_max_2d_dim),
                 chem_ace_max_3dqm_dim=int(args.chem_ace_max_3dqm_dim),
+                chem_ace_persist_patch_embeddings=bool(args.chem_ace_persist_patch_embeddings),
                 chem_ace_top_concepts=int(args.chem_ace_top_concepts),
                 chem_ace_infer_max_distance=float(args.chem_ace_infer_max_distance),
                 lambda_vol_output_dir=(
@@ -880,6 +882,9 @@ class MILPipelineOrchestrator:
                         chem_ace_target_total_patches=int(self.config.explainability.chem_ace_target_total_patches),
                         chem_ace_max_2d_dim=int(self.config.explainability.chem_ace_max_2d_dim),
                         chem_ace_max_3dqm_dim=int(self.config.explainability.chem_ace_max_3dqm_dim),
+                        chem_ace_persist_patch_embeddings=bool(
+                            self.config.explainability.chem_ace_persist_patch_embeddings
+                        ),
                         chem_ace_top_concepts=int(self.config.explainability.chem_ace_top_concepts),
                         chem_ace_infer_max_distance=float(self.config.explainability.chem_ace_infer_max_distance),
                         lambda_vol_output_dir=self.config.explainability.lambda_vol_output_dir,
@@ -1074,6 +1079,15 @@ def _parse_args(argv: Any | None = None):
         type=int,
         default=0,
         help="Max merged 3D+QM dims for Chem-ACE embedding (<=0 uses full available merged dim).",
+    )
+    ap.add_argument(
+        "--chem_ace_persist_patch_embeddings",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Persist per-patch embedding files and DB rows. "
+            "Disabled by default to avoid massive disk usage."
+        ),
     )
     ap.add_argument("--chem_ace_top_concepts", type=int, default=64)
     ap.add_argument(

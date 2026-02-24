@@ -1414,6 +1414,7 @@ This section lists defaults exactly as defined in typed configs and CLI parser, 
 - `chem_ace_max_confs_per_id = 0` (`<=0` means use all conformers)
 - `chem_ace_max_2d_dim = 0` (`<=0` means auto-use full 2D raw dimension)
 - `chem_ace_max_3dqm_dim = 0` (`<=0` means auto-use full merged 3D+QM raw dimension)
+- `chem_ace_persist_patch_embeddings = False` (avoid writing millions of per-patch embedding files by default)
 - `chem_ace_top_concepts = 64`
 - `lambda_vol_output_dir = None`
 - `lambda_vol_db_uri = None`
@@ -1462,6 +1463,7 @@ Explainability:
 - `--chem_ace_max_confs_per_id 0` (`<=0` means use all conformers)
 - `--chem_ace_max_2d_dim 0` (`<=0` means auto-use full 2D raw dimension)
 - `--chem_ace_max_3dqm_dim 0` (`<=0` means auto-use full merged 3D+QM raw dimension)
+- `--chem_ace_persist_patch_embeddings false` (enable only if you explicitly need patch-embedding files/rows)
 - `--chem_ace_top_concepts 64`
 - `--lambda_vol_output_dir None`
 - `--lambda_vol_db_uri None`

@@ -9,7 +9,7 @@
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
-set -euo pipefail
+set -eo pipefail
 ulimit -n 4096 || true
 
 # -------------------- conda --------------------
@@ -48,7 +48,7 @@ FEAT3D_QM="${FEAT3D_QM:-${DATA_DIR}/scaled_3d_quantum.csv}"
 BEST_PARAMS_JSON="${BEST_PARAMS_JSON:-${REPO_DIR}/best_params_279756.json}"
 
 # Precomputed conformer SDF for 3D patching (one conformer per entry).
-CONF_SDF="${CONF_SDF:-${REPO_DIR}/test_mols_batch.sdf}"
+CONF_SDF="${CONF_SDF:-${REPO_DIR}/full_data_set_confs.sdf}"
 # Your SDF stores conformer ID in _Name.
 CONF_ID_PROP="${CONF_ID_PROP:-_Name}"
 
@@ -83,11 +83,12 @@ CHEMACE_MAX_IDS="${CHEMACE_MAX_IDS:-0}"
 CHEMACE_MAX_CONFS_PER_ID="${CHEMACE_MAX_CONFS_PER_ID:-0}"
 CHEMACE_LOCAL_RADII="${CHEMACE_LOCAL_RADII:-1}"
 CHEMACE_PATCH_CAP_PER_MOL="${CHEMACE_PATCH_CAP_PER_MOL:-0}"
-CHEMACE_TARGET_TOTAL_PATCHES="${CHEMACE_TARGET_TOTAL_PATCHES:-1200000}"
+CHEMACE_TARGET_TOTAL_PATCHES="${CHEMACE_TARGET_TOTAL_PATCHES:-1200}" #1200000
 CHEMACE_MAX_2D_DIM="${CHEMACE_MAX_2D_DIM:-0}"
 CHEMACE_MAX_3DQM_DIM="${CHEMACE_MAX_3DQM_DIM:-0}"
 CHEMACE_TOP_CONCEPTS="${CHEMACE_TOP_CONCEPTS:-64}"
 CHEMACE_INFER_MAX_DISTANCE="${CHEMACE_INFER_MAX_DISTANCE:--1.0}"
+CHEMACE_PERSIST_PATCH_EMBEDDINGS="${CHEMACE_PERSIST_PATCH_EMBEDDINGS:-0}"
 
 # Lambda-Vol controls
 LAMBDA_VOL_OUTPUT_DIR="${LAMBDA_VOL_OUTPUT_DIR:-}"
@@ -232,6 +233,11 @@ if [[ "$RUN_CHEM_ACE" == "1" ]]; then
     --chem_ace_top_concepts "$CHEMACE_TOP_CONCEPTS"
     --chem_ace_infer_max_distance "$CHEMACE_INFER_MAX_DISTANCE"
   )
+  if [[ "$CHEMACE_PERSIST_PATCH_EMBEDDINGS" == "1" ]]; then
+    CMD+=(--chem_ace_persist_patch_embeddings)
+  else
+    CMD+=(--no-chem_ace_persist_patch_embeddings)
+  fi
   if [[ -n "$CHEMACE_OUTPUT_DIR" ]]; then
     CMD+=(--chem_ace_output_dir "$CHEMACE_OUTPUT_DIR")
   fi

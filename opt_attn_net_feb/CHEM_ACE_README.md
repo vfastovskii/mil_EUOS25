@@ -597,6 +597,7 @@ From `entrypoints/hpo_pipeline.py`:
 - `--chem_ace_target_total_patches`
 - `--chem_ace_max_2d_dim` (`<=0` means auto-use full 2D raw dimension)
 - `--chem_ace_max_3dqm_dim` (`<=0` means auto-use full merged 3D+QM raw dimension)
+- `--chem_ace_persist_patch_embeddings` (default `false`; keeps embeddings in memory only to prevent huge disk writes)
 - `--chem_ace_top_concepts`
 - `--cpu_workers`
 
