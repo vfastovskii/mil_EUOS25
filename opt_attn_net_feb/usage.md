@@ -162,6 +162,11 @@ Final outputs include:
 
 - `<study_dir>/final_best_train_vs_leaderboard/explainability_artifacts.json`
 - Chem-ACE DB/artifacts in `chem_ace_output_dir` (or `<study_dir>/chem_ace`)
+- Chem-ACE molecule-level semantic baseline exports:
+  - `a_priori_tags.csv`
+  - `a_priori_vs_concepts.csv`
+  - `a_priori_tags_infer_scope.csv`
+  - `a_priori_vs_concepts_infer_scope.csv`
 - Lambda-Vol tensor/log/html artifacts in `lambda_vol_output_dir` (or `<study_dir>/lambda_vol`)
 - Concept-RL policy history JSON (`concept_rl_policy_history.json`) inside final run directory when enabled
 - Ricci artifacts (`ricci_edges_long.csv`, `ricci_task_summary.csv`, `ricci_flow_tensors.npz`) inside Lambda-Vol output

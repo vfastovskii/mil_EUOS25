@@ -1292,6 +1292,24 @@ class MILFinalTrainer:
                 "concept_set_id": str(chem_bundle.concept_set_id),
                 "n_concepts": int(len(chem_bundle.concept_ids)),
                 "concept_ids": [str(x) for x in chem_bundle.concept_ids],
+                "a_priori_tags_csv": (
+                    None if chem_bundle.a_priori_tags_csv is None else str(chem_bundle.a_priori_tags_csv)
+                ),
+                "a_priori_vs_concepts_csv": (
+                    None
+                    if chem_bundle.a_priori_vs_concepts_csv is None
+                    else str(chem_bundle.a_priori_vs_concepts_csv)
+                ),
+                "a_priori_tags_infer_csv": (
+                    None
+                    if chem_bundle.a_priori_tags_infer_csv is None
+                    else str(chem_bundle.a_priori_tags_infer_csv)
+                ),
+                "a_priori_vs_concepts_infer_csv": (
+                    None
+                    if chem_bundle.a_priori_vs_concepts_infer_csv is None
+                    else str(chem_bundle.a_priori_vs_concepts_infer_csv)
+                ),
                 "prediction_explanations_csv": (
                     None if explained_pred_path is None else str(explained_pred_path)
                 ),

@@ -398,6 +398,18 @@ SMARTS-RX file formats supported:
      - `role = <category>` (normalized)
      - defaults for confidence/threshold/provenance when missing
 
+Molecule-level baseline exports (a priori, structure-only):
+
+1. `a_priori_tags.csv`:
+   - one row per molecule in Chem-ACE scope
+   - tags from functional SMARTS / RDKit fragment rules / SMARTS-RX only
+2. `a_priori_vs_concepts.csv`:
+   - same rows, plus concept-level post-discovery annotations
+3. `a_priori_tags_infer_scope.csv`:
+   - infer/test subset (leaderboard scope in final run)
+4. `a_priori_vs_concepts_infer_scope.csv`:
+   - infer/test subset with concept-level annotations
+
 RDKit Fragments augmentation:
 
 1. during final Chem-ACE runtime, rules are auto-augmented from the labels table `curated_SMILES` column using all available `rdkit.Chem.Fragments.fr_*` functions

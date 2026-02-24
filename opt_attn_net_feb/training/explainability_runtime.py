@@ -121,6 +121,10 @@ class ChemACEBundle:
     concept_support: Mapping[str, int]
     concept_mol_map: Mapping[str, set[str]]
     concept_conf_map: Mapping[str, set[tuple[str, str]]]
+    a_priori_tags_csv: Optional[str] = None
+    a_priori_vs_concepts_csv: Optional[str] = None
+    a_priori_tags_infer_csv: Optional[str] = None
+    a_priori_vs_concepts_infer_csv: Optional[str] = None
 
 
 def build_positive_concept_targets(
@@ -564,6 +568,191 @@ def _prepare_dataset_functional_rules(
         n_unique_smiles=int(len(smiles)),
     )
     return out_rules
+
+
+def _semicolon_join(values: Iterable[str]) -> str:
+    cleaned = sorted({str(v).strip() for v in values if str(v).strip()})
+    return ";".join(cleaned)
+
+
+def _molecule_a_priori_semantic_tags(
+    *,
+    mol: Any,
+    semantic_tagger: Any,
+) -> dict[str, list[str]]:
+    """
+    Compute molecule-level a priori tags from structure-only rule systems.
+
+    This intentionally uses only functional SMARTS / RDKit fragment rules and SMARTS-RX
+    patterns, without concept discovery or model activations.
+    """
+    functional_tags: set[str] = set()
+    smartsrx_tags: set[str] = set()
+    smartsrx_roles: set[str] = set()
+
+    # Functional SMARTS rules.
+    for rule, pattern in getattr(semantic_tagger, "_functional_patterns", ()):
+        try:
+            hit = bool(mol.HasSubstructMatch(pattern))
+        except Exception:
+            hit = False
+        if hit:
+            functional_tags.add(str(rule.tag))
+
+    # Functional RDKit fragment-counter rules.
+    frag_fns = getattr(semantic_tagger, "_functional_fragment_functions", {})
+    if isinstance(frag_fns, Mapping) and len(frag_fns) > 0:
+        for rule in getattr(semantic_tagger, "functional_rules", ()):
+            fn_name = str(getattr(rule, "rdkit_fragment", "")).strip()
+            if not fn_name:
+                continue
+            fn = frag_fns.get(fn_name)
+            if fn is None:
+                continue
+            try:
+                value = float(fn(mol))
+            except Exception:
+                value = 0.0
+            if np.isfinite(value) and value > 0.0:
+                functional_tags.add(str(rule.tag))
+
+    # SMARTS-RX rule-level and role tags.
+    for rule, pattern in getattr(semantic_tagger, "_smarts_rx_patterns", ()):
+        try:
+            hit = bool(mol.HasSubstructMatch(pattern))
+        except Exception:
+            hit = False
+        if not hit:
+            continue
+        smartsrx_tags.add(str(rule.tag))
+        role = str(getattr(rule, "role", "")).strip()
+        if role:
+            role_tag = role if role.startswith("rx_role_") else f"rx_role_{role}"
+            smartsrx_roles.add(role_tag)
+
+    all_tags = sorted(functional_tags.union(smartsrx_tags).union(smartsrx_roles))
+    return {
+        "all_tags": all_tags,
+        "functional_tags": sorted(functional_tags),
+        "smartsrx_tags": sorted(smartsrx_tags),
+        "smartsrx_role_tags": sorted(smartsrx_roles),
+    }
+
+
+def _export_a_priori_and_concept_views(
+    *,
+    out_dir: Path,
+    ids_discover: Sequence[str],
+    ids_infer: Sequence[str],
+    smiles_by_id: Mapping[str, str],
+    molecules_by_id: Mapping[str, Any],
+    semantic_tagger: Any,
+    concept_mol_map: Mapping[str, set[str]],
+    concept_metadata: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Optional[str]]:
+    """
+    Export molecule-level a priori tags and joined concept annotations.
+
+    Files written:
+    - a_priori_tags.csv
+    - a_priori_vs_concepts.csv
+    - a_priori_tags_infer_scope.csv
+    - a_priori_vs_concepts_infer_scope.csv
+    """
+    all_ids = sorted(set(str(x) for x in ids_discover).union(str(x) for x in ids_infer))
+    infer_ids_set = {str(x) for x in ids_infer}
+
+    rows: list[dict[str, Any]] = []
+    for mol_id in all_ids:
+        mol = molecules_by_id.get(str(mol_id))
+        if mol is None:
+            continue
+        tags = _molecule_a_priori_semantic_tags(mol=mol, semantic_tagger=semantic_tagger)
+        rows.append(
+            {
+                "ID": str(mol_id),
+                "scope": ("infer_scope" if str(mol_id) in infer_ids_set else "discover_train"),
+                "curated_SMILES": str(smiles_by_id.get(str(mol_id), "")),
+                "n_a_priori_tags": int(len(tags["all_tags"])),
+                "a_priori_tags": _semicolon_join(tags["all_tags"]),
+                "a_priori_functional_tags": _semicolon_join(tags["functional_tags"]),
+                "a_priori_smartsrx_tags": _semicolon_join(tags["smartsrx_tags"]),
+                "a_priori_smartsrx_role_tags": _semicolon_join(tags["smartsrx_role_tags"]),
+            }
+        )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df_priors = pd.DataFrame(rows)
+    priors_csv = out_dir / "a_priori_tags.csv"
+    df_priors.to_csv(priors_csv, index=False)
+
+    # Build molecule -> concepts index.
+    mol_to_concepts: dict[str, list[str]] = {}
+    for concept_id, mols in concept_mol_map.items():
+        cid = str(concept_id)
+        for mid in mols:
+            m = str(mid)
+            if m not in mol_to_concepts:
+                mol_to_concepts[m] = []
+            mol_to_concepts[m].append(cid)
+
+    concept_rows: list[dict[str, Any]] = []
+    for row in rows:
+        mid = str(row["ID"])
+        cids = sorted(set(mol_to_concepts.get(mid, [])))
+        labels = [
+            str(concept_metadata.get(cid, {}).get("label_auto") or cid)
+            for cid in cids
+        ]
+        ctags: list[str] = []
+        for cid in cids:
+            tags = concept_metadata.get(cid, {}).get("tags", [])
+            if isinstance(tags, (list, tuple)):
+                ctags.extend([str(t) for t in tags if str(t).strip()])
+        concept_rows.append(
+            {
+                **row,
+                "n_concepts": int(len(cids)),
+                "concept_ids": _semicolon_join(cids),
+                "concept_labels": _semicolon_join(labels),
+                "concept_tags": _semicolon_join(ctags),
+            }
+        )
+
+    df_join = pd.DataFrame(concept_rows)
+    join_csv = out_dir / "a_priori_vs_concepts.csv"
+    df_join.to_csv(join_csv, index=False)
+
+    priors_infer_csv: Optional[Path] = None
+    join_infer_csv: Optional[Path] = None
+    if len(infer_ids_set) > 0:
+        df_priors_infer = df_priors[df_priors["ID"].astype(str).isin(infer_ids_set)].copy()
+        priors_infer_csv = out_dir / "a_priori_tags_infer_scope.csv"
+        df_priors_infer.to_csv(priors_infer_csv, index=False)
+
+        df_join_infer = df_join[df_join["ID"].astype(str).isin(infer_ids_set)].copy()
+        join_infer_csv = out_dir / "a_priori_vs_concepts_infer_scope.csv"
+        df_join_infer.to_csv(join_infer_csv, index=False)
+
+    log_event(
+        "INFO",
+        "explainability.chem_ace.a_priori_exports",
+        n_rows_all=int(len(df_priors)),
+        n_rows_infer=int(0 if priors_infer_csv is None else len(df_priors[df_priors["ID"].astype(str).isin(infer_ids_set)])),
+        path_priors=str(priors_csv),
+        path_join=str(join_csv),
+        path_priors_infer=(None if priors_infer_csv is None else str(priors_infer_csv)),
+        path_join_infer=(None if join_infer_csv is None else str(join_infer_csv)),
+    )
+
+    return {
+        "a_priori_tags_csv": str(priors_csv),
+        "a_priori_vs_concepts_csv": str(join_csv),
+        "a_priori_tags_infer_csv": (None if priors_infer_csv is None else str(priors_infer_csv)),
+        "a_priori_vs_concepts_infer_csv": (
+            None if join_infer_csv is None else str(join_infer_csv)
+        ),
+    }
 
 
 def prepare_chem_ace_bundle(
@@ -1020,6 +1209,17 @@ def prepare_chem_ace_bundle(
             "n_conf_pairs_total": int(len(confs_total)),
         }
 
+    a_priori_paths = _export_a_priori_and_concept_views(
+        out_dir=ace_out_dir,
+        ids_discover=ids_discover,
+        ids_infer=ids_infer,
+        smiles_by_id=smiles_by_id,
+        molecules_by_id=molecules_by_id,
+        semantic_tagger=pipeline.semantic_tagger,
+        concept_mol_map=concept_mol_map,
+        concept_metadata=concept_metadata,
+    )
+
     ordered_concepts = sorted(
         support_map.keys(),
         key=lambda cid: support_map[cid],
@@ -1041,6 +1241,10 @@ def prepare_chem_ace_bundle(
         "n_inferred_memberships": int(n_inferred_memberships),
         "n_concepts": int(len(concept_set.candidates)),
         "selected_concepts": ordered_concepts,
+        "a_priori_tags_csv": a_priori_paths.get("a_priori_tags_csv"),
+        "a_priori_vs_concepts_csv": a_priori_paths.get("a_priori_vs_concepts_csv"),
+        "a_priori_tags_infer_csv": a_priori_paths.get("a_priori_tags_infer_csv"),
+        "a_priori_vs_concepts_infer_csv": a_priori_paths.get("a_priori_vs_concepts_infer_csv"),
     }
     (ace_out_dir / "chem_ace_pipeline_summary.json").write_text(json.dumps(summary, indent=2))
 
@@ -1071,6 +1275,26 @@ def prepare_chem_ace_bundle(
         concept_support=support_map,
         concept_mol_map=concept_mol_map,
         concept_conf_map=concept_conf_map,
+        a_priori_tags_csv=(
+            None
+            if a_priori_paths.get("a_priori_tags_csv") is None
+            else str(a_priori_paths["a_priori_tags_csv"])
+        ),
+        a_priori_vs_concepts_csv=(
+            None
+            if a_priori_paths.get("a_priori_vs_concepts_csv") is None
+            else str(a_priori_paths["a_priori_vs_concepts_csv"])
+        ),
+        a_priori_tags_infer_csv=(
+            None
+            if a_priori_paths.get("a_priori_tags_infer_csv") is None
+            else str(a_priori_paths["a_priori_tags_infer_csv"])
+        ),
+        a_priori_vs_concepts_infer_csv=(
+            None
+            if a_priori_paths.get("a_priori_vs_concepts_infer_csv") is None
+            else str(a_priori_paths["a_priori_vs_concepts_infer_csv"])
+        ),
     )
 
 
