@@ -1064,7 +1064,12 @@ def _parse_args(argv: Any | None = None):
         help="Target total patches when auto-cap is enabled (<=0 disables auto-cap).",
     )
     ap.add_argument("--chem_ace_max_2d_dim", type=int, default=256)
-    ap.add_argument("--chem_ace_max_3dqm_dim", type=int, default=256)
+    ap.add_argument(
+        "--chem_ace_max_3dqm_dim",
+        type=int,
+        default=0,
+        help="Max merged 3D+QM dims for Chem-ACE embedding (<=0 uses full available merged dim).",
+    )
     ap.add_argument("--chem_ace_top_concepts", type=int, default=64)
     ap.add_argument(
         "--chem_ace_infer_max_distance",

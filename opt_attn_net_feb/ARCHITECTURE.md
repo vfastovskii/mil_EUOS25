@@ -817,14 +817,16 @@ Patch IDs/hashes are deterministic SHA1 signatures over:
 
 For each patch, integrated runtime creates feature-level vector:
 - `v2d = take_or_pad(x2d, chem_ace_max_2d_dim)`
-- `v3dqm = take_or_pad(conf-specific instance vector or molecule mean, chem_ace_max_3dqm_dim)`
+- `v3dqm = take_or_pad(conf-specific instance vector or molecule mean, resolved_chem_ace_3dqm_dim)`
+  - where `resolved_chem_ace_3dqm_dim = chem_ace_max_3dqm_dim` if `chem_ace_max_3dqm_dim > 0`
+  - else `resolved_chem_ace_3dqm_dim = full merged 3D+QM raw dimension` from `Xinst_sorted.shape[1]`
 - descriptor vector:
   - 10 scalar patch descriptors
   - +5 one-hot patch type indicators
 
 Final patch vector:
 - `vec = concat([v2d, v3dqm, descriptors])`
-- dimension = `chem_ace_max_2d_dim + chem_ace_max_3dqm_dim + 15`
+- dimension = `chem_ace_max_2d_dim + resolved_chem_ace_3dqm_dim + 15`
 
 Stored with metadata via embedding cache and DB.
 
@@ -1409,7 +1411,7 @@ This section lists defaults exactly as defined in typed configs and CLI parser, 
 - `chem_ace_max_ids = 0` (`0` means use all IDs in scope)
 - `chem_ace_max_confs_per_id = 0` (`<=0` means use all conformers)
 - `chem_ace_max_2d_dim = 256`
-- `chem_ace_max_3dqm_dim = 256`
+- `chem_ace_max_3dqm_dim = 0` (`<=0` means auto-use full merged 3D+QM raw dimension)
 - `chem_ace_top_concepts = 64`
 - `lambda_vol_output_dir = None`
 - `lambda_vol_db_uri = None`
@@ -1457,7 +1459,7 @@ Explainability:
 - `--chem_ace_max_ids 0` (`0` means use all IDs in scope)
 - `--chem_ace_max_confs_per_id 0` (`<=0` means use all conformers)
 - `--chem_ace_max_2d_dim 256`
-- `--chem_ace_max_3dqm_dim 256`
+- `--chem_ace_max_3dqm_dim 0` (`<=0` means auto-use full merged 3D+QM raw dimension)
 - `--chem_ace_top_concepts 64`
 - `--lambda_vol_output_dir None`
 - `--lambda_vol_db_uri None`

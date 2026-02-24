@@ -74,7 +74,8 @@ class FinalExplainabilityConfig:
     chem_ace_patch_cap_per_mol: int = 0
     chem_ace_target_total_patches: int = 1200000
     chem_ace_max_2d_dim: int = 256
-    chem_ace_max_3dqm_dim: int = 256
+    # <=0 means use full available merged 3D+QM feature dimension.
+    chem_ace_max_3dqm_dim: int = 0
     chem_ace_top_concepts: int = 64
     # <=0 disables distance gating for inference-time nearest-centroid assignment.
     chem_ace_infer_max_distance: float = -1.0
@@ -794,6 +795,14 @@ def prepare_chem_ace_bundle(
     )
     dim_2d_raw = int(X2d_file.shape[1]) if np.asarray(X2d_file).ndim == 2 else -1
     dim_inst_raw = int(Xinst_sorted.shape[1]) if np.asarray(Xinst_sorted).ndim == 2 else -1
+    dim_2d_used = _resolve_effective_feature_dim(
+        requested_dim=int(config.chem_ace_max_2d_dim),
+        raw_dim=int(dim_2d_raw),
+    )
+    dim_3dqm_used = _resolve_effective_feature_dim(
+        requested_dim=int(config.chem_ace_max_3dqm_dim),
+        raw_dim=int(dim_inst_raw),
+    )
     log_event(
         "INFO",
         "explainability.chem_ace.modalities",
@@ -802,8 +811,10 @@ def prepare_chem_ace_bundle(
         dim_3d_geom=(int(inst_geom_dim) if int(inst_geom_dim) > 0 else "unknown"),
         dim_3d_qm=(int(inst_qm_dim) if int(inst_qm_dim) > 0 else "unknown"),
         dim_3dqm_merged_raw=int(dim_inst_raw),
-        dim_2d_used=int(config.chem_ace_max_2d_dim),
-        dim_3dqm_used=int(config.chem_ace_max_3dqm_dim),
+        dim_2d_cfg=int(config.chem_ace_max_2d_dim),
+        dim_3dqm_cfg=int(config.chem_ace_max_3dqm_dim),
+        dim_2d_used=int(dim_2d_used),
+        dim_3dqm_used=int(dim_3dqm_used),
         n_geom_descriptor_cols=int(len(inst_geom_cols)),
         n_qm_descriptor_cols=int(len(inst_qm_cols)),
     )
@@ -1015,8 +1026,8 @@ def prepare_chem_ace_bundle(
     progress_extras_discover = {
         "phase": "discover_train",
         "modalities": "2d+3d+3d_qm",
-        "dim_2d_used": int(config.chem_ace_max_2d_dim),
-        "dim_3dqm_used": int(config.chem_ace_max_3dqm_dim),
+        "dim_2d_used": int(dim_2d_used),
+        "dim_3dqm_used": int(dim_3dqm_used),
     }
     if int(inst_geom_dim) > 0:
         progress_extras_discover["dim_3d_geom"] = int(inst_geom_dim)
@@ -1053,8 +1064,8 @@ def prepare_chem_ace_bundle(
             x2d_by_id=x2d_by_id,
             xinst_by_pair=inst_map,
             xinst_mean_by_id=inst_mean_map,
-            max_2d_dim=int(config.chem_ace_max_2d_dim),
-            max_3dqm_dim=int(config.chem_ace_max_3dqm_dim),
+            max_2d_dim=int(dim_2d_used),
+            max_3dqm_dim=int(dim_3dqm_used),
             n_workers=max(0, int(config.cpu_workers)),
         )
     log_event(
@@ -1096,8 +1107,8 @@ def prepare_chem_ace_bundle(
         progress_extras_infer = {
             "phase": "infer_scope",
             "modalities": "2d+3d+3d_qm",
-            "dim_2d_used": int(config.chem_ace_max_2d_dim),
-            "dim_3dqm_used": int(config.chem_ace_max_3dqm_dim),
+            "dim_2d_used": int(dim_2d_used),
+            "dim_3dqm_used": int(dim_3dqm_used),
         }
         if int(inst_geom_dim) > 0:
             progress_extras_infer["dim_3d_geom"] = int(inst_geom_dim)
@@ -1134,8 +1145,8 @@ def prepare_chem_ace_bundle(
                     x2d_by_id=x2d_by_id,
                     xinst_by_pair=inst_map,
                     xinst_mean_by_id=inst_mean_map,
-                    max_2d_dim=int(config.chem_ace_max_2d_dim),
-                    max_3dqm_dim=int(config.chem_ace_max_3dqm_dim),
+                    max_2d_dim=int(dim_2d_used),
+                    max_3dqm_dim=int(dim_3dqm_used),
                     n_workers=max(0, int(config.cpu_workers)),
                 )
             n_embeddings_infer = int(len(embeddings_infer))
@@ -1760,6 +1771,22 @@ def _take_or_pad(vec: np.ndarray, dim: int) -> np.ndarray:
     out[: v.shape[0]] = v
     return out
 
+
+
+def _resolve_effective_feature_dim(*, requested_dim: int, raw_dim: int) -> int:
+    """
+    Resolve effective feature width for Chem-ACE feature projection.
+
+    requested_dim > 0: use requested cap.
+    requested_dim <= 0: auto-use full available raw width.
+    """
+    req = int(requested_dim)
+    raw = int(raw_dim)
+    if req > 0:
+        return req
+    if raw > 0:
+        return raw
+    return 1
 
 
 def _infer_memberships_to_frozen_centroids(
