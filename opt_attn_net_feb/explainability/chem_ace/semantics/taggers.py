@@ -5,6 +5,7 @@ import json
 import logging
 from pathlib import Path
 import re
+import time
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 import numpy as np
@@ -17,6 +18,7 @@ from ..optional_deps import (
 )
 from ..types import PatchRecord, TagAssignment
 from .naming import NamingRegistry, choose_label
+from ....utils.progress import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -319,10 +321,31 @@ class SemanticTagger:
 
     def _init_openbabel_backend(self) -> Any:
         if not bool(self.config.use_openbabel_descriptors):
+            log_event(
+                "INFO",
+                "explainability.chem_ace.tag_concepts.openbabel",
+                enabled=False,
+                reason="disabled_by_config",
+            )
             return None
         try:
-            return require_openbabel_pybel()
-        except OptionalDependencyError:
+            backend = require_openbabel_pybel()
+            backend_name = getattr(backend, "__name__", backend.__class__.__name__)
+            log_event(
+                "INFO",
+                "explainability.chem_ace.tag_concepts.openbabel",
+                enabled=True,
+                backend=str(backend_name),
+            )
+            return backend
+        except OptionalDependencyError as exc:
+            log_event(
+                "WARN",
+                "explainability.chem_ace.tag_concepts.openbabel",
+                enabled=False,
+                reason="optional_dependency_missing",
+                error=repr(exc),
+            )
             logger.info("Open Babel pybel is unavailable; skipping Open Babel semantic descriptors")
             return None
 
@@ -339,7 +362,15 @@ class SemanticTagger:
         geom_feature_names: Optional[Sequence[str]] = None,
         qm_feature_names: Optional[Sequence[str]] = None,
     ) -> SemanticTaggingResult:
+        tag_t0 = time.perf_counter()
+        log_event(
+            "START",
+            "explainability.chem_ace.tag_concepts.tag_one",
+            concept_id=str(concept_id),
+            n_patches=int(len(concept_patches)),
+        )
         descriptors = self._compute_descriptors(
+            concept_id=str(concept_id),
             concept_patches=concept_patches,
             molecules_by_id=molecules_by_id,
             inst_by_pair=inst_by_pair,
@@ -364,6 +395,14 @@ class SemanticTagger:
         tag_names = [t.tag for t in tags]
         descriptor_rank = self._descriptor_rank(descriptors)
         label_auto = choose_label(tags=tag_names, registry=self.registry, descriptor_rank=descriptor_rank)
+        log_event(
+            "DONE",
+            "explainability.chem_ace.tag_concepts.tag_one",
+            concept_id=str(concept_id),
+            n_tags=int(len(tags)),
+            label_auto=str(label_auto),
+            elapsed_s=f"{(time.perf_counter() - tag_t0):.2f}",
+        )
 
         return SemanticTaggingResult(
             concept_id=concept_id,
@@ -375,6 +414,7 @@ class SemanticTagger:
     def _compute_descriptors(
         self,
         *,
+        concept_id: str,
         concept_patches: Sequence[PatchRecord],
         molecules_by_id: Mapping[str, Any],
         inst_by_pair: Optional[Mapping[tuple[str, str], np.ndarray]],
@@ -384,14 +424,32 @@ class SemanticTagger:
         geom_feature_names: Optional[Sequence[str]],
         qm_feature_names: Optional[Sequence[str]],
     ) -> dict[str, Any]:
+        t0 = time.perf_counter()
+        n_patches = int(len(concept_patches))
+        log_event(
+            "START",
+            "explainability.chem_ace.tag_concepts.compute_descriptors",
+            concept_id=str(concept_id),
+            n_patches=n_patches,
+            functional_rules=int(len(self.functional_rules)),
+            smarts_rx_rules=int(len(self.smarts_rx_rules)),
+            openbabel_enabled=bool(self._openbabel_pybel is not None),
+        )
         try:
             require_rdkit()
             from rdkit.Chem import rdPartialCharges
             from rdkit.Chem import ChemicalFeatures
             from rdkit import RDConfig
             from rdkit import Chem
-        except OptionalDependencyError:
-            return {"n_patches": int(len(concept_patches)), "rdkit_available": False}
+        except OptionalDependencyError as exc:
+            log_event(
+                "WARN",
+                "explainability.chem_ace.tag_concepts.compute_descriptors",
+                concept_id=str(concept_id),
+                rdkit_available=False,
+                error=repr(exc),
+            )
+            return {"n_patches": n_patches, "rdkit_available": False}
 
         formal_charge_sums: list[float] = []
         gasteiger_vals: list[float] = []
@@ -440,6 +498,9 @@ class SemanticTagger:
         functional_fragment_cache: dict[str, dict[str, float]] = {}
         smarts_rx_cache: dict[str, tuple[tuple[set[int], ...], ...]] = {}
         mol_seen: dict[str, Any] = {}
+        gasteiger_mol_calcs = 0
+        functional_overlap_hits_total = 0
+        smarts_rx_overlap_hits_total = 0
 
         geom_names = self._normalize_geom_feature_names(
             geom_feature_names=geom_feature_names,
@@ -451,7 +512,9 @@ class SemanticTagger:
         )
 
         valid_patch_count = 0
-        for patch in concept_patches:
+        progress_every = max(1, n_patches // 5) if n_patches > 0 else 1
+        emit_progress = n_patches >= 250
+        for done, patch in enumerate(concept_patches, start=1):
             mol = molecules_by_id.get(patch.mol_id)
             if mol is None:
                 continue
@@ -468,6 +531,7 @@ class SemanticTagger:
 
             charges = gasteiger_cache.get(mol_id)
             if charges is None:
+                gasteiger_mol_calcs += 1
                 try:
                     mol_copy = Chem.Mol(mol)
                     rdPartialCharges.ComputeGasteigerCharges(mol_copy)
@@ -576,6 +640,7 @@ class SemanticTagger:
                         if match_atoms.intersection(atom_set):
                             overlap_hits += 1
                     if overlap_hits > 0:
+                        functional_overlap_hits_total += int(overlap_hits)
                         functional_patch_presence[rule.tag] = int(functional_patch_presence.get(rule.tag, 0) + 1)
                         functional_match_hits[rule.tag] = int(functional_match_hits.get(rule.tag, 0) + overlap_hits)
 
@@ -628,6 +693,7 @@ class SemanticTagger:
                         if match_atoms_rx.intersection(atom_set):
                             overlap_hits_rx += 1
                     if overlap_hits_rx > 0:
+                        smarts_rx_overlap_hits_total += int(overlap_hits_rx)
                         smarts_rx_patch_presence[rule.tag] = int(smarts_rx_patch_presence.get(rule.tag, 0) + 1)
                         smarts_rx_match_hits[rule.tag] = int(smarts_rx_match_hits.get(rule.tag, 0) + overlap_hits_rx)
                         if rule.role:
@@ -645,6 +711,16 @@ class SemanticTagger:
                 geom_vectors.append(geom_vec.astype(np.float32, copy=False))
             if qm_vec is not None and qm_vec.size > 0:
                 qm_vectors.append(qm_vec.astype(np.float32, copy=False))
+            if emit_progress and ((done % progress_every) == 0 or done == n_patches):
+                log_event(
+                    "PROGRESS",
+                    "explainability.chem_ace.tag_concepts.compute_descriptors.loop",
+                    concept_id=str(concept_id),
+                    done=int(done),
+                    total=n_patches,
+                    pct=f"{(100.0 * done / max(1, n_patches)):.1f}",
+                    valid_patches=int(valid_patch_count),
+                )
 
         functional_patch_rate = {
             str(tag): float(cnt) / float(max(1, valid_patch_count))
@@ -670,10 +746,36 @@ class SemanticTagger:
             qm_vectors=qm_vectors,
             qm_feature_names=qm_names,
         )
-
+        log_event(
+            "INFO",
+            "explainability.chem_ace.tag_concepts.compute_descriptors.summary",
+            concept_id=str(concept_id),
+            n_valid_patches=int(valid_patch_count),
+            n_unique_molecules=int(len(mol_seen)),
+            gasteiger_molecules=int(gasteiger_mol_calcs),
+            smarts_overlap_hits=int(functional_overlap_hits_total),
+            smarts_rx_overlap_hits=int(smarts_rx_overlap_hits_total),
+            geom_vectors=int(len(geom_vectors)),
+            qm_vectors=int(len(qm_vectors)),
+        )
+        if self._openbabel_pybel is not None:
+            log_event(
+                "START",
+                "explainability.chem_ace.tag_concepts.openbabel_summary",
+                concept_id=str(concept_id),
+                n_molecules=int(len(mol_seen)),
+            )
         openbabel_summary = self._summarize_openbabel_descriptors(molecules_by_id=mol_seen)
+        if self._openbabel_pybel is not None:
+            log_event(
+                "DONE",
+                "explainability.chem_ace.tag_concepts.openbabel_summary",
+                concept_id=str(concept_id),
+                n_molecules=int(openbabel_summary.get("n_molecules", 0)),
+                enabled=bool(openbabel_summary.get("enabled", False)),
+            )
 
-        return {
+        out = {
             "n_patches": int(len(concept_patches)),
             "n_valid_patches": int(valid_patch_count),
             "rdkit_available": True,
@@ -708,6 +810,14 @@ class SemanticTagger:
             "qm_summary": qm_summary,
             "openbabel_descriptor_summary": openbabel_summary,
         }
+        log_event(
+            "DONE",
+            "explainability.chem_ace.tag_concepts.compute_descriptors",
+            concept_id=str(concept_id),
+            n_valid_patches=int(valid_patch_count),
+            elapsed_s=f"{(time.perf_counter() - t0):.2f}",
+        )
+        return out
 
     def _summarize_geom_vectors(
         self,

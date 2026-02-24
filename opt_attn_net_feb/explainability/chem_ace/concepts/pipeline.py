@@ -452,6 +452,18 @@ class ChemACEPipeline:
             for cand in concept_set.candidates
             if members_by_concept.get(cand.concept_local_id, [])
         ]
+        n_candidates_total = int(len(concept_set.candidates))
+        n_candidates_with_patches = int(len(candidates_with_patches))
+        n_memberships = int(len(concept_set.memberships))
+        log_event(
+            "INFO",
+            "explainability.chem_ace.tag_concepts.membership_index",
+            n_patches=int(len(patch_by_id)),
+            n_memberships=n_memberships,
+            n_candidates=n_candidates_total,
+            n_candidates_with_patches=n_candidates_with_patches,
+            cpu_workers=int(workers),
+        )
 
         def _tag_one(cand) -> SemanticTaggingResult:
             cpatches = members_by_concept[cand.concept_local_id]
@@ -467,17 +479,95 @@ class ChemACEPipeline:
                 qm_feature_names=qm_feature_names,
             )
 
+        results: list[SemanticTaggingResult] = []
+        n_total = int(len(candidates_with_patches))
+        progress_every = max(1, n_total // 10) if n_total > 0 else 1
+        compute_t0 = time.perf_counter()
+        log_event(
+            "START",
+            "explainability.chem_ace.tag_concepts.compute",
+            n_concepts=n_total,
+            cpu_workers=int(workers),
+        )
         if workers > 1:
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                results = list(ex.map(_tag_one, candidates_with_patches))
+                future_to_concept = {
+                    ex.submit(_tag_one, cand): str(cand.concept_local_id)
+                    for cand in candidates_with_patches
+                }
+                for done, fut in enumerate(as_completed(future_to_concept), start=1):
+                    concept_id = future_to_concept[fut]
+                    try:
+                        result = fut.result()
+                    except Exception as exc:
+                        log_event(
+                            "FAIL",
+                            "explainability.chem_ace.tag_concepts.compute_one",
+                            concept_id=concept_id,
+                            error=repr(exc),
+                        )
+                        raise
+                    results.append(result)
+                    if (done % progress_every) == 0 or done == n_total:
+                        log_event(
+                            "PROGRESS",
+                            "explainability.chem_ace.tag_concepts.compute",
+                            done=int(done),
+                            total=n_total,
+                            pct=f"{(100.0 * done / max(1, n_total)):.1f}",
+                            cpu_workers=int(workers),
+                        )
         else:
-            results = [_tag_one(cand) for cand in candidates_with_patches]
+            for done, cand in enumerate(candidates_with_patches, start=1):
+                result = _tag_one(cand)
+                results.append(result)
+                if (done % progress_every) == 0 or done == n_total:
+                    log_event(
+                        "PROGRESS",
+                        "explainability.chem_ace.tag_concepts.compute",
+                        done=int(done),
+                        total=n_total,
+                        pct=f"{(100.0 * done / max(1, n_total)):.1f}",
+                        cpu_workers=1,
+                    )
+        log_event(
+            "DONE",
+            "explainability.chem_ace.tag_concepts.compute",
+            n_results=int(len(results)),
+            elapsed_s=f"{(time.perf_counter() - compute_t0):.2f}",
+        )
 
+        persist_t0 = time.perf_counter()
+        log_event(
+            "START",
+            "explainability.chem_ace.tag_concepts.persist",
+            n_results=int(len(results)),
+        )
         out: list[SemanticTaggingResult] = []
-        for result in results:
+        n_tags_total = 0
+        n_results = int(len(results))
+        persist_every = max(1, n_results // 10) if n_results > 0 else 1
+        for done, result in enumerate(results, start=1):
             self.repository.set_concept_label(concept_id=result.concept_id, label_auto=result.label_auto)
             self.repository.upsert_tags(result.tags)
             out.append(result)
+            n_tags_total += int(len(result.tags))
+            if (done % persist_every) == 0 or done == n_results:
+                log_event(
+                    "PROGRESS",
+                    "explainability.chem_ace.tag_concepts.persist",
+                    done=int(done),
+                    total=n_results,
+                    pct=f"{(100.0 * done / max(1, n_results)):.1f}",
+                    tags_written=int(n_tags_total),
+                )
+        log_event(
+            "DONE",
+            "explainability.chem_ace.tag_concepts.persist",
+            n_results=int(len(out)),
+            tags_written=int(n_tags_total),
+            elapsed_s=f"{(time.perf_counter() - persist_t0):.2f}",
+        )
         logger.info("Tagged concepts", extra={"n_tagged": len(out), "cpu_workers": workers})
         return out
 
