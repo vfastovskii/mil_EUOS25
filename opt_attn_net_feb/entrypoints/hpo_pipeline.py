@@ -188,6 +188,7 @@ class CLIExplainabilityConfig:
     run_chem_ace: bool
     run_lambda_vol: bool
     run_concept_rl: bool
+    run_concept_rl_ablation: bool
     curated_smiles_col: str
     chem_ace_conformer_sdf: str | None
     chem_ace_sdf_conf_id_prop: str
@@ -384,6 +385,7 @@ class PipelineConfigFactory:
                 run_chem_ace=bool(args.run_chem_ace),
                 run_lambda_vol=bool(args.run_lambda_vol),
                 run_concept_rl=bool(args.run_concept_rl),
+                run_concept_rl_ablation=bool(args.run_concept_rl_ablation),
                 curated_smiles_col=str(args.curated_smiles_col),
                 chem_ace_conformer_sdf=(
                     None if args.chem_ace_conformer_sdf is None else str(args.chem_ace_conformer_sdf)
@@ -496,6 +498,7 @@ class PipelineEnvironmentFactory:
                 "run_chem_ace": bool(self.config.explainability.run_chem_ace),
                 "run_lambda_vol": bool(self.config.explainability.run_lambda_vol),
                 "run_concept_rl": bool(self.config.explainability.run_concept_rl),
+                "run_concept_rl_ablation": bool(self.config.explainability.run_concept_rl_ablation),
                 "lambda_vol_run_ricci": bool(self.config.explainability.lambda_vol_run_ricci),
                 "curated_smiles_col": str(self.config.explainability.curated_smiles_col),
                 "argv": " ".join([str(x) for x in (argv if argv is not None else os.sys.argv)]),
@@ -884,29 +887,38 @@ class MILPipelineOrchestrator:
                     inst_geom_cols=tuple(str(x) for x in inst_meta_all.get("geom_cols", ())),
                     inst_qm_cols=tuple(str(x) for x in inst_meta_all.get("qm_cols", ())),
                 )
-                final_cfg = FinalTrainConfig(
-                    seed=int(self.config.runtime.seed),
-                    trainer=TrainerSystemConfig(
-                        max_epochs=int(self.config.runtime.max_epochs),
-                        patience=int(self.config.runtime.patience),
-                        accelerator=str(self.config.runtime.nn_accelerator),
-                        devices=int(self.config.runtime.nn_devices),
-                        precision=str(self.config.runtime.precision),
-                    ),
-                    loader=LoaderConfig(
-                        num_workers=int(env.num_workers),
-                        pin_memory=bool(env.pin_memory),
-                    ),
-                    attn_out=self.config.export.attn_out,
-                    explainability=FinalExplainabilityConfig(
+                trainer_cfg = TrainerSystemConfig(
+                    max_epochs=int(self.config.runtime.max_epochs),
+                    patience=int(self.config.runtime.patience),
+                    accelerator=str(self.config.runtime.nn_accelerator),
+                    devices=int(self.config.runtime.nn_devices),
+                    precision=str(self.config.runtime.precision),
+                )
+                loader_cfg = LoaderConfig(
+                    num_workers=int(env.num_workers),
+                    pin_memory=bool(env.pin_memory),
+                )
+
+                def _make_explainability_cfg(
+                    *,
+                    run_concept_rl: bool,
+                    run_label: str | None,
+                ) -> FinalExplainabilityConfig:
+                    return FinalExplainabilityConfig(
                         run_chem_ace=bool(self.config.explainability.run_chem_ace),
                         run_lambda_vol=bool(self.config.explainability.run_lambda_vol),
                         curated_smiles_col=str(self.config.explainability.curated_smiles_col),
                         chem_ace_conformer_sdf=self.config.explainability.chem_ace_conformer_sdf,
                         chem_ace_sdf_conf_id_prop=str(self.config.explainability.chem_ace_sdf_conf_id_prop),
                         cpu_workers=int(env.cpu_workers),
-                        chem_ace_output_dir=self.config.explainability.chem_ace_output_dir,
-                        chem_ace_db_uri=self.config.explainability.chem_ace_db_uri,
+                        chem_ace_output_dir=self._suffix_output_dir(
+                            base_dir=self.config.explainability.chem_ace_output_dir,
+                            suffix=run_label,
+                        ),
+                        chem_ace_db_uri=self._suffix_sqlite_uri(
+                            base_uri=self.config.explainability.chem_ace_db_uri,
+                            suffix=run_label,
+                        ),
                         chem_ace_max_ids=int(self.config.explainability.chem_ace_max_ids),
                         chem_ace_max_confs_per_id=int(self.config.explainability.chem_ace_max_confs_per_id),
                         chem_ace_local_radii=tuple(self.config.explainability.chem_ace_local_radii),
@@ -962,8 +974,14 @@ class MILPipelineOrchestrator:
                         activity_calibration_fallback_top1_if_empty=bool(
                             self.config.explainability.activity_calibration_fallback_top1_if_empty
                         ),
-                        lambda_vol_output_dir=self.config.explainability.lambda_vol_output_dir,
-                        lambda_vol_db_uri=self.config.explainability.lambda_vol_db_uri,
+                        lambda_vol_output_dir=self._suffix_output_dir(
+                            base_dir=self.config.explainability.lambda_vol_output_dir,
+                            suffix=run_label,
+                        ),
+                        lambda_vol_db_uri=self._suffix_sqlite_uri(
+                            base_uri=self.config.explainability.lambda_vol_db_uri,
+                            suffix=run_label,
+                        ),
                         lambda_vol_layer_name=str(self.config.explainability.lambda_vol_layer_name),
                         lambda_vol_top_concepts=int(self.config.explainability.lambda_vol_top_concepts),
                         lambda_vol_monitor_max_samples=int(self.config.explainability.lambda_vol_monitor_max_samples),
@@ -992,7 +1010,7 @@ class MILPipelineOrchestrator:
                         lambda_vol_ricci_coupling_strength=float(
                             self.config.explainability.lambda_vol_ricci_coupling_strength
                         ),
-                        run_concept_rl=bool(self.config.explainability.run_concept_rl),
+                        run_concept_rl=bool(run_concept_rl),
                         concept_rl_top_k_per_task=int(self.config.explainability.concept_rl_top_k_per_task),
                         concept_rl_min_pos_coverage=float(
                             self.config.explainability.concept_rl_min_pos_coverage
@@ -1007,14 +1025,307 @@ class MILPipelineOrchestrator:
                         concept_rl_baseline_momentum=float(
                             self.config.explainability.concept_rl_baseline_momentum
                         ),
-                    ),
+                    )
+
+                def _make_final_cfg(
+                    *,
+                    run_concept_rl: bool,
+                    attn_out: str | None,
+                    run_label: str | None,
+                ) -> FinalTrainConfig:
+                    return FinalTrainConfig(
+                        seed=int(self.config.runtime.seed),
+                        trainer=trainer_cfg,
+                        loader=loader_cfg,
+                        attn_out=attn_out,
+                        explainability=_make_explainability_cfg(
+                            run_concept_rl=run_concept_rl,
+                            run_label=run_label,
+                        ),
+                    )
+
+            if not bool(self.config.explainability.run_concept_rl_ablation):
+                with log_step("pipeline.final.train_and_eval"):
+                    final_cfg = _make_final_cfg(
+                        run_concept_rl=bool(self.config.explainability.run_concept_rl),
+                        attn_out=self.config.export.attn_out,
+                        run_label=None,
+                    )
+                    MILFinalTrainer(config=final_cfg).run(
+                        outdir=env.outdir,
+                        best_params=dict(best_params),
+                        data=final_data,
+                    )
+                return
+
+            with log_step("pipeline.final.train_and_eval_ablation"):
+                run_specs = (
+                    ("no_rl", False),
+                    ("with_rl", True),
                 )
-            with log_step("pipeline.final.train_and_eval"):
-                MILFinalTrainer(config=final_cfg).run(
+                ablation_root = env.outdir / "ablation"
+                ablation_root.mkdir(parents=True, exist_ok=True)
+                summaries: list[dict[str, Any]] = []
+                for run_label, run_concept_rl in run_specs:
+                    run_outdir = ablation_root / run_label
+                    run_outdir.mkdir(parents=True, exist_ok=True)
+                    run_attn_out = self._with_suffix_path(
+                        base_path=self.config.export.attn_out,
+                        suffix=run_label,
+                    )
+                    final_cfg = _make_final_cfg(
+                        run_concept_rl=bool(run_concept_rl),
+                        attn_out=run_attn_out,
+                        run_label=str(run_label),
+                    )
+                    with log_step(
+                        "pipeline.final.ablation_run",
+                        run_label=str(run_label),
+                        run_concept_rl=bool(run_concept_rl),
+                    ):
+                        MILFinalTrainer(config=final_cfg).run(
+                            outdir=run_outdir,
+                            best_params=dict(best_params),
+                            data=final_data,
+                        )
+                    summaries.append(
+                        self._collect_ablation_run_summary(
+                            run_outdir=run_outdir,
+                            run_label=str(run_label),
+                            run_concept_rl=bool(run_concept_rl),
+                        )
+                    )
+
+                self._write_ablation_report(
                     outdir=env.outdir,
-                    best_params=dict(best_params),
-                    data=final_data,
+                    summaries=summaries,
                 )
+
+    @staticmethod
+    def _with_suffix_path(*, base_path: str | None, suffix: str) -> str | None:
+        if base_path is None:
+            return None
+        path = Path(base_path)
+        if path.suffix:
+            return str(path.with_name(f"{path.stem}_{suffix}{path.suffix}"))
+        return f"{str(path)}_{suffix}"
+
+    @staticmethod
+    def _suffix_output_dir(*, base_dir: str | None, suffix: str | None) -> str | None:
+        if base_dir is None or suffix is None or len(str(suffix)) == 0:
+            return base_dir
+        return str(Path(base_dir) / str(suffix))
+
+    @staticmethod
+    def _suffix_sqlite_uri(*, base_uri: str | None, suffix: str | None) -> str | None:
+        if base_uri is None or suffix is None or len(str(suffix)) == 0:
+            return base_uri
+        prefix = "sqlite:///"
+        if not str(base_uri).startswith(prefix):
+            return base_uri
+        path = Path(str(base_uri)[len(prefix):])
+        if path.suffix:
+            out = path.with_name(f"{path.stem}_{suffix}{path.suffix}")
+        else:
+            out = path.with_name(f"{path.name}_{suffix}")
+        return f"{prefix}{out.as_posix()}"
+
+    @staticmethod
+    def _summarize_rl_policy(policy_path: Path) -> dict[str, Any]:
+        payload = json.loads(policy_path.read_text())
+        history = payload.get("history", [])
+        if not isinstance(history, list) or len(history) == 0:
+            return {
+                "policy_history_path": str(policy_path),
+                "n_epochs": 0,
+                "policy_mean_start": None,
+                "policy_mean_end": None,
+                "policy_mean_abs_step": None,
+                "policy_mean_sign_flip_rate": None,
+                "policy_mean_tail_std": None,
+                "policy_converged": None,
+                "policy_likely_oscillating": None,
+            }
+
+        mu = np.asarray(
+            [float(x.get("policy_mean_after", np.nan)) for x in history],
+            dtype=np.float64,
+        )
+        mu = mu[np.isfinite(mu)]
+        if mu.size == 0:
+            return {
+                "policy_history_path": str(policy_path),
+                "n_epochs": int(len(history)),
+                "policy_mean_start": None,
+                "policy_mean_end": None,
+                "policy_mean_abs_step": None,
+                "policy_mean_sign_flip_rate": None,
+                "policy_mean_tail_std": None,
+                "policy_converged": None,
+                "policy_likely_oscillating": None,
+            }
+
+        diff = np.diff(mu)
+        mean_abs_step = float(np.mean(np.abs(diff))) if diff.size > 0 else 0.0
+        if diff.size > 1:
+            sign_flip_count = int(np.sum((diff[1:] * diff[:-1]) < 0.0))
+            sign_flip_rate = float(sign_flip_count / max(1, diff.size - 1))
+        else:
+            sign_flip_rate = 0.0
+        tail = mu[-min(5, int(mu.size)) :]
+        tail_std = float(np.std(tail)) if tail.size > 0 else 0.0
+        likely_oscillating = bool(sign_flip_rate > 0.50 and mean_abs_step > 0.003)
+        converged = bool((not likely_oscillating) and tail_std <= 0.01)
+        return {
+            "policy_history_path": str(policy_path),
+            "n_epochs": int(mu.size),
+            "policy_mean_start": float(mu[0]),
+            "policy_mean_end": float(mu[-1]),
+            "policy_mean_abs_step": float(mean_abs_step),
+            "policy_mean_sign_flip_rate": float(sign_flip_rate),
+            "policy_mean_tail_std": float(tail_std),
+            "policy_converged": bool(converged),
+            "policy_likely_oscillating": bool(likely_oscillating),
+        }
+
+    def _collect_ablation_run_summary(
+        self,
+        *,
+        run_outdir: Path,
+        run_label: str,
+        run_concept_rl: bool,
+    ) -> dict[str, Any]:
+        final_dir = run_outdir / "final_best_train_vs_leaderboard"
+        eval_path = final_dir / "leaderboard_eval.json"
+        if not eval_path.exists():
+            raise FileNotFoundError(f"Missing final eval file for run '{run_label}': {eval_path}")
+        eval_payload = json.loads(eval_path.read_text())
+
+        pr_aucs = [float(eval_payload.get(f"pr_auc_task{i}", np.nan)) for i in range(4)]
+        finite_pr_aucs = [x for x in pr_aucs if np.isfinite(x)]
+        min_task_pr_auc = float(min(finite_pr_aucs)) if len(finite_pr_aucs) > 0 else float("nan")
+        row: dict[str, Any] = {
+            "run_label": str(run_label),
+            "run_concept_rl": bool(run_concept_rl),
+            "run_outdir": str(run_outdir),
+            "final_dir": str(final_dir),
+            "leaderboard_eval_path": str(eval_path),
+            "macro_pr_auc": float(eval_payload.get("macro_pr_auc", np.nan)),
+            "min_task_pr_auc": float(min_task_pr_auc),
+            "macro_auc": float(eval_payload.get("macro_auc", np.nan)),
+            "best_epoch": eval_payload.get("best_epoch"),
+            "best_ckpt_path": eval_payload.get("best_ckpt_path"),
+        }
+        for i in range(4):
+            row[f"pr_auc_task{i}"] = float(eval_payload.get(f"pr_auc_task{i}", np.nan))
+            row[f"auc_task{i}"] = float(eval_payload.get(f"auc_task{i}", np.nan))
+
+        policy_path = final_dir / "concept_rl_policy_history.json"
+        if run_concept_rl and policy_path.exists():
+            row.update(self._summarize_rl_policy(policy_path=policy_path))
+        elif run_concept_rl:
+            row.update(
+                {
+                    "policy_history_path": str(policy_path),
+                    "n_epochs": 0,
+                    "policy_mean_start": None,
+                    "policy_mean_end": None,
+                    "policy_mean_abs_step": None,
+                    "policy_mean_sign_flip_rate": None,
+                    "policy_mean_tail_std": None,
+                    "policy_converged": None,
+                    "policy_likely_oscillating": None,
+                }
+            )
+        return row
+
+    def _write_ablation_report(self, *, outdir: Path, summaries: list[dict[str, Any]]) -> None:
+        if len(summaries) == 0:
+            return
+        csv_path = outdir / "final_concept_rl_ablation_comparison.csv"
+        json_path = outdir / "final_concept_rl_ablation_comparison.json"
+        md_path = outdir / "final_concept_rl_ablation_comparison.md"
+
+        df = pd.DataFrame(summaries)
+        df.to_csv(csv_path, index=False)
+
+        by_label = {str(x.get("run_label")): x for x in summaries}
+        no_rl = by_label.get("no_rl")
+        with_rl = by_label.get("with_rl")
+        delta_macro = None
+        delta_min = None
+        winner_macro = None
+        winner_min = None
+        if no_rl is not None and with_rl is not None:
+            try:
+                delta_macro = float(with_rl.get("macro_pr_auc", np.nan)) - float(
+                    no_rl.get("macro_pr_auc", np.nan)
+                )
+            except Exception:
+                delta_macro = None
+            try:
+                delta_min = float(with_rl.get("min_task_pr_auc", np.nan)) - float(
+                    no_rl.get("min_task_pr_auc", np.nan)
+                )
+            except Exception:
+                delta_min = None
+            if delta_macro is not None and np.isfinite(delta_macro):
+                winner_macro = "with_rl" if delta_macro >= 0.0 else "no_rl"
+            if delta_min is not None and np.isfinite(delta_min):
+                winner_min = "with_rl" if delta_min >= 0.0 else "no_rl"
+
+        payload = {
+            "runs": summaries,
+            "comparison": {
+                "delta_macro_pr_auc_with_rl_minus_no_rl": delta_macro,
+                "delta_min_task_pr_auc_with_rl_minus_no_rl": delta_min,
+                "winner_by_macro_pr_auc": winner_macro,
+                "winner_by_min_task_pr_auc": winner_min,
+            },
+            "files": {
+                "csv": str(csv_path),
+                "markdown": str(md_path),
+            },
+        }
+        json_path.write_text(json.dumps(payload, indent=2))
+
+        md_lines = [
+            "# Concept-RL Ablation Comparison",
+            "",
+            "| run | rl | macro_pr_auc | min_task_pr_auc | macro_auc | best_epoch | oscillating | converged |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+        for row in summaries:
+            md_lines.append(
+                "| "
+                + f"{row.get('run_label')} | "
+                + f"{int(bool(row.get('run_concept_rl')))} | "
+                + f"{float(row.get('macro_pr_auc', np.nan)):.6f} | "
+                + f"{float(row.get('min_task_pr_auc', np.nan)):.6f} | "
+                + f"{float(row.get('macro_auc', np.nan)):.6f} | "
+                + f"{row.get('best_epoch')} | "
+                + f"{row.get('policy_likely_oscillating')} | "
+                + f"{row.get('policy_converged')} |"
+            )
+        md_lines.extend(
+            [
+                "",
+                "## Delta (with_rl - no_rl)",
+                "",
+                f"- macro_pr_auc: {delta_macro}",
+                f"- min_task_pr_auc: {delta_min}",
+                f"- winner_by_macro_pr_auc: {winner_macro}",
+                f"- winner_by_min_task_pr_auc: {winner_min}",
+            ]
+        )
+        md_path.write_text("\n".join(md_lines) + "\n")
+        log_event(
+            "INFO",
+            "pipeline.final.ablation_report_written",
+            csv_path=str(csv_path),
+            json_path=str(json_path),
+            markdown_path=str(md_path),
+        )
 
 
 def _parse_args(argv: Any | None = None):
@@ -1096,6 +1407,14 @@ def _parse_args(argv: Any | None = None):
     ap.add_argument("--run_chem_ace", action="store_true")
     ap.add_argument("--run_lambda_vol", action="store_true")
     ap.add_argument("--run_concept_rl", action="store_true")
+    ap.add_argument(
+        "--run_concept_rl_ablation",
+        action="store_true",
+        help=(
+            "Run final stage twice with identical params/seed: "
+            "baseline (no RL) and RL-enabled, then export comparison."
+        ),
+    )
     ap.add_argument("--curated_smiles_col", default="curated_SMILES")
     ap.add_argument(
         "--chem_ace_conformer_sdf",
@@ -1260,7 +1579,7 @@ def _normalize_compat_args(args) -> None:
     """
     if args.trials_mil is not None:
         args.trials = int(args.trials_mil)
-    if bool(args.run_lambda_vol) or bool(args.run_concept_rl):
+    if bool(args.run_lambda_vol) or bool(args.run_concept_rl) or bool(args.run_concept_rl_ablation):
         # Lambda-Vol and concept RL both rely on concept families from Chem-ACE.
         args.run_chem_ace = True
 
@@ -1295,6 +1614,7 @@ def main(argv: Any | None = None) -> None:
             run_chem_ace=bool(config.explainability.run_chem_ace),
             run_lambda_vol=bool(config.explainability.run_lambda_vol),
             run_concept_rl=bool(config.explainability.run_concept_rl),
+            run_concept_rl_ablation=bool(config.explainability.run_concept_rl_ablation),
         )
         MILPipelineOrchestrator(config=config, argv=argv).run()
 

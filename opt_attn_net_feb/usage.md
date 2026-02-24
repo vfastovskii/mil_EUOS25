@@ -169,6 +169,27 @@ Useful controls:
 - `--concept_rl_reward_alignment_w 0.25`
 - `--concept_rl_baseline_momentum 0.90`
 
+## Run RL ablation automatically (recommended)
+
+Runs two final trainings with identical params/seed:
+
+- `no_rl`: RL disabled
+- `with_rl`: RL enabled
+
+```bash
+python -m entrypoints.hpo_pipeline ... \
+  --best_params_json /path/to/multimodal_mil_aux_gpu_best_params.json \
+  --run_concept_rl_ablation
+```
+
+Ablation outputs:
+
+- `<study_dir>/ablation/no_rl/...`
+- `<study_dir>/ablation/with_rl/...`
+- `<study_dir>/final_concept_rl_ablation_comparison.csv`
+- `<study_dir>/final_concept_rl_ablation_comparison.json`
+- `<study_dir>/final_concept_rl_ablation_comparison.md`
+
 Final outputs include:
 
 - `<study_dir>/final_best_train_vs_leaderboard/explainability_artifacts.json`
