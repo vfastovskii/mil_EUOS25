@@ -1061,7 +1061,7 @@ def prepare_chem_ace_bundle(
     )
 
     with log_step("explainability.chem_ace.embed_patches", phase="discover_train"):
-        embeddings_train = _build_feature_patch_embeddings(
+        embeddings_train, descriptor_scaler = _build_feature_patch_embeddings(
             pipeline=pipeline,
             patches=patches_train,
             molecules_by_id=molecules_by_id,
@@ -1070,6 +1070,8 @@ def prepare_chem_ace_bundle(
             xinst_mean_by_id=inst_mean_map,
             max_2d_dim=int(dim_2d_used),
             max_3dqm_dim=int(dim_3dqm_used),
+            fit_descriptor_scaler=True,
+            descriptor_scaler=None,
             persist_embeddings=bool(config.chem_ace_persist_patch_embeddings),
             n_workers=max(0, int(config.cpu_workers)),
         )
@@ -1143,7 +1145,7 @@ def prepare_chem_ace_bundle(
             )
 
             with log_step("explainability.chem_ace.embed_patches", phase="infer_scope"):
-                embeddings_infer = _build_feature_patch_embeddings(
+                embeddings_infer, _ = _build_feature_patch_embeddings(
                     pipeline=pipeline,
                     patches=patches_infer,
                     molecules_by_id=molecules_by_id,
@@ -1152,6 +1154,8 @@ def prepare_chem_ace_bundle(
                     xinst_mean_by_id=inst_mean_map,
                     max_2d_dim=int(dim_2d_used),
                     max_3dqm_dim=int(dim_3dqm_used),
+                    fit_descriptor_scaler=False,
+                    descriptor_scaler=descriptor_scaler,
                     persist_embeddings=bool(config.chem_ace_persist_patch_embeddings),
                     n_workers=max(0, int(config.cpu_workers)),
                 )
@@ -1588,14 +1592,25 @@ def _build_feature_patch_embeddings(
     xinst_mean_by_id: Mapping[str, np.ndarray],
     max_2d_dim: int,
     max_3dqm_dim: int,
+    fit_descriptor_scaler: bool = False,
+    descriptor_scaler: Any | None = None,
     persist_embeddings: bool = False,
     n_workers: int = 0,
-) -> list[PatchEmbeddingRecord]:
+) -> tuple[list[PatchEmbeddingRecord], Any | None]:
     emb_recs: list[PatchEmbeddingRecord] = []
 
     workers = max(0, int(n_workers))
     total_patches = int(len(patches))
     progress_every = 200000
+
+    scaler_obj = descriptor_scaler
+    if bool(fit_descriptor_scaler) and scaler_obj is None:
+        scaler_obj = _fit_patch_descriptor_robust_scaler(
+            patches=patches,
+            molecules_by_id=molecules_by_id,
+            x2d_by_id=x2d_by_id,
+            max_fit_samples=200000,
+        )
 
     def _compute_patch_vec(patch: PatchRecord) -> tuple[PatchRecord, np.ndarray, dict[str, int]] | None:
         mol_id = str(patch.mol_id)
@@ -1612,7 +1627,8 @@ def _build_feature_patch_embeddings(
             x3d = np.zeros((max(1, int(max_3dqm_dim)),), dtype=np.float32)
 
         mol = molecules_by_id.get(mol_id)
-        desc = _patch_descriptors(mol=mol, atom_indices=patch.atom_indices, patch_type=patch.patch_type)
+        desc_raw = _patch_descriptors(mol=mol, atom_indices=patch.atom_indices, patch_type=patch.patch_type)
+        desc = _transform_patch_descriptors(desc_raw=desc_raw, scaler_obj=scaler_obj)
 
         v2d = _take_or_pad(np.asarray(x2d, dtype=np.float32), int(max_2d_dim))
         v3d = _take_or_pad(np.asarray(x3d, dtype=np.float32), int(max_3dqm_dim))
@@ -1728,7 +1744,7 @@ def _build_feature_patch_embeddings(
 
     if not emb_recs:
         raise RuntimeError("Chem-ACE feature projection produced zero patch embeddings")
-    return emb_recs
+    return emb_recs, scaler_obj
 
 
 
@@ -1808,6 +1824,79 @@ def _take_or_pad(vec: np.ndarray, dim: int) -> np.ndarray:
     out[: v.shape[0]] = v
     return out
 
+
+
+def _fit_patch_descriptor_robust_scaler(
+    *,
+    patches: Sequence[PatchRecord],
+    molecules_by_id: Mapping[str, Any],
+    x2d_by_id: Mapping[str, np.ndarray],
+    max_fit_samples: int = 200000,
+) -> Any | None:
+    """Fit RobustScaler on train-scope patch descriptors using a deterministic prefix sample."""
+    limit = int(max(0, max_fit_samples))
+    if limit <= 0 or len(patches) == 0:
+        return None
+
+    try:
+        from sklearn.preprocessing import RobustScaler
+    except Exception as exc:
+        log_event(
+            "WARN",
+            "explainability.chem_ace.descriptor_scaler.unavailable",
+            reason="sklearn_import_failed",
+            error=str(exc),
+        )
+        return None
+
+    desc_rows: list[np.ndarray] = []
+    for patch in patches:
+        if len(desc_rows) >= limit:
+            break
+        mol_id = str(patch.mol_id)
+        if mol_id not in x2d_by_id:
+            continue
+        mol = molecules_by_id.get(mol_id)
+        desc = _patch_descriptors(mol=mol, atom_indices=patch.atom_indices, patch_type=patch.patch_type)
+        desc_rows.append(np.asarray(desc, dtype=np.float32))
+
+    if len(desc_rows) < 8:
+        log_event(
+            "WARN",
+            "explainability.chem_ace.descriptor_scaler.skipped",
+            reason="insufficient_samples",
+            n_samples=int(len(desc_rows)),
+        )
+        return None
+
+    mat = np.stack(desc_rows, axis=0)
+    scaler = RobustScaler(with_centering=True, with_scaling=True, quantile_range=(25.0, 75.0))
+    scaler.fit(mat)
+    log_event(
+        "INFO",
+        "explainability.chem_ace.descriptor_scaler.fitted",
+        method="RobustScaler",
+        fit_samples=int(mat.shape[0]),
+        descriptor_dim=int(mat.shape[1]),
+    )
+    return scaler
+
+
+def _transform_patch_descriptors(*, desc_raw: np.ndarray, scaler_obj: Any | None) -> np.ndarray:
+    """Apply fitted RobustScaler to descriptor block when available."""
+    desc = np.asarray(desc_raw, dtype=np.float32).reshape(1, -1)
+    if scaler_obj is None:
+        return desc.reshape(-1)
+    try:
+        out = scaler_obj.transform(desc)
+        return np.asarray(out, dtype=np.float32).reshape(-1)
+    except Exception as exc:
+        log_event(
+            "WARN",
+            "explainability.chem_ace.descriptor_scaler.transform_failed",
+            error=str(exc),
+        )
+        return desc.reshape(-1)
 
 
 def _resolve_effective_feature_dim(*, requested_dim: int, raw_dim: int) -> int:

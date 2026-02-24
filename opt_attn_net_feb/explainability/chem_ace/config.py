@@ -70,8 +70,10 @@ class EmbeddingConfig:
 class ConceptDiscoveryConfig:
     """Concept clustering and filtering configuration."""
 
-    algorithms: tuple[str, ...] = ("kmeans", "hierarchical", "hdbscan")
-    kmeans_k: int = 24
+    # Default to a single scalable algorithm for very large embedding sets.
+    algorithms: tuple[str, ...] = ("kmeans",)
+    # <=1 enables automatic k selection based on embedding count.
+    kmeans_k: int = 0
     # Use MiniBatchKMeans above this sample size to reduce memory pressure.
     kmeans_minibatch_over: int = 200000
     kmeans_minibatch_size: int = 4096

@@ -318,9 +318,10 @@ Per patch vector is:
    - else zero vector
 3. patch descriptors:
    - 10 structural stats (size, aromaticity, hetero fraction, charge, conjugation, ring, atomic number/degree stats)
+   - 10 structural stats are transformed by `RobustScaler` (fitted on discover-train patch descriptors; reused on infer-scope)
    - 5-way patch-type one-hot
 
-Embedding record is cached and persisted (`patch_embeddings` table plus vector artifact URI).
+Embedding record stays in-memory by default. Per-patch embedding file/DB persistence is optional via `--chem_ace_persist_patch_embeddings`.
 
 ### 7.3 Concept discovery
 
@@ -330,14 +331,14 @@ File:
 
 Algorithms:
 
-- k-means (required)
-- hierarchical (required)
-- HDBSCAN (optional if installed)
+- Default: k-means only (MiniBatchKMeans at large `N`)
+- Optional (if explicitly enabled in config): hierarchical, HDBSCAN
 
 Flow:
 
 1. cluster embeddings per algorithm
    - k-means switches to MiniBatchKMeans for large `N` (`kmeans_minibatch_over`)
+   - if `kmeans_k <= 1`, cluster count is auto-selected as `sqrt(n_embeddings)` (no fixed hardcoded `k`)
    - hierarchical is guarded by `hierarchical_max_samples` and `hierarchical_max_pairwise_gb` to avoid O(N^2) memory blowups
    - HDBSCAN is guarded by `hdbscan_max_samples`
    - if one algorithm fails/skips, others still run

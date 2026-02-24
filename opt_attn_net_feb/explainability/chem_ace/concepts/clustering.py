@@ -121,9 +121,24 @@ def _cluster_with_kmeans(x: np.ndarray, k: int, seed: int) -> np.ndarray:
         np.ndarray: An array of cluster labels, where each element corresponds to the cluster index
         assigned to the respective data point.
     """
-    kk = max(2, min(int(k), int(x.shape[0])))
+    kk = _resolve_kmeans_k(n_samples=int(x.shape[0]), requested_k=int(k))
     model = KMeans(n_clusters=kk, random_state=int(seed), n_init=10)
     return model.fit_predict(x)
+
+
+def _resolve_kmeans_k(*, n_samples: int, requested_k: int) -> int:
+    """
+    Resolve effective number of k-means clusters.
+
+    If requested_k <= 1, choose k automatically from data size.
+    """
+    n = int(max(2, n_samples))
+    req = int(requested_k)
+    if req > 1:
+        return max(2, min(req, n))
+    # Data-size heuristic without fixed sample caps.
+    auto_k = int(np.sqrt(float(n)))
+    return max(2, min(auto_k, n))
 
 
 def _cluster_with_kmeans_adaptive(
@@ -151,7 +166,7 @@ def _cluster_with_kmeans_adaptive(
         np.ndarray: Array of cluster labels for each point in the input data.
     """
     n = int(x.shape[0])
-    kk = max(2, min(int(k), n))
+    kk = _resolve_kmeans_k(n_samples=n, requested_k=int(k))
     if n >= int(max(2, minibatch_over)):
         bs = int(max(256, min(int(minibatch_size), n)))
         model = MiniBatchKMeans(
@@ -301,9 +316,23 @@ def _algorithm_labels(
         key = str(algo).lower()
         try:
             if key == "kmeans":
+                k_eff = _resolve_kmeans_k(
+                    n_samples=int(x.shape[0]),
+                    requested_k=int(config.kmeans_k),
+                )
+                logger.info(
+                    "Running kmeans clustering",
+                    extra={
+                        "n_samples": int(x.shape[0]),
+                        "kmeans_k_config": int(config.kmeans_k),
+                        "kmeans_k_effective": int(k_eff),
+                        "minibatch_over": int(config.kmeans_minibatch_over),
+                        "minibatch_size": int(config.kmeans_minibatch_size),
+                    },
+                )
                 out[key] = _cluster_with_kmeans_adaptive(
                     x,
-                    k=config.kmeans_k,
+                    k=int(k_eff),
                     seed=seed,
                     minibatch_over=config.kmeans_minibatch_over,
                     minibatch_size=config.kmeans_minibatch_size,

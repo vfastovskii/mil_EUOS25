@@ -377,15 +377,25 @@ class ChemACEPipeline:
         embeddings: Sequence[PatchEmbeddingRecord],
     ) -> tuple[DiscoveredConceptSet, str]:
         """Run concept discovery, persist snapshot, concepts, and memberships."""
+        algo_keys = tuple(str(x).lower() for x in self.config.discovery.algorithms)
+        n_embeddings = int(len(embeddings))
+        k_cfg = int(self.config.discovery.kmeans_k)
+        k_eff = int(max(2, min((int(np.sqrt(max(2, n_embeddings))) if k_cfg <= 1 else k_cfg), max(2, n_embeddings))))
+        config_payload: dict[str, object] = {
+            "n_embeddings": int(n_embeddings),
+            "algorithms": ",".join(str(x) for x in self.config.discovery.algorithms),
+            "kmeans_k": int(k_cfg),
+            "kmeans_k_effective": int(k_eff),
+        }
+        if "hierarchical" in algo_keys:
+            config_payload["hierarchical_max_samples"] = int(self.config.discovery.hierarchical_max_samples)
+            config_payload["hierarchical_max_pairwise_gb"] = float(self.config.discovery.hierarchical_max_pairwise_gb)
+        if "hdbscan" in algo_keys:
+            config_payload["hdbscan_max_samples"] = int(self.config.discovery.hdbscan_max_samples)
         log_event(
             "INFO",
             "explainability.chem_ace.discover_concepts.config",
-            n_embeddings=int(len(embeddings)),
-            algorithms=",".join(str(x) for x in self.config.discovery.algorithms),
-            kmeans_k=int(self.config.discovery.kmeans_k),
-            hierarchical_max_samples=int(self.config.discovery.hierarchical_max_samples),
-            hierarchical_max_pairwise_gb=float(self.config.discovery.hierarchical_max_pairwise_gb),
-            hdbscan_max_samples=int(self.config.discovery.hdbscan_max_samples),
+            **config_payload,
         )
         concept_set = discover_concepts(
             embeddings=embeddings,

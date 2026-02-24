@@ -823,7 +823,7 @@ For each patch, integrated runtime creates feature-level vector:
   - where `resolved_chem_ace_3dqm_dim = chem_ace_max_3dqm_dim` if `chem_ace_max_3dqm_dim > 0`
   - else `resolved_chem_ace_3dqm_dim = full merged 3D+QM raw dimension` from `Xinst_sorted.shape[1]`
 - descriptor vector:
-  - 10 scalar patch descriptors
+  - 10 scalar patch descriptors (RobustScaler-transformed; scaler fitted on discover-train descriptors)
   - +5 one-hot patch type indicators
 
 Final patch vector:
@@ -836,13 +836,9 @@ Stored with metadata via embedding cache and DB.
 
 Clustering algorithms configured (default):
 - kmeans
-- hierarchical
-- hdbscan (if installed)
 
 Defaults (`ConceptDiscoveryConfig`):
-- `kmeans_k=24`
-- `hierarchical_distance_threshold=1.25`
-- `hdbscan_min_cluster_size=12`
+- `kmeans_k=0` (`<=1` enables automatic `k=sqrt(n_embeddings)`)
 - `min_support=8`
 - `min_coherence=0.0`
 - `dedup_centroid_similarity_threshold=0.98`
