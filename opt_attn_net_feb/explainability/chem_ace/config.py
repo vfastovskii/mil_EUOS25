@@ -112,6 +112,9 @@ class SemanticTaggingConfig:
     aromatic_fraction_threshold: float = 0.35
     conjugation_size_threshold: int = 6
     planarity_rmsd_threshold: float = 0.25
+    geom_min_vectors_for_tagging: int = 8
+    geom_z_threshold: float = 0.50
+    geom_strong_z_threshold: float = 1.00
     qm_min_vectors_for_tagging: int = 8
     qm_z_threshold: float = 0.50
     qm_strong_z_threshold: float = 1.00

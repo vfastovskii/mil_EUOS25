@@ -424,6 +424,7 @@ class ChemACEPipeline:
         inst_mean_by_id: Optional[Mapping[str, np.ndarray]] = None,
         inst_geom_dim: int = 0,
         inst_qm_dim: int = 0,
+        geom_feature_names: Optional[Sequence[str]] = None,
         qm_feature_names: Optional[Sequence[str]] = None,
     ) -> list[SemanticTaggingResult]:
         """Compute semantic tags for each concept and persist them."""
@@ -452,6 +453,7 @@ class ChemACEPipeline:
                 inst_mean_by_id=inst_mean_by_id,
                 inst_geom_dim=int(inst_geom_dim),
                 inst_qm_dim=int(inst_qm_dim),
+                geom_feature_names=geom_feature_names,
                 qm_feature_names=qm_feature_names,
             )
 

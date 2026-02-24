@@ -828,6 +828,7 @@ class MILPipelineOrchestrator:
                     inst_dim=int(Xinst_sorted_all.shape[1]),
                     inst_geom_dim=int(inst_meta_all["geom_dim"]),
                     inst_qm_dim=int(inst_meta_all["qm_dim"]),
+                    n_geom_cols=int(len(inst_meta_all.get("geom_cols", ()))),
                     n_qm_cols=int(len(inst_meta_all.get("qm_cols", ()))),
                 )
 
@@ -846,6 +847,7 @@ class MILPipelineOrchestrator:
                     conf_sorted=conf_sorted_all,
                     inst_geom_dim=int(inst_meta_all["geom_dim"]),
                     inst_qm_dim=int(inst_meta_all["qm_dim"]),
+                    inst_geom_cols=tuple(str(x) for x in inst_meta_all.get("geom_cols", ())),
                     inst_qm_cols=tuple(str(x) for x in inst_meta_all.get("qm_cols", ())),
                 )
                 final_cfg = FinalTrainConfig(

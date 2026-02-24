@@ -860,18 +860,23 @@ Concept IDs:
 Taggers produce evidence-backed tags with confidence:
 - charge tags
 - conjugation/aromaticity tags
-- geometry tags
+- geometry tags from conformer coordinates (planarity RMSD + rotatable-bond proxy)
+- geometry descriptor-family tags from 3D descriptor vectors using `geom_cols` + `inst_geom_dim`
 - pharmacophore tags
 - SMARTS functional-group tags from `default_functional_group_rules.json`
 - SMARTS-RX reactivity tags from `smartsrx.json`
 - QM descriptor-family tags derived from per-conformer QM vectors and QM column names
 - optional Open Babel descriptor tags (`logP`, `TPSA`, `MR`) when `openbabel.pybel` is available
+- cross-modal consistency tags (SMARTS-RX + QM + geometry + pharmacophore agreement)
 
 Key thresholds (`SemanticTaggingConfig` defaults):
 - `charge_threshold_formal = 1`
 - `aromatic_fraction_threshold = 0.35`
 - `conjugation_size_threshold = 6`
 - `planarity_rmsd_threshold = 0.25`
+- `geom_min_vectors_for_tagging = 8`
+- `geom_z_threshold = 0.50`
+- `geom_strong_z_threshold = 1.00`
 - `qm_min_vectors_for_tagging = 8`
 - `qm_z_threshold = 0.50`
 - `qm_strong_z_threshold = 1.00`
@@ -917,6 +922,18 @@ QM family mapping:
   - electrophilicity, nucleophilicity, charge-transfer, ESP, Fukui, NBO, Mulliken/NPA
 - family stats are computed as concept-level `abs_z_mean`, `z_mean`, `z_std`
 - tags are emitted from thresholded family stats (e.g., `large HOMO-LUMO gap`, `high dipole moment`, `electrophile-like electronic profile`)
+
+3D geometry family mapping:
+- geometry descriptor names are normalized and token-matched to families:
+  - distance, angle, dihedral, planarity, shape, size, inertia, surface_volume, ring_strain, hbond_geometry
+- family stats are computed as concept-level `abs_z_mean`, `z_mean`, `z_std`
+- tags are emitted from thresholded family stats (e.g., `torsionally active geometry`, `shape-anisotropic geometry`, `ring-strained geometry`)
+
+Cross-modal semantic tags:
+- `electrophilic reaction-center motif`: SMARTS-RX electrophile role + elevated QM electrophilicity
+- `nucleophilic reaction-center motif`: SMARTS-RX nucleophile role + elevated QM nucleophilicity
+- `planar conjugated electronic motif`: aromatic signal + geometry planarity + QM gap signal
+- `polar donor-acceptor electronic motif`: pharmacophore HBD/HBA + elevated QM dipole
 
 ### 14.7 Chem-ACE persistence schema
 

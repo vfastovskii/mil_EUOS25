@@ -58,6 +58,19 @@ class SemanticTaggingResult:
 class SemanticTagger:
     """Compute semantic descriptors and map them to chemist-readable tags."""
 
+    _GEOM_FAMILY_TOKENS: Mapping[str, tuple[str, ...]] = {
+        "distance": ("dist", "distance", "bondlen", "bond_length", "pair_dist", "nearest"),
+        "angle": ("angle", "bend", "bond_angle"),
+        "dihedral": ("dihedral", "torsion", "phi", "psi", "chi"),
+        "planarity": ("planar", "planarity", "out_of_plane", "oop", "flatness"),
+        "shape": ("shape", "asphericity", "eccentricity", "spherocity", "globularity", "anisotropy"),
+        "size": ("radius_gyration", "rg", "gyration", "span", "diameter"),
+        "inertia": ("inertia", "principal", "pmi", "moment"),
+        "surface_volume": ("surface", "sasa", "vsa", "psa", "volume"),
+        "ring_strain": ("strain", "ring_strain", "angle_strain", "torsional_strain"),
+        "hbond_geometry": ("hb", "hbond", "donor_acceptor", "d_a", "donnor", "acceptor"),
+    }
+
     _QM_FAMILY_TOKENS: Mapping[str, tuple[str, ...]] = {
         "homo": ("homo", "ehomo", "eps_homo"),
         "lumo": ("lumo", "elumo", "eps_lumo"),
@@ -286,6 +299,7 @@ class SemanticTagger:
         inst_mean_by_id: Optional[Mapping[str, np.ndarray]] = None,
         inst_geom_dim: int = 0,
         inst_qm_dim: int = 0,
+        geom_feature_names: Optional[Sequence[str]] = None,
         qm_feature_names: Optional[Sequence[str]] = None,
     ) -> SemanticTaggingResult:
         descriptors = self._compute_descriptors(
@@ -295,6 +309,7 @@ class SemanticTagger:
             inst_mean_by_id=inst_mean_by_id,
             inst_geom_dim=int(inst_geom_dim),
             inst_qm_dim=int(inst_qm_dim),
+            geom_feature_names=geom_feature_names,
             qm_feature_names=qm_feature_names,
         )
         tags: list[TagAssignment] = []
@@ -306,6 +321,7 @@ class SemanticTagger:
         tags.extend(self._pharmacophore_tags(concept_id=concept_id, descriptors=descriptors))
         tags.extend(self._qm_tags(concept_id=concept_id, descriptors=descriptors))
         tags.extend(self._openbabel_tags(concept_id=concept_id, descriptors=descriptors))
+        tags.extend(self._cross_modal_tags(concept_id=concept_id, descriptors=descriptors))
         tags = self._deduplicate_tags(tags)
 
         tag_names = [t.tag for t in tags]
@@ -328,6 +344,7 @@ class SemanticTagger:
         inst_mean_by_id: Optional[Mapping[str, np.ndarray]],
         inst_geom_dim: int,
         inst_qm_dim: int,
+        geom_feature_names: Optional[Sequence[str]],
         qm_feature_names: Optional[Sequence[str]],
     ) -> dict[str, Any]:
         try:
@@ -347,6 +364,7 @@ class SemanticTagger:
         heteroaromatic_flags: list[int] = []
         planarity_rmsd: list[float] = []
         rot_bond_counts: list[int] = []
+        geom_vectors: list[np.ndarray] = []
         qm_vectors: list[np.ndarray] = []
 
         pharm_counts = {
@@ -386,6 +404,10 @@ class SemanticTagger:
         smarts_rx_cache: dict[str, tuple[tuple[set[int], ...], ...]] = {}
         mol_seen: dict[str, Any] = {}
 
+        geom_names = self._normalize_geom_feature_names(
+            geom_feature_names=geom_feature_names,
+            inst_geom_dim=int(inst_geom_dim),
+        )
         qm_names = self._normalize_qm_feature_names(
             qm_feature_names=qm_feature_names,
             inst_qm_dim=int(inst_qm_dim),
@@ -575,13 +597,15 @@ class SemanticTagger:
                             role_key = str(rule.role)
                             smarts_rx_role_presence[role_key] = int(smarts_rx_role_presence.get(role_key, 0) + 1)
 
-            qm_vec = self._resolve_qm_vector_for_patch(
+            geom_vec, qm_vec = self._resolve_geom_qm_vectors_for_patch(
                 patch=patch,
                 inst_by_pair=inst_by_pair,
                 inst_mean_by_id=inst_mean_by_id,
                 inst_geom_dim=int(inst_geom_dim),
                 inst_qm_dim=int(inst_qm_dim),
             )
+            if geom_vec is not None and geom_vec.size > 0:
+                geom_vectors.append(geom_vec.astype(np.float32, copy=False))
             if qm_vec is not None and qm_vec.size > 0:
                 qm_vectors.append(qm_vec.astype(np.float32, copy=False))
 
@@ -601,6 +625,10 @@ class SemanticTagger:
             if int(cnt) > 0
         }
 
+        geom_summary = self._summarize_geom_vectors(
+            geom_vectors=geom_vectors,
+            geom_feature_names=geom_names,
+        )
         qm_summary = self._summarize_qm_vectors(
             qm_vectors=qm_vectors,
             qm_feature_names=qm_names,
@@ -639,9 +667,23 @@ class SemanticTagger:
                 if int(cnt) > 0
             },
             "smarts_rx_role_rate": smarts_rx_role_rate,
+            "geom_summary": geom_summary,
             "qm_summary": qm_summary,
             "openbabel_descriptor_summary": openbabel_summary,
         }
+
+    def _summarize_geom_vectors(
+        self,
+        *,
+        geom_vectors: Sequence[np.ndarray],
+        geom_feature_names: Sequence[str],
+    ) -> dict[str, Any]:
+        return self._summarize_vector_block(
+            vectors=geom_vectors,
+            feature_names=geom_feature_names,
+            fallback_prefix="geom",
+            family_tokens=self._GEOM_FAMILY_TOKENS,
+        )
 
     def _summarize_qm_vectors(
         self,
@@ -649,7 +691,22 @@ class SemanticTagger:
         qm_vectors: Sequence[np.ndarray],
         qm_feature_names: Sequence[str],
     ) -> dict[str, Any]:
-        n_vectors = int(len(qm_vectors))
+        return self._summarize_vector_block(
+            vectors=qm_vectors,
+            feature_names=qm_feature_names,
+            fallback_prefix="qm",
+            family_tokens=self._QM_FAMILY_TOKENS,
+        )
+
+    def _summarize_vector_block(
+        self,
+        *,
+        vectors: Sequence[np.ndarray],
+        feature_names: Sequence[str],
+        fallback_prefix: str,
+        family_tokens: Mapping[str, tuple[str, ...]],
+    ) -> dict[str, Any]:
+        n_vectors = int(len(vectors))
         if n_vectors <= 0:
             return {
                 "n_vectors": 0,
@@ -658,7 +715,7 @@ class SemanticTagger:
                 "family_stats": {},
             }
 
-        dim = min(int(v.shape[0]) for v in qm_vectors if np.asarray(v).ndim == 1)
+        dim = min(int(v.shape[0]) for v in vectors if np.asarray(v).ndim == 1)
         if dim <= 0:
             return {
                 "n_vectors": 0,
@@ -667,10 +724,10 @@ class SemanticTagger:
                 "family_stats": {},
             }
 
-        mat = np.vstack([np.asarray(v, dtype=np.float32)[:dim] for v in qm_vectors])
-        feat_names = list(qm_feature_names)
+        mat = np.vstack([np.asarray(v, dtype=np.float32)[:dim] for v in vectors])
+        feat_names = list(feature_names)
         if len(feat_names) < dim:
-            feat_names = feat_names + [f"qm_{i}" for i in range(len(feat_names), dim)]
+            feat_names = feat_names + [f"{fallback_prefix}_{i}" for i in range(len(feat_names), dim)]
         elif len(feat_names) > dim:
             feat_names = feat_names[:dim]
 
@@ -690,7 +747,10 @@ class SemanticTagger:
             for i in top_idx
         ]
 
-        family_index = self._build_qm_family_index(feature_names=feat_names)
+        family_index = self._build_family_index(
+            feature_names=feat_names,
+            family_tokens=family_tokens,
+        )
         family_stats: dict[str, dict[str, float]] = {}
         for family, idxs in family_index.items():
             if len(idxs) == 0:
@@ -859,6 +919,100 @@ class SemanticTagger:
             tags.append(self._mk_tag(concept_id, "rigid", 0.65, "geometry_tagger", descriptors))
         if rot >= 2.0:
             tags.append(self._mk_tag(concept_id, "flexible", 0.7, "geometry_tagger", descriptors))
+
+        gms = descriptors.get("geom_summary", {})
+        if not isinstance(gms, Mapping):
+            return tags
+        n_vectors = int(gms.get("n_vectors", 0))
+        if n_vectors < int(self.config.geom_min_vectors_for_tagging):
+            return tags
+
+        family_stats = gms.get("family_stats", {})
+        if not isinstance(family_stats, Mapping):
+            family_stats = {}
+
+        thr = float(self.config.geom_z_threshold)
+        strong_thr = float(self.config.geom_strong_z_threshold)
+
+        def fam(name: str) -> Mapping[str, float]:
+            item = family_stats.get(name, {})
+            if isinstance(item, Mapping):
+                return item
+            return {}
+
+        torsion_abs = float(fam("dihedral").get("abs_z_mean", 0.0))
+        torsion_mean = float(fam("dihedral").get("z_mean", 0.0))
+        if torsion_abs >= thr and torsion_mean >= 0.0:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "torsionally active geometry",
+                    min(1.0, 0.55 + 0.22 * torsion_abs),
+                    "geometry_descriptor_tagger",
+                    descriptors,
+                )
+            )
+
+        planar_abs = float(fam("planarity").get("abs_z_mean", 0.0))
+        if planar_abs >= strong_thr:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "planarity-enriched geometry",
+                    min(1.0, 0.55 + 0.20 * planar_abs),
+                    "geometry_descriptor_tagger",
+                    descriptors,
+                )
+            )
+
+        shape_abs = float(fam("shape").get("abs_z_mean", 0.0))
+        shape_mean = float(fam("shape").get("z_mean", 0.0))
+        if shape_abs >= thr:
+            if shape_mean >= 0.0:
+                tags.append(
+                    self._mk_tag(
+                        concept_id,
+                        "shape-anisotropic geometry",
+                        min(1.0, 0.55 + 0.20 * shape_abs),
+                        "geometry_descriptor_tagger",
+                        descriptors,
+                    )
+                )
+            else:
+                tags.append(
+                    self._mk_tag(
+                        concept_id,
+                        "shape-compact geometry",
+                        min(1.0, 0.55 + 0.20 * shape_abs),
+                        "geometry_descriptor_tagger",
+                        descriptors,
+                    )
+                )
+
+        ring_strain_abs = float(fam("ring_strain").get("abs_z_mean", 0.0))
+        if ring_strain_abs >= thr:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "ring-strained geometry",
+                    min(1.0, 0.55 + 0.20 * ring_strain_abs),
+                    "geometry_descriptor_tagger",
+                    descriptors,
+                )
+            )
+
+        surface_abs = float(fam("surface_volume").get("abs_z_mean", 0.0))
+        if surface_abs >= thr:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "surface/volume-driven geometry",
+                    min(1.0, 0.55 + 0.18 * surface_abs),
+                    "geometry_descriptor_tagger",
+                    descriptors,
+                )
+            )
+
         return tags
 
     def _pharmacophore_tags(self, *, concept_id: str, descriptors: Mapping[str, Any]) -> list[TagAssignment]:
@@ -989,6 +1143,97 @@ class SemanticTagger:
 
         return tags
 
+    def _cross_modal_tags(self, *, concept_id: str, descriptors: Mapping[str, Any]) -> list[TagAssignment]:
+        tags: list[TagAssignment] = []
+
+        rx_roles = descriptors.get("smarts_rx_role_rate", {})
+        if not isinstance(rx_roles, Mapping):
+            rx_roles = {}
+        qms = descriptors.get("qm_summary", {})
+        if not isinstance(qms, Mapping):
+            qms = {}
+        gms = descriptors.get("geom_summary", {})
+        if not isinstance(gms, Mapping):
+            gms = {}
+
+        qfam = qms.get("family_stats", {})
+        if not isinstance(qfam, Mapping):
+            qfam = {}
+        gfam = gms.get("family_stats", {})
+        if not isinstance(gfam, Mapping):
+            gfam = {}
+
+        def qfam_stat(name: str) -> Mapping[str, Any]:
+            item = qfam.get(name, {})
+            if isinstance(item, Mapping):
+                return item
+            return {}
+
+        def gfam_stat(name: str) -> Mapping[str, Any]:
+            item = gfam.get(name, {})
+            if isinstance(item, Mapping):
+                return item
+            return {}
+
+        thr_q = float(self.config.qm_z_threshold)
+        thr_g = float(self.config.geom_z_threshold)
+
+        rx_electrophile = float(rx_roles.get("electrophile", 0.0))
+        electrophile_qm = float(qfam_stat("electrophilicity").get("abs_z_mean", 0.0))
+        if rx_electrophile >= 0.02 and electrophile_qm >= thr_q:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "electrophilic reaction-center motif",
+                    min(1.0, 0.58 + 0.16 * (rx_electrophile + electrophile_qm)),
+                    "cross_modal_tagger",
+                    descriptors,
+                )
+            )
+
+        rx_nucleophile = float(rx_roles.get("nucleophile", 0.0))
+        nucleophile_qm = float(qfam_stat("nucleophilicity").get("abs_z_mean", 0.0))
+        if rx_nucleophile >= 0.02 and nucleophile_qm >= thr_q:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "nucleophilic reaction-center motif",
+                    min(1.0, 0.58 + 0.16 * (rx_nucleophile + nucleophile_qm)),
+                    "cross_modal_tagger",
+                    descriptors,
+                )
+            )
+
+        aromatic = float(descriptors.get("aromatic_atom_fraction_mean", 0.0))
+        planar = float(gfam_stat("planarity").get("abs_z_mean", 0.0))
+        gap = float(qfam_stat("gap").get("abs_z_mean", 0.0))
+        if aromatic >= float(self.config.aromatic_fraction_threshold) and planar >= thr_g and gap >= thr_q:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "planar conjugated electronic motif",
+                    min(1.0, 0.55 + 0.14 * (aromatic + planar + gap)),
+                    "cross_modal_tagger",
+                    descriptors,
+                )
+            )
+
+        hbd = int((descriptors.get("pharmacophore_counts", {}) or {}).get("Donor", 0))
+        hba = int((descriptors.get("pharmacophore_counts", {}) or {}).get("Acceptor", 0))
+        dip = float(qfam_stat("dipole").get("abs_z_mean", 0.0))
+        if hbd > 0 and hba > 0 and dip >= thr_q:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "polar donor-acceptor electronic motif",
+                    min(1.0, 0.58 + 0.18 * dip),
+                    "cross_modal_tagger",
+                    descriptors,
+                )
+            )
+
+        return tags
+
     @staticmethod
     def _deduplicate_tags(tags: Sequence[TagAssignment]) -> list[TagAssignment]:
         best: dict[str, TagAssignment] = {}
@@ -1014,6 +1259,20 @@ class SemanticTagger:
             evidence_json=dict(descriptors),
         )
 
+    def _normalize_geom_feature_names(
+        self,
+        *,
+        geom_feature_names: Optional[Sequence[str]],
+        inst_geom_dim: int,
+    ) -> list[str]:
+        names = [str(x) for x in (geom_feature_names or ())]
+        if int(inst_geom_dim) > 0:
+            if len(names) > int(inst_geom_dim):
+                names = names[: int(inst_geom_dim)]
+            elif len(names) < int(inst_geom_dim):
+                names = names + [f"geom_{i}" for i in range(len(names), int(inst_geom_dim))]
+        return names
+
     def _normalize_qm_feature_names(self, *, qm_feature_names: Optional[Sequence[str]], inst_qm_dim: int) -> list[str]:
         names = [str(x) for x in (qm_feature_names or ())]
         if int(inst_qm_dim) > 0:
@@ -1029,26 +1288,35 @@ class SemanticTagger:
         s = re.sub(r"[^a-z0-9]+", "_", s)
         return s.strip("_")
 
-    def _build_qm_family_index(self, *, feature_names: Sequence[str]) -> dict[str, list[int]]:
-        out: dict[str, list[int]] = {str(k): [] for k in self._QM_FAMILY_TOKENS.keys()}
+    def _build_family_index(
+        self,
+        *,
+        feature_names: Sequence[str],
+        family_tokens: Mapping[str, tuple[str, ...]],
+    ) -> dict[str, list[int]]:
+        out: dict[str, list[int]] = {str(k): [] for k in family_tokens.keys()}
         normalized = [self._normalize_descriptor_name(n) for n in feature_names]
         for idx, name in enumerate(normalized):
-            for family, tokens in self._QM_FAMILY_TOKENS.items():
+            for family, tokens in family_tokens.items():
                 if any(tok in name for tok in tokens):
                     out[str(family)].append(int(idx))
         return out
 
+    def _build_qm_family_index(self, *, feature_names: Sequence[str]) -> dict[str, list[int]]:
+        return self._build_family_index(
+            feature_names=feature_names,
+            family_tokens=self._QM_FAMILY_TOKENS,
+        )
+
     @staticmethod
-    def _resolve_qm_vector_for_patch(
+    def _resolve_geom_qm_vectors_for_patch(
         *,
         patch: PatchRecord,
         inst_by_pair: Optional[Mapping[tuple[str, str], np.ndarray]],
         inst_mean_by_id: Optional[Mapping[str, np.ndarray]],
         inst_geom_dim: int,
         inst_qm_dim: int,
-    ) -> Optional[np.ndarray]:
-        if int(inst_qm_dim) <= 0:
-            return None
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         mol_id = str(patch.mol_id)
 
         vec = None
@@ -1057,25 +1325,37 @@ class SemanticTagger:
         if vec is None and inst_mean_by_id is not None:
             vec = inst_mean_by_id.get(mol_id)
         if vec is None:
-            return None
+            return None, None
 
         arr = np.asarray(vec, dtype=np.float32).reshape(-1)
         if arr.size <= 0:
-            return None
+            return None, None
 
-        start = max(0, int(inst_geom_dim))
-        stop = start + int(inst_qm_dim)
-        if arr.size >= stop:
-            out = arr[start:stop]
-        elif arr.size >= int(inst_qm_dim):
-            out = arr[: int(inst_qm_dim)]
-        else:
-            return None
+        geom_out: Optional[np.ndarray] = None
+        if int(inst_geom_dim) > 0:
+            gdim = int(inst_geom_dim)
+            if arr.size >= gdim:
+                geom_out = arr[:gdim]
+                if geom_out is not None and np.isfinite(geom_out).any():
+                    geom_out = np.nan_to_num(geom_out, copy=False)
+                else:
+                    geom_out = None
 
-        if not np.isfinite(out).any():
-            return None
-        out = np.nan_to_num(out, copy=False)
-        return out
+        qm_out: Optional[np.ndarray] = None
+        if int(inst_qm_dim) > 0:
+            start = max(0, int(inst_geom_dim))
+            stop = start + int(inst_qm_dim)
+            if arr.size >= stop:
+                qm_out = arr[start:stop]
+            elif arr.size >= int(inst_qm_dim):
+                qm_out = arr[: int(inst_qm_dim)]
+            if qm_out is not None:
+                if np.isfinite(qm_out).any():
+                    qm_out = np.nan_to_num(qm_out, copy=False)
+                else:
+                    qm_out = None
+
+        return geom_out, qm_out
 
     @staticmethod
     def _largest_component_size(graph: Mapping[int, set[int]]) -> int:
@@ -1181,6 +1461,21 @@ class SemanticTagger:
                     reverse=True,
                 )
                 out.extend([name for name, score in ordered_fam[:2] if score >= float(self.config.qm_z_threshold)])
+
+        gms = descriptors.get("geom_summary", {})
+        if isinstance(gms, Mapping):
+            gfam = gms.get("family_stats", {})
+            if isinstance(gfam, Mapping):
+                ordered_gfam = sorted(
+                    (
+                        (str(k), float(v.get("abs_z_mean", 0.0)))
+                        for k, v in gfam.items()
+                        if isinstance(v, Mapping)
+                    ),
+                    key=lambda x: x[1],
+                    reverse=True,
+                )
+                out.extend([name for name, score in ordered_gfam[:2] if score >= float(self.config.geom_z_threshold)])
 
         if not out:
             out.append("mixed")

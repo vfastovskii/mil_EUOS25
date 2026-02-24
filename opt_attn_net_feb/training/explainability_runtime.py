@@ -773,6 +773,7 @@ def prepare_chem_ace_bundle(
     Xinst_sorted: np.ndarray,
     inst_geom_dim: int = -1,
     inst_qm_dim: int = -1,
+    inst_geom_cols: Sequence[str] = (),
     inst_qm_cols: Sequence[str] = (),
 ) -> Optional[ChemACEBundle]:
     """
@@ -803,6 +804,7 @@ def prepare_chem_ace_bundle(
         dim_3dqm_merged_raw=int(dim_inst_raw),
         dim_2d_used=int(config.chem_ace_max_2d_dim),
         dim_3dqm_used=int(config.chem_ace_max_3dqm_dim),
+        n_geom_descriptor_cols=int(len(inst_geom_cols)),
         n_qm_descriptor_cols=int(len(inst_qm_cols)),
     )
 
@@ -1076,6 +1078,7 @@ def prepare_chem_ace_bundle(
             inst_mean_by_id=inst_mean_map,
             inst_geom_dim=int(inst_geom_dim),
             inst_qm_dim=int(inst_qm_dim),
+            geom_feature_names=tuple(str(x) for x in inst_geom_cols),
             qm_feature_names=tuple(str(x) for x in inst_qm_cols),
         )
 

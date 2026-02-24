@@ -358,17 +358,32 @@ Computed descriptor families:
 
 - charge/formal + Gasteiger
 - aromaticity/conjugation
-- geometry (if conformers available and resolvable)
+- geometry from conformer coordinates (if conformers available and resolvable)
+- geometry from 3D descriptor vectors (column-name token families from `geom_cols`)
 - pharmacophore counts
 - SMARTS functional-group coverage (carboxylate, amide, sulfonamide, phosphates, amines, heteroaromatics, halogen motifs, boron motifs, ring classes, etc.)
 - SMARTS-RX reactivity-function coverage (electrophile/nucleophile/acid-base/leaving-group/redox/coordination/cycloaddition motifs)
 - QM descriptor semantics from per-conformer QM columns (token-mapped families such as HOMO/LUMO/gap, dipole, polarizability, hardness/softness, electrophilicity/nucleophilicity, charge-transfer/Fukui/ESP proxies)
 - optional Open Babel descriptor summary (`logP`, `TPSA`, `MR`) when `openbabel.pybel` is available
 
-3D geometry tags are derived from conformer coordinates:
+3D geometry tags are derived from two sources:
 
-- planarity RMSD
-- rotatable-bond proxy for rigid/flexible labels
+1. coordinate-derived:
+   - planarity RMSD
+   - rotatable-bond proxy for rigid/flexible labels
+2. descriptor-derived (from `inst_geom_cols` + `inst_geom_dim`, per patch):
+   - family summaries for distance / angle / dihedral / planarity / shape / size / inertia / surface-volume / ring-strain / hbond-geometry
+   - tags gated by:
+     - `geom_min_vectors_for_tagging`
+     - `geom_z_threshold`
+     - `geom_strong_z_threshold`
+
+Cross-modal tags are also emitted when signals agree across modalities:
+
+- SMARTS-RX electrophile + QM electrophilicity -> `electrophilic reaction-center motif`
+- SMARTS-RX nucleophile + QM nucleophilicity -> `nucleophilic reaction-center motif`
+- aromatic + planar geometry + QM gap signal -> `planar conjugated electronic motif`
+- HBD/HBA + QM dipole signal -> `polar donor-acceptor electronic motif`
 
 Tag outputs include:
 
@@ -434,9 +449,10 @@ QM semantic interpretation logic:
 1. concept-level QM vectors are pulled from conformer-specific `(mol_id, conf_id)` rows
 2. if conformer vector is missing, molecule-level mean vector is used as fallback
 3. vector is split into geometry + QM by `inst_geom_dim` and `inst_qm_dim`
-4. descriptor families are assigned by normalized column-name token matching
-5. tags are emitted only when enough QM vectors are available (`qm_min_vectors_for_tagging`)
-6. thresholds:
+4. geometry and QM feature names are passed explicitly (`geom_cols`, `qm_cols`) and normalized
+5. descriptor families are assigned by normalized column-name token matching
+6. tags are emitted only when enough QM vectors are available (`qm_min_vectors_for_tagging`)
+7. thresholds:
    - moderate: `qm_z_threshold`
    - strong: `qm_strong_z_threshold`
 

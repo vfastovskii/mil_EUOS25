@@ -264,6 +264,7 @@ class MILFinalData:
     conf_sorted: np.ndarray
     inst_geom_dim: int = -1
     inst_qm_dim: int = -1
+    inst_geom_cols: tuple[str, ...] = ()
     inst_qm_cols: tuple[str, ...] = ()
 
 
@@ -966,6 +967,7 @@ class MILFinalTrainer:
                 Xinst_sorted=data.Xinst_sorted,
                 inst_geom_dim=int(data.inst_geom_dim),
                 inst_qm_dim=int(data.inst_qm_dim),
+                inst_geom_cols=tuple(str(x) for x in data.inst_geom_cols),
                 inst_qm_cols=tuple(str(x) for x in data.inst_qm_cols),
             )
             log_event(
