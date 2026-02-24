@@ -350,6 +350,9 @@ Flow:
 File:
 
 - `explainability/chem_ace/semantics/taggers.py`
+- `explainability/chem_ace/rules/default_naming_rules.json`
+- `explainability/chem_ace/rules/default_functional_group_rules.json`
+- `explainability/chem_ace/rules/smartsrx.json`
 
 Computed descriptor families:
 
@@ -357,6 +360,10 @@ Computed descriptor families:
 - aromaticity/conjugation
 - geometry (if conformers available and resolvable)
 - pharmacophore counts
+- SMARTS functional-group coverage (carboxylate, amide, sulfonamide, phosphates, amines, heteroaromatics, halogen motifs, boron motifs, ring classes, etc.)
+- SMARTS-RX reactivity-function coverage (electrophile/nucleophile/acid-base/leaving-group/redox/coordination/cycloaddition motifs)
+- QM descriptor semantics from per-conformer QM columns (token-mapped families such as HOMO/LUMO/gap, dipole, polarizability, hardness/softness, electrophilicity/nucleophilicity, charge-transfer/Fukui/ESP proxies)
+- optional Open Babel descriptor summary (`logP`, `TPSA`, `MR`) when `openbabel.pybel` is available
 
 3D geometry tags are derived from conformer coordinates:
 
@@ -374,6 +381,59 @@ Concept receives `label_auto` from:
 
 1. rule-based registry
 2. fallback descriptor-based description
+
+Rule loading behavior:
+
+1. naming rules: explicit `naming_rules_path` if set, else bundled `default_naming_rules.json`
+2. functional rules: explicit `functional_rules_path` if set, else bundled `default_functional_group_rules.json`
+3. SMARTS-RX rules: explicit `smarts_rx_rules_path` if set, else bundled `smartsrx.json` (legacy fallback: `default_smarts_rx_rules.json`)
+4. invalid SMARTS are skipped with warning; pipeline continues
+
+SMARTS-RX file formats supported:
+
+1. canonical: `{ "rules": [ {tag, smarts, role, min_patch_rate, confidence, provenance}, ... ] }`
+2. SMARTS-RX generated registry: `{ "data": [ {category, subcategory, specific_type, smarts}, ... ] }`
+   - loader auto-derives:
+     - `tag = rx_<specific_type|subcategory|category>` (normalized)
+     - `role = <category>` (normalized)
+     - defaults for confidence/threshold/provenance when missing
+
+RDKit Fragments augmentation:
+
+1. during final Chem-ACE runtime, rules are auto-augmented from the labels table `curated_SMILES` column using all available `rdkit.Chem.Fragments.fr_*` functions
+2. generated rules are merged with bundled defaults and written to:
+   - `<chem_ace_output_dir>/rules_autogen/default_functional_group_rules.dataset.json`
+   - `<chem_ace_output_dir>/rules_autogen/functional_group_fragment_stats.json`
+3. this merged path is injected into `SemanticTaggingConfig.functional_rules_path` for concept tagging
+4. tags from these rules use `provenance = "rdkit_fragment_tagger"`
+
+Manual regeneration command:
+
+```bash
+python -m explainability.chem_ace.rules.generate_fragment_rules_from_labels \
+  --labels_csv /path/to/master_table_labels_final_modelling_ready_1401_with_cv_split.csv \
+  --smiles_col curated_SMILES \
+  --output_json /path/to/default_functional_group_rules.json \
+  --stats_json /path/to/functional_group_fragment_stats.json
+```
+
+QM semantic interpretation logic:
+
+1. concept-level QM vectors are pulled from conformer-specific `(mol_id, conf_id)` rows
+2. if conformer vector is missing, molecule-level mean vector is used as fallback
+3. vector is split into geometry + QM by `inst_geom_dim` and `inst_qm_dim`
+4. descriptor families are assigned by normalized column-name token matching
+5. tags are emitted only when enough QM vectors are available (`qm_min_vectors_for_tagging`)
+6. thresholds:
+   - moderate: `qm_z_threshold`
+   - strong: `qm_strong_z_threshold`
+
+SMARTS-RX semantics:
+
+1. each SMARTS-RX rule defines `tag`, `smarts`, `role`, `min_patch_rate`, `confidence`
+2. tags are emitted as rule-level tags (e.g., `rx_michael_acceptor`) plus role tags (`rx_role_electrophile`)
+3. naming rules can combine structural tags + SMARTS-RX tags (for example: `rx_michael_acceptor` + `rx_role_electrophile`)
+4. this gives concept labels that explicitly encode predicted reactivity class, not only structure
 
 ### 7.5 Downstream usage in Lambda-Vol and Concept-RL
 
@@ -515,19 +575,44 @@ Persisted DB entities include:
 - `explainability/chem_ace/concepts/clustering.py`
 - `explainability/chem_ace/concepts/pipeline.py`
 - `explainability/chem_ace/cav/tcav.py`
+- `explainability/chem_ace/rules/smartsrx.json`
 - `explainability/chem_ace/semantics/*`
 - `explainability/chem_ace/db/*`
 - `explainability/chem_ace/analytics/queries.py`
 - `entrypoints/chem_ace_demo.py`
 
-## 13) Assumptions and known limitations
+## 13) External descriptor ecosystem for larger semantic coverage
+
+Current implementation is RDKit-first, then optional Open Babel.
+
+Recommended expansion path:
+
+1. RDKit functional hierarchy:
+   - import hierarchy names/SMARTS from RDKit functional-group hierarchy file
+   - auto-generate additional SMARTS rules into a versioned JSON registry
+2. SMARTS-RX rule expansion:
+   - curate rule blocks by reaction family (SNAr, SN2, acylation, Michael addition, click, metal coordination, redox)
+   - keep each rule explicit: `(tag, smarts, role, min_patch_rate, confidence)` and version the JSON registry
+3. Open Babel descriptors:
+   - use `obabel -L descriptors` to enumerate plugins available in your environment
+   - map selected descriptors to semantic tags (lipophilicity, polarity, refractivity, etc.)
+4. QM parser toolchains:
+   - if raw quantum outputs are available, parse with cclib and map parsed attributes to schema-level descriptor families
+5. high-dimensional descriptor toolkits:
+   - Mordred / PaDEL-style descriptors can be used for extra concept annotation channels, then compressed to stable semantic families
+
+Design constraint:
+
+- keep semantic tags interpretable and sparse; large descriptor sets should feed family-level tags, not raw-feature labels.
+
+## 14) Assumptions and known limitations
 
 - RDKit is required for full Chem-ACE behavior.
 - HDBSCAN is optional; pipeline degrades gracefully if missing.
 - Final MIL integration currently uses feature-fusion patch embedding (`feature_projection`) rather than hook-based embedding strategies.
 - Patch volume can still be large; use radius/cap/target knobs aggressively on big datasets.
 
-## 14) TODO (advanced extensions)
+## 15) TODO (advanced extensions)
 
 - richer 3D pharmacophore grouping and spatial motifs
 - direct MIL attention-region extraction as native patch type

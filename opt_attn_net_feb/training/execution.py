@@ -262,6 +262,9 @@ class MILFinalData:
     id2pos: Dict[str, int]
     Xinst_sorted: np.ndarray
     conf_sorted: np.ndarray
+    inst_geom_dim: int = -1
+    inst_qm_dim: int = -1
+    inst_qm_cols: tuple[str, ...] = ()
 
 
 def drop_ids_without_bags(
@@ -961,6 +964,9 @@ class MILFinalTrainer:
                 id2pos=data.id2pos,
                 conf_sorted=data.conf_sorted,
                 Xinst_sorted=data.Xinst_sorted,
+                inst_geom_dim=int(data.inst_geom_dim),
+                inst_qm_dim=int(data.inst_qm_dim),
+                inst_qm_cols=tuple(str(x) for x in data.inst_qm_cols),
             )
             log_event(
                 "INFO",

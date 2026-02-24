@@ -24,10 +24,16 @@ from ..explainability.chem_ace.config import (
     LocalSubgraphPatchConfig,
     PatchGenerationConfig,
     Pharm3DPatchConfig,
+    SemanticTaggingConfig,
 )
 from ..explainability.chem_ace.concepts.pipeline import ChemACEPipeline, MoleculeSource
 from ..explainability.chem_ace.embedding.hooks import LayerActivationHook
 from ..explainability.chem_ace.optional_deps import OptionalDependencyError, require_rdkit
+from ..explainability.chem_ace.rules.rdkit_fragment_rules import (
+    default_functional_rules_path,
+    generate_fragment_rules_from_smiles,
+    merge_rules,
+)
 from ..explainability.chem_ace.types import (
     ConceptCandidate,
     ConceptMembership,
@@ -394,6 +400,14 @@ class MILLambdaVolFrameProvider:
         activation_matrix: np.ndarray,
     ) -> np.ndarray:
         tcav_scores = np.zeros((len(self.task_ids), len(self.concept_ids)), dtype=np.float32)
+        log_event(
+            "INFO",
+            "explainability.lambda_vol.tcav.compute.start",
+            layer_name=str(self.layer_name),
+            n_tasks=int(len(self.task_ids)),
+            n_concepts=int(len(self.concept_ids)),
+            concept_source="chem_ace_memberships_from_feature_fusion_2d3dqm",
+        )
 
         adapter = _MILTaskAdapter(model=model, task_ids=self.task_ids)
         with torch.enable_grad():
@@ -435,8 +449,121 @@ class MILLambdaVolFrameProvider:
                     )
                     tcav_scores[ti, ci] = float(summary.mean_sign_rate)
         model.zero_grad(set_to_none=True)
+        valid_scores = int(np.isfinite(tcav_scores).sum())
+        log_event(
+            "INFO",
+            "explainability.lambda_vol.tcav.compute.done",
+            layer_name=str(self.layer_name),
+            valid_scores=int(valid_scores),
+        )
         return tcav_scores
 
+
+
+def _prepare_dataset_functional_rules(
+    *,
+    df_full: pd.DataFrame,
+    smiles_col: str,
+    out_dir: Path,
+    min_count: int = 10,
+    min_prevalence: float = 0.0002,
+) -> Optional[Path]:
+    """
+    Build RDKit fragment rules from dataset SMILES and merge with default functional rules.
+
+    Returns path to merged rules JSON, or None when generation is not possible.
+    """
+    if smiles_col not in df_full.columns:
+        return None
+
+    smiles = (
+        df_full[smiles_col]
+        .dropna()
+        .astype(str)
+        .str.strip()
+    )
+    smiles = smiles[smiles.str.len() > 0].drop_duplicates().tolist()
+    if len(smiles) == 0:
+        log_event(
+            "WARN",
+            "explainability.chem_ace.functional_rules.no_smiles",
+            smiles_col=str(smiles_col),
+        )
+        return None
+
+    try:
+        generated_rules, summary, fragment_stats = generate_fragment_rules_from_smiles(
+            smiles_iter=smiles,
+            min_count=int(min_count),
+            min_prevalence=float(min_prevalence),
+        )
+    except Exception as exc:
+        log_event(
+            "WARN",
+            "explainability.chem_ace.functional_rules.generation_failed",
+            error=str(exc),
+        )
+        return None
+
+    base_rules_path = default_functional_rules_path()
+    payload_base: dict[str, Any] = {}
+    base_rules: list[dict[str, Any]] = []
+    if base_rules_path.exists():
+        try:
+            payload_base = json.loads(base_rules_path.read_text())
+            base_rules = list(payload_base.get("rules", []))
+        except Exception as exc:
+            log_event(
+                "WARN",
+                "explainability.chem_ace.functional_rules.base_load_failed",
+                path=str(base_rules_path),
+                error=str(exc),
+            )
+            payload_base = {}
+            base_rules = []
+
+    merged_rules = merge_rules(base_rules=base_rules, generated_rules=generated_rules)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_rules = out_dir / "default_functional_group_rules.dataset.json"
+    payload_out = {
+        **payload_base,
+        "rules": merged_rules,
+        "rdkit_fragment_generation": {
+            **summary.to_dict(),
+            "smiles_col": str(smiles_col),
+            "n_unique_smiles": int(len(smiles)),
+            "source": "prepare_chem_ace_bundle",
+        },
+    }
+    out_rules.write_text(json.dumps(payload_out, indent=2, sort_keys=False))
+
+    out_stats = out_dir / "functional_group_fragment_stats.json"
+    out_stats.write_text(
+        json.dumps(
+            {
+                **summary.to_dict(),
+                "smiles_col": str(smiles_col),
+                "n_unique_smiles": int(len(smiles)),
+                "fragments": fragment_stats,
+            },
+            indent=2,
+            sort_keys=False,
+        )
+    )
+
+    log_event(
+        "INFO",
+        "explainability.chem_ace.functional_rules.generated",
+        path=str(out_rules),
+        n_base_rules=int(len(base_rules)),
+        n_generated_rules=int(summary.n_generated_rules),
+        n_total_rules=int(len(merged_rules)),
+        min_count=int(min_count),
+        min_prevalence=float(min_prevalence),
+        n_unique_smiles=int(len(smiles)),
+    )
+    return out_rules
 
 
 def prepare_chem_ace_bundle(
@@ -455,6 +582,9 @@ def prepare_chem_ace_bundle(
     id2pos: Mapping[str, int],
     conf_sorted: np.ndarray,
     Xinst_sorted: np.ndarray,
+    inst_geom_dim: int = -1,
+    inst_qm_dim: int = -1,
+    inst_qm_cols: Sequence[str] = (),
 ) -> Optional[ChemACEBundle]:
     """
     Build Chem-ACE concepts and mappings with leakage-safe two-phase logic.
@@ -471,6 +601,20 @@ def prepare_chem_ace_bundle(
         cpu_workers=int(max(0, config.cpu_workers)),
         n_scope_ids_input=int(len(ids_scope)),
         n_infer_scope_ids_input=int(len(ids_infer_scope or [])),
+    )
+    dim_2d_raw = int(X2d_file.shape[1]) if np.asarray(X2d_file).ndim == 2 else -1
+    dim_inst_raw = int(Xinst_sorted.shape[1]) if np.asarray(Xinst_sorted).ndim == 2 else -1
+    log_event(
+        "INFO",
+        "explainability.chem_ace.modalities",
+        modalities="2d+3d+3d_qm",
+        dim_2d_raw=int(dim_2d_raw),
+        dim_3d_geom=(int(inst_geom_dim) if int(inst_geom_dim) > 0 else "unknown"),
+        dim_3d_qm=(int(inst_qm_dim) if int(inst_qm_dim) > 0 else "unknown"),
+        dim_3dqm_merged_raw=int(dim_inst_raw),
+        dim_2d_used=int(config.chem_ace_max_2d_dim),
+        dim_3dqm_used=int(config.chem_ace_max_3dqm_dim),
+        n_qm_descriptor_cols=int(len(inst_qm_cols)),
     )
 
     try:
@@ -490,6 +634,14 @@ def prepare_chem_ace_bundle(
     ace_out_dir = Path(config.chem_ace_output_dir) if config.chem_ace_output_dir else (outdir / "chem_ace")
     ace_out_dir.mkdir(parents=True, exist_ok=True)
     db_uri = str(config.chem_ace_db_uri) if config.chem_ace_db_uri else f"sqlite:///{(ace_out_dir / 'chem_ace.sqlite3').as_posix()}"
+
+    functional_rules_path: Optional[Path] = _prepare_dataset_functional_rules(
+        df_full=df_full,
+        smiles_col=smiles_col,
+        out_dir=(ace_out_dir / "rules_autogen"),
+        min_count=10,
+        min_prevalence=0.0002,
+    )
 
     local_radii = tuple(
         sorted({int(r) for r in config.chem_ace_local_radii if int(r) >= 0})
@@ -516,6 +668,11 @@ def prepare_chem_ace_bundle(
         patch_generation=PatchGenerationConfig(
             local_subgraph=LocalSubgraphPatchConfig(radii=tuple(local_radii)),
             pharm3d=Pharm3DPatchConfig(enabled=True),
+        ),
+        semantics=SemanticTaggingConfig(
+            functional_rules_path=(
+                None if functional_rules_path is None else str(functional_rules_path)
+            ),
         ),
         database=DatabaseConfig(uri=db_uri),
     )
@@ -664,12 +821,26 @@ def prepare_chem_ace_bundle(
     molecules_by_id.update(molecules_by_id_train)
     molecules_by_id.update(molecules_by_id_infer)
 
+    progress_extras_discover = {
+        "phase": "discover_train",
+        "modalities": "2d+3d+3d_qm",
+        "dim_2d_used": int(config.chem_ace_max_2d_dim),
+        "dim_3dqm_used": int(config.chem_ace_max_3dqm_dim),
+    }
+    if int(inst_geom_dim) > 0:
+        progress_extras_discover["dim_3d_geom"] = int(inst_geom_dim)
+    if int(inst_qm_dim) > 0:
+        progress_extras_discover["dim_3d_qm"] = int(inst_qm_dim)
+
     with log_step(
         "explainability.chem_ace.generate_patches",
         phase="discover_train",
         n_molecules=int(len(molecules_train)),
     ):
-        patches_train = pipeline.generate_patches(molecules=molecules_train)
+        patches_train = pipeline.generate_patches(
+            molecules=molecules_train,
+            progress_extras=progress_extras_discover,
+        )
     if len(patches_train) == 0:
         raise RuntimeError("Chem-ACE generated zero train patches; cannot continue")
     n_patches_train_2d = int(sum(1 for p in patches_train if p.conf_id is None))
@@ -712,6 +883,11 @@ def prepare_chem_ace_bundle(
             concept_set=concept_set,
             patches=patches_train,
             molecules_by_id=molecules_by_id_train,
+            inst_by_pair=inst_map,
+            inst_mean_by_id=inst_mean_map,
+            inst_geom_dim=int(inst_geom_dim),
+            inst_qm_dim=int(inst_qm_dim),
+            qm_feature_names=tuple(str(x) for x in inst_qm_cols),
         )
 
     concept_mol_map_train, concept_conf_map_train = _build_concept_membership_maps(
@@ -725,12 +901,26 @@ def prepare_chem_ace_bundle(
     n_inferred_memberships = 0
 
     if len(ids_infer) > 0 and len(concept_set.candidates) > 0:
+        progress_extras_infer = {
+            "phase": "infer_scope",
+            "modalities": "2d+3d+3d_qm",
+            "dim_2d_used": int(config.chem_ace_max_2d_dim),
+            "dim_3dqm_used": int(config.chem_ace_max_3dqm_dim),
+        }
+        if int(inst_geom_dim) > 0:
+            progress_extras_infer["dim_3d_geom"] = int(inst_geom_dim)
+        if int(inst_qm_dim) > 0:
+            progress_extras_infer["dim_3d_qm"] = int(inst_qm_dim)
+
         with log_step(
             "explainability.chem_ace.generate_patches",
             phase="infer_scope",
             n_molecules=int(len(molecules_infer)),
         ):
-            patches_infer = pipeline.generate_patches(molecules=molecules_infer)
+            patches_infer = pipeline.generate_patches(
+                molecules=molecules_infer,
+                progress_extras=progress_extras_infer,
+            )
         n_patches_infer = int(len(patches_infer))
         if n_patches_infer > 0:
             n_patches_infer_2d = int(sum(1 for p in patches_infer if p.conf_id is None))

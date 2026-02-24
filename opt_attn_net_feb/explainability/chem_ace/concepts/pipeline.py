@@ -156,13 +156,19 @@ class ChemACEPipeline:
         ranked.sort(key=lambda x: x[0])
         return [p for _, p in ranked[:cap]]
 
-    def generate_patches(self, *, molecules: Sequence[MoleculeSource]) -> list[PatchRecord]:
+    def generate_patches(
+        self,
+        *,
+        molecules: Sequence[MoleculeSource],
+        progress_extras: Optional[Mapping[str, Any]] = None,
+    ) -> list[PatchRecord]:
         """Generate patches for a set of molecules and persist them."""
         workers = self._cpu_workers()
         total_molecules = int(len(molecules))
         progress_every = self._patch_progress_every()
         patch_cap = self._resolve_patch_cap(total_molecules=total_molecules)
         t0 = time.perf_counter()
+        extras = {str(k): v for k, v in dict(progress_extras or {}).items()}
 
         log_event(
             "INFO",
@@ -170,6 +176,7 @@ class ChemACEPipeline:
             n_molecules=int(total_molecules),
             cap_per_molecule=int(patch_cap),
             target_total_patches=int(getattr(self.config, "target_total_patches", 0)),
+            **extras,
         )
 
         three_d_patch_types = {
@@ -255,6 +262,7 @@ class ChemACEPipeline:
                 mol_per_s=f"{rate:.2f}",
                 eta_s=(f"{eta_s:.1f}" if eta_s is not None else "na"),
                 cpu_workers=int(workers),
+                **extras,
             )
 
         all_patches: list[PatchRecord] = []
@@ -314,6 +322,7 @@ class ChemACEPipeline:
             patches_total=int(len(all_patches)),
             patches_2d=int(kept_2d_total),
             patches_3d=int(kept_3d_total),
+            **extras,
         )
         log_event(
             "START",
@@ -411,6 +420,11 @@ class ChemACEPipeline:
         concept_set: DiscoveredConceptSet,
         patches: Sequence[PatchRecord],
         molecules_by_id: Mapping[str, Any],
+        inst_by_pair: Optional[Mapping[tuple[str, str], np.ndarray]] = None,
+        inst_mean_by_id: Optional[Mapping[str, np.ndarray]] = None,
+        inst_geom_dim: int = 0,
+        inst_qm_dim: int = 0,
+        qm_feature_names: Optional[Sequence[str]] = None,
     ) -> list[SemanticTaggingResult]:
         """Compute semantic tags for each concept and persist them."""
         workers = self._cpu_workers()
@@ -434,6 +448,11 @@ class ChemACEPipeline:
                 concept_id=cand.concept_local_id,
                 concept_patches=cpatches,
                 molecules_by_id=molecules_by_id,
+                inst_by_pair=inst_by_pair,
+                inst_mean_by_id=inst_mean_by_id,
+                inst_geom_dim=int(inst_geom_dim),
+                inst_qm_dim=int(inst_qm_dim),
+                qm_feature_names=qm_feature_names,
             )
 
         if workers > 1:

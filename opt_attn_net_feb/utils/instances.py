@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -15,7 +15,8 @@ def load_and_merge_instances(
     allowed_ids: Optional[Set[str]],
     id_col: str = "ID",
     conf_col: str = "conf_id",
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return_meta: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray] | Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
     dg = pd.read_csv(geom_csv)
     dq = pd.read_csv(qm_csv)
 
@@ -97,6 +98,21 @@ def load_and_merge_instances(
     Xg = m[g_cols].to_numpy(dtype=np.float32)
     Xq = m[q_cols].to_numpy(dtype=np.float32)
     X = np.hstack([Xg, Xq]).astype(np.float32)
+    meta = {
+        "geom_dim": int(len(g_cols)),
+        "qm_dim": int(len(q_cols)),
+        "inst_dim": int(X.shape[1]),
+        "n_pairs": int(m.shape[0]),
+        "geom_cols": tuple(str(c) for c in g_cols),
+        "qm_cols": tuple(str(c) for c in q_cols),
+    }
+    print(
+        "[DATA-3D-MERGE] "
+        f"paired_rows={meta['n_pairs']} geom_dim={meta['geom_dim']} "
+        f"qm_dim={meta['qm_dim']} inst_dim={meta['inst_dim']}"
+    )
+    if bool(return_meta):
+        return ids_conf, conf_ids, X, meta
     return ids_conf, conf_ids, X
 
 

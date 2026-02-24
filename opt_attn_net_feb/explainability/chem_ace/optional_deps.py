@@ -35,6 +35,15 @@ def has_hdbscan() -> bool:
         return False
 
 
+def has_openbabel_pybel() -> bool:
+    """Return True when Open Babel pybel bindings are importable."""
+    try:
+        import_module("openbabel.pybel")
+        return True
+    except Exception:
+        return False
+
+
 def require_rdkit() -> ModuleType:
     """Import and return the RDKit root module or raise a clear error."""
     return _import_module("rdkit", "pip install rdkit")
@@ -50,11 +59,21 @@ def require_sqlalchemy() -> ModuleType:
     return _import_module("sqlalchemy", "pip install sqlalchemy")
 
 
+def require_openbabel_pybel() -> ModuleType:
+    """Import and return Open Babel pybel module or raise a clear error."""
+    return _import_module(
+        "openbabel.pybel",
+        "conda install -c conda-forge openbabel",
+    )
+
+
 __all__ = [
     "OptionalDependencyError",
     "has_hdbscan",
+    "has_openbabel_pybel",
     "has_rdkit",
     "require_hdbscan",
+    "require_openbabel_pybel",
     "require_rdkit",
     "require_sqlalchemy",
 ]

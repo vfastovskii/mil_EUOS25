@@ -862,16 +862,61 @@ Taggers produce evidence-backed tags with confidence:
 - conjugation/aromaticity tags
 - geometry tags
 - pharmacophore tags
+- SMARTS functional-group tags from `default_functional_group_rules.json`
+- SMARTS-RX reactivity tags from `smartsrx.json`
+- QM descriptor-family tags derived from per-conformer QM vectors and QM column names
+- optional Open Babel descriptor tags (`logP`, `TPSA`, `MR`) when `openbabel.pybel` is available
 
 Key thresholds (`SemanticTaggingConfig` defaults):
 - `charge_threshold_formal = 1`
 - `aromatic_fraction_threshold = 0.35`
 - `conjugation_size_threshold = 6`
 - `planarity_rmsd_threshold = 0.25`
+- `qm_min_vectors_for_tagging = 8`
+- `qm_z_threshold = 0.50`
+- `qm_strong_z_threshold = 1.00`
+- `use_smarts_rx = True`
+- `smarts_rx_rules_path = None` (uses bundled SMARTS-RX registry)
+
+Functional rules:
+- source file: `explainability/chem_ace/rules/default_functional_group_rules.json`
+- per-rule controls: `min_patch_rate`, `confidence`, `provenance`
+- invalid SMARTS are skipped with warning; pipeline continues
+- runtime augmentation:
+  - Chem-ACE builds additional functional rules from dataset `curated_SMILES` using RDKit `Chem.Fragments.fr_*` counters
+  - generated + merged file path:
+    - `<chem_ace_output_dir>/rules_autogen/default_functional_group_rules.dataset.json`
+  - fragment prevalence stats:
+    - `<chem_ace_output_dir>/rules_autogen/functional_group_fragment_stats.json`
+  - merged rules are injected through `SemanticTaggingConfig.functional_rules_path` and used for semantic tagging in the same run
+
+SMARTS-RX rules:
+- source file: `explainability/chem_ace/rules/smartsrx.json` (legacy fallback: `default_smarts_rx_rules.json`)
+- each rule: `(tag, smarts, role, min_patch_rate, confidence, provenance)`
+- emitted tags include rule tags (e.g., `rx_michael_acceptor`) and role tags (e.g., `rx_role_electrophile`)
+- intended for reactivity-aware concept naming and downstream filtering
+- supported input schemas:
+  - canonical `rules` schema (explicit `tag`)
+  - generated `data` schema (`category/subcategory/specific_type/smarts`) with auto-derived `tag` and `role`
 
 Naming:
 - rule-based first (JSON registry)
 - fallback descriptor-based label (`"<top descriptors> motif"`)
+
+Rule sources:
+- naming rules: `explainability/chem_ace/rules/default_naming_rules.json`
+- functional rules: `explainability/chem_ace/rules/default_functional_group_rules.json`
+- SMARTS-RX rules: `explainability/chem_ace/rules/smartsrx.json`
+- RDKit-fragment generator CLI:
+  - `python -m explainability.chem_ace.rules.generate_fragment_rules_from_labels --labels_csv ... --smiles_col curated_SMILES`
+- explicit paths can be set via `SemanticTaggingConfig.naming_rules_path`, `SemanticTaggingConfig.functional_rules_path`, and `SemanticTaggingConfig.smarts_rx_rules_path`
+
+QM family mapping:
+- descriptor names are normalized and matched by token to families:
+  - HOMO, LUMO, gap, dipole, polarizability, hardness, softness
+  - electrophilicity, nucleophilicity, charge-transfer, ESP, Fukui, NBO, Mulliken/NPA
+- family stats are computed as concept-level `abs_z_mean`, `z_mean`, `z_std`
+- tags are emitted from thresholded family stats (e.g., `large HOMO-LUMO gap`, `high dipole moment`, `electrophile-like electronic profile`)
 
 ### 14.7 Chem-ACE persistence schema
 

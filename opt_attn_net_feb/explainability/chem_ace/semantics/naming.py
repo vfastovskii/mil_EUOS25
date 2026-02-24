@@ -22,7 +22,17 @@ class NamingRegistry:
     rules: tuple[NamingRule, ...]
 
     @staticmethod
+    def bundled_default_path() -> Path:
+        return Path(__file__).resolve().parents[1] / "rules" / "default_naming_rules.json"
+
+    @staticmethod
     def default() -> "NamingRegistry":
+        default_path = NamingRegistry.bundled_default_path()
+        if default_path.exists():
+            try:
+                return NamingRegistry.from_json(default_path)
+            except Exception:
+                pass
         return NamingRegistry(
             rules=(
                 NamingRule(label="carboxylate-like anion", required_tags=("anionic", "HBA")),

@@ -104,10 +104,17 @@ class SemanticTaggingConfig:
     """Semantic tagging and naming settings."""
 
     naming_rules_path: Optional[str] = None
+    functional_rules_path: Optional[str] = None
+    smarts_rx_rules_path: Optional[str] = None
+    use_smarts_rx: bool = True
+    use_openbabel_descriptors: bool = True
     charge_threshold_formal: int = 1
     aromatic_fraction_threshold: float = 0.35
     conjugation_size_threshold: int = 6
     planarity_rmsd_threshold: float = 0.25
+    qm_min_vectors_for_tagging: int = 8
+    qm_z_threshold: float = 0.50
+    qm_strong_z_threshold: float = 1.00
 
 
 @dataclass(frozen=True)

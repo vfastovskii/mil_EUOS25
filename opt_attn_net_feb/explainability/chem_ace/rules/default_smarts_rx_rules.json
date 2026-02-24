@@ -1,0 +1,54 @@
+{
+  "rules": [
+    {"tag": "rx_michael_acceptor", "role": "electrophile", "smarts": "[C]=[C]-[C](=O)[#6,#7,#8]", "min_patch_rate": 0.003, "confidence": 0.95},
+    {"tag": "rx_alpha_beta_unsat_nitrile", "role": "electrophile", "smarts": "[C]=[C]-[C]#N", "min_patch_rate": 0.002, "confidence": 0.92},
+    {"tag": "rx_epoxide_ring_opening_acceptor", "role": "electrophile", "smarts": "[OX2r3]1[#6r3][#6r3]1", "min_patch_rate": 0.002, "confidence": 0.95},
+    {"tag": "rx_aziridine_ring_opening_acceptor", "role": "electrophile", "smarts": "[NX3r3]1[#6r3][#6r3]1", "min_patch_rate": 0.001, "confidence": 0.92},
+    {"tag": "rx_acyl_halide", "role": "electrophile", "smarts": "[CX3](=O)[Cl,Br,I]", "min_patch_rate": 0.001, "confidence": 0.98},
+    {"tag": "rx_sulfonyl_halide", "role": "electrophile", "smarts": "[SX4](=O)(=O)[Cl,Br,I]", "min_patch_rate": 0.001, "confidence": 0.97},
+    {"tag": "rx_anhydride_acylating_agent", "role": "electrophile", "smarts": "[CX3](=O)O[CX3](=O)", "min_patch_rate": 0.001, "confidence": 0.96},
+    {"tag": "rx_isocyanate", "role": "electrophile", "smarts": "N=C=O", "min_patch_rate": 0.001, "confidence": 0.95},
+    {"tag": "rx_isothiocyanate", "role": "electrophile", "smarts": "N=C=S", "min_patch_rate": 0.001, "confidence": 0.95},
+    {"tag": "rx_imine_electrophile", "role": "electrophile", "smarts": "[CX3]=[NX2]", "min_patch_rate": 0.004, "confidence": 0.86},
+    {"tag": "rx_iminium_like_center", "role": "electrophile", "smarts": "[NX3+]=[CX3]", "min_patch_rate": 0.001, "confidence": 0.93},
+    {"tag": "rx_nitrile_electrophile", "role": "electrophile", "smarts": "[CX2]#N", "min_patch_rate": 0.005, "confidence": 0.84},
+    {"tag": "rx_quinone_like_acceptor", "role": "electrophile", "smarts": "O=[C]1[C]=[C][C](=O)[C]=[C]1", "min_patch_rate": 0.001, "confidence": 0.90},
+    {"tag": "rx_alkyl_halide_sn2_acceptor", "role": "electrophile", "smarts": "[CX4][Cl,Br,I]", "min_patch_rate": 0.004, "confidence": 0.9},
+    {"tag": "rx_benzylic_halide_sn1_sn2_acceptor", "role": "electrophile", "smarts": "[c][CH2][Cl,Br,I]", "min_patch_rate": 0.001, "confidence": 0.92},
+    {"tag": "rx_allylic_halide_sn2_acceptor", "role": "electrophile", "smarts": "C=CC[Cl,Br,I]", "min_patch_rate": 0.001, "confidence": 0.9},
+
+    {"tag": "rx_amine_nucleophile", "role": "nucleophile", "smarts": "[NX3;!$(N=*)]", "min_patch_rate": 0.01, "confidence": 0.82},
+    {"tag": "rx_thiol_nucleophile", "role": "nucleophile", "smarts": "[SX2H]", "min_patch_rate": 0.001, "confidence": 0.93},
+    {"tag": "rx_alkoxide_nucleophile_like", "role": "nucleophile", "smarts": "[OX2H][CX4]", "min_patch_rate": 0.005, "confidence": 0.80},
+    {"tag": "rx_phenoxide_nucleophile_like", "role": "nucleophile", "smarts": "[OX2H][c]", "min_patch_rate": 0.003, "confidence": 0.88},
+    {"tag": "rx_enamine_nucleophile_like", "role": "nucleophile", "smarts": "[NX3][CX3]=[CX3]", "min_patch_rate": 0.001, "confidence": 0.86},
+    {"tag": "rx_enolate_prone_carbonyl", "role": "nucleophile", "smarts": "[CH2][CX3](=O)[#6,#7,#8]", "min_patch_rate": 0.003, "confidence": 0.8},
+    {"tag": "rx_electron_rich_heteroaromatic_nucleophile", "role": "nucleophile", "smarts": "[nH]1cccc1", "min_patch_rate": 0.001, "confidence": 0.82},
+
+    {"tag": "rx_bronsted_acid_carboxylic", "role": "acid_base", "smarts": "[CX3](=O)[OX2H1]", "min_patch_rate": 0.004, "confidence": 0.9},
+    {"tag": "rx_bronsted_acid_phenol", "role": "acid_base", "smarts": "[OX2H][c]", "min_patch_rate": 0.003, "confidence": 0.83},
+    {"tag": "rx_bronsted_base_tertiary_amine", "role": "acid_base", "smarts": "[NX3;H0]([#6])([#6])[#6]", "min_patch_rate": 0.003, "confidence": 0.9},
+    {"tag": "rx_bronsted_base_pyridine_like", "role": "acid_base", "smarts": "n1ccccc1", "min_patch_rate": 0.002, "confidence": 0.9},
+    {"tag": "rx_strong_base_guanidine_like", "role": "acid_base", "smarts": "[NX3][CX3](=[NX2])[NX3]", "min_patch_rate": 0.001, "confidence": 0.93},
+
+    {"tag": "rx_sn2_leaving_group_halide", "role": "leaving_group", "smarts": "[Cl,Br,I]", "min_patch_rate": 0.01, "confidence": 0.76},
+    {"tag": "rx_leaving_group_sulfonate", "role": "leaving_group", "smarts": "O[S](=O)(=O)[#6]", "min_patch_rate": 0.001, "confidence": 0.92},
+    {"tag": "rx_leaving_group_phosphate", "role": "leaving_group", "smarts": "O[P](=O)(O)O", "min_patch_rate": 0.001, "confidence": 0.88},
+
+    {"tag": "rx_redox_disulfide", "role": "redox", "smarts": "S-S", "min_patch_rate": 0.001, "confidence": 0.9},
+    {"tag": "rx_redox_nitro", "role": "redox", "smarts": "[NX3+](=O)[O-]", "min_patch_rate": 0.003, "confidence": 0.86},
+    {"tag": "rx_redox_quinone_like", "role": "redox", "smarts": "O=[C]1[C]=[C][C](=O)[C]=[C]1", "min_patch_rate": 0.001, "confidence": 0.9},
+    {"tag": "rx_peroxide_like", "role": "redox", "smarts": "OO", "min_patch_rate": 0.001, "confidence": 0.86},
+
+    {"tag": "rx_metal_binder_1_3_dicarbonyl", "role": "coordination", "smarts": "O=C-C-C=O", "min_patch_rate": 0.001, "confidence": 0.86},
+    {"tag": "rx_metal_binder_pyridyl_n", "role": "coordination", "smarts": "n1ccccc1", "min_patch_rate": 0.002, "confidence": 0.88},
+    {"tag": "rx_metal_binder_imidazole_n", "role": "coordination", "smarts": "n1cc[nH]c1", "min_patch_rate": 0.001, "confidence": 0.9},
+    {"tag": "rx_metal_binder_carboxylate", "role": "coordination", "smarts": "[CX3](=O)[O-]", "min_patch_rate": 0.002, "confidence": 0.91},
+    {"tag": "rx_metal_binder_hydroxamate", "role": "coordination", "smarts": "[CX3](=O)N[OX2H,OX1-]", "min_patch_rate": 0.001, "confidence": 0.95},
+
+    {"tag": "rx_click_azide_partner", "role": "cycloaddition", "smarts": "[N]=[N+]=[N-]", "min_patch_rate": 0.001, "confidence": 0.92},
+    {"tag": "rx_click_terminal_alkyne_partner", "role": "cycloaddition", "smarts": "[C]#[CH]", "min_patch_rate": 0.001, "confidence": 0.9},
+    {"tag": "rx_diels_alder_diene_like", "role": "cycloaddition", "smarts": "C=CC=C", "min_patch_rate": 0.001, "confidence": 0.82},
+    {"tag": "rx_diels_alder_dienophile_like", "role": "cycloaddition", "smarts": "C=CC(=O)", "min_patch_rate": 0.001, "confidence": 0.84}
+  ]
+}

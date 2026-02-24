@@ -85,6 +85,23 @@ Behavior for conformers:
 - 3D Pharm3D patches are generated only for conformers found in the SDF.
 - If a `conf_id` from the features is missing in SDF, it is skipped (no conformer generation fallback).
 
+Functional-group rules behavior:
+
+- Chem-ACE auto-augments functional-group rules from all unique `curated_SMILES` in the provided labels table using RDKit `Chem.Fragments.fr_*`.
+- Merged runtime rules are written to:
+  - `<chem_ace_output_dir>/rules_autogen/default_functional_group_rules.dataset.json`
+  - `<chem_ace_output_dir>/rules_autogen/functional_group_fragment_stats.json`
+
+Manual rule generation:
+
+```bash
+python -m explainability.chem_ace.rules.generate_fragment_rules_from_labels \
+  --labels_csv /path/to/master_table_labels_final_modelling_ready_1401_with_cv_split.csv \
+  --smiles_col curated_SMILES \
+  --output_json /path/to/default_functional_group_rules.json \
+  --stats_json /path/to/functional_group_fragment_stats.json
+```
+
 Patch-budget behavior:
 
 - Local-subgraph default is `radii=(1,)`.

@@ -1,20 +1,87 @@
 {
   "rules": [
-    {
-      "label": "carboxylate-like anion",
-      "required_tags": ["anionic", "HBA"]
-    },
-    {
-      "label": "cationic amine",
-      "required_tags": ["cationic", "HBD"]
-    },
-    {
-      "label": "planar aromatic pi-system",
-      "required_tags": ["planar", "aromatic pi-system"]
-    },
-    {
-      "label": "HBD/HBA pair",
-      "required_tags": ["HBD/HBA pair"]
-    }
+    {"label": "carboxylate-like anion", "required_tags": ["carboxylate", "anionic"]},
+    {"label": "carboxylic acid motif", "required_tags": ["carboxylic_acid", "HBD", "HBA"]},
+    {"label": "sulfonamide motif", "required_tags": ["sulfonamide"]},
+    {"label": "sulfone motif", "required_tags": ["sulfone"]},
+    {"label": "sulfoxide motif", "required_tags": ["sulfoxide"]},
+    {"label": "phosphonate motif", "required_tags": ["phosphonate"]},
+    {"label": "phosphate motif", "required_tags": ["phosphate"]},
+    {"label": "amide carbonyl motif", "required_tags": ["amide"]},
+    {"label": "lactam ring amide", "required_tags": ["lactam"]},
+    {"label": "lactone ester ring", "required_tags": ["lactone"]},
+    {"label": "carbamate motif", "required_tags": ["carbamate"]},
+    {"label": "urea motif", "required_tags": ["urea"]},
+    {"label": "guanidinium-like cation", "required_tags": ["guanidine", "cationic"]},
+    {"label": "amidinium-like cation", "required_tags": ["amidine", "cationic"]},
+    {"label": "quaternary ammonium center", "required_tags": ["quaternary_ammonium", "cationic"]},
+    {"label": "tertiary amine center", "required_tags": ["amine_tertiary", "cationic"]},
+    {"label": "primary amine donor motif", "required_tags": ["amine_primary", "HBD"]},
+    {"label": "imidazole-like heteroaromatic", "required_tags": ["imidazole_like", "heteroaromatic"]},
+    {"label": "pyridine-like heteroaromatic", "required_tags": ["pyridine_like_n", "heteroaromatic"]},
+    {"label": "indole-like aromatic donor", "required_tags": ["indole_like", "aromatic pi-system"]},
+    {"label": "nitrile motif", "required_tags": ["nitrile"]},
+    {"label": "nitro motif", "required_tags": ["nitro"]},
+    {"label": "azide motif", "required_tags": ["azide"]},
+    {"label": "isocyanate electrophile motif", "required_tags": ["isocyanate", "electrophile-like electronic profile"]},
+    {"label": "boronic acid motif", "required_tags": ["boronic_acid"]},
+    {"label": "boronate ester motif", "required_tags": ["boronate_ester"]},
+    {"label": "phenol aromatic donor motif", "required_tags": ["phenol", "HBD", "aromatic pi-system"]},
+    {"label": "alcohol donor motif", "required_tags": ["alcohol", "HBD"]},
+    {"label": "ether acceptor motif", "required_tags": ["ether", "HBA"]},
+    {"label": "thioether sulfur motif", "required_tags": ["thioether"]},
+    {"label": "thiol sulfur donor motif", "required_tags": ["thiol", "HBD"]},
+    {"label": "disulfide linkage motif", "required_tags": ["disulfide"]},
+    {"label": "aldehyde electrophile motif", "required_tags": ["aldehyde", "electrophile-like electronic profile"]},
+    {"label": "ketone carbonyl motif", "required_tags": ["ketone", "HBA"]},
+    {"label": "ester carbonyl motif", "required_tags": ["ester", "HBA"]},
+    {"label": "aromatic halogenated motif", "required_tags": ["halogenated", "aromatic pi-system"]},
+    {"label": "trifluoromethyl hydrophobic motif", "required_tags": ["trifluoromethyl", "neutral nonpolar"]},
+    {"label": "fused aromatic pi-system", "required_tags": ["fused_aromatic", "aromatic pi-system", "planar"]},
+    {"label": "aromatic heterocycle pi-system", "required_tags": ["aromatic_heterocycle", "heteroaromatic"]},
+    {"label": "macrocyclic scaffold motif", "required_tags": ["ring_macrocycle"]},
+    {"label": "strained epoxide electrophile", "required_tags": ["epoxide", "electrophile-like electronic profile"]},
+    {"label": "electron-rich aromatic donor motif", "required_tags": ["aromatic pi-system", "nucleophile-like electronic profile"]},
+    {"label": "electron-poor aromatic acceptor motif", "required_tags": ["aromatic pi-system", "electrophile-like electronic profile"]},
+    {"label": "charge-transfer aromatic motif", "required_tags": ["aromatic pi-system", "charge-transfer-prone profile"]},
+    {"label": "highly polarizable aromatic motif", "required_tags": ["aromatic pi-system", "high polarizability"]},
+    {"label": "high-dipole donor/acceptor motif", "required_tags": ["high dipole moment", "HBD/HBA pair"]},
+    {"label": "rigid planar aromatic motif", "required_tags": ["aromatic pi-system", "planar", "rigid"]},
+    {"label": "flexible aliphatic motif", "required_tags": ["aliphatic", "flexible"]},
+    {"label": "zwitterionic donor/acceptor motif", "required_tags": ["zwitterionic-like", "HBD/HBA pair"]},
+    {"label": "soft nucleophilic motif", "required_tags": ["soft electronic profile", "nucleophile-like electronic profile"]},
+    {"label": "hard electrophilic motif", "required_tags": ["hard electronic profile", "electrophile-like electronic profile"]},
+    {"label": "neutral lipophilic motif", "required_tags": ["neutral nonpolar", "lipophilic"]},
+    {"label": "polar surface-rich motif", "required_tags": ["neutral polar", "high polar surface area"]},
+    {"label": "low-gap reactive motif", "required_tags": ["small HOMO-LUMO gap"]},
+    {"label": "large-gap stable motif", "required_tags": ["large HOMO-LUMO gap"]},
+
+    {"label": "SMARTS-RX michael acceptor motif", "required_tags": ["rx_michael_acceptor", "rx_role_electrophile"]},
+    {"label": "SMARTS-RX acylating electrophile motif", "required_tags": ["rx_acyl_halide", "rx_role_electrophile"]},
+    {"label": "SMARTS-RX sulfonylating electrophile motif", "required_tags": ["rx_sulfonyl_halide", "rx_role_electrophile"]},
+    {"label": "SMARTS-RX ring-opening electrophile motif", "required_tags": ["rx_epoxide_ring_opening_acceptor", "rx_role_electrophile"]},
+    {"label": "SMARTS-RX isocyanate electrophile motif", "required_tags": ["rx_isocyanate", "rx_role_electrophile"]},
+    {"label": "SMARTS-RX imine electrophile motif", "required_tags": ["rx_imine_electrophile", "rx_role_electrophile"]},
+    {"label": "SMARTS-RX alkyl-halide substitution motif", "required_tags": ["rx_alkyl_halide_sn2_acceptor", "rx_sn2_leaving_group_halide"]},
+
+    {"label": "SMARTS-RX amine nucleophile motif", "required_tags": ["rx_amine_nucleophile", "rx_role_nucleophile"]},
+    {"label": "SMARTS-RX thiol nucleophile motif", "required_tags": ["rx_thiol_nucleophile", "rx_role_nucleophile"]},
+    {"label": "SMARTS-RX phenoxy nucleophile motif", "required_tags": ["rx_phenoxide_nucleophile_like", "rx_role_nucleophile"]},
+    {"label": "SMARTS-RX enolate-prone nucleophile motif", "required_tags": ["rx_enolate_prone_carbonyl", "rx_role_nucleophile"]},
+
+    {"label": "SMARTS-RX acid/base bifunctional motif", "required_tags": ["rx_role_acid_base", "HBD/HBA pair"]},
+    {"label": "SMARTS-RX strong base motif", "required_tags": ["rx_strong_base_guanidine_like", "rx_role_acid_base"]},
+
+    {"label": "SMARTS-RX redox-active motif", "required_tags": ["rx_role_redox"]},
+    {"label": "SMARTS-RX quinone-like redox motif", "required_tags": ["rx_redox_quinone_like", "rx_role_redox"]},
+
+    {"label": "SMARTS-RX metal-binding motif", "required_tags": ["rx_role_coordination"]},
+    {"label": "SMARTS-RX hydroxamate metal-binder motif", "required_tags": ["rx_metal_binder_hydroxamate", "rx_role_coordination"]},
+
+    {"label": "SMARTS-RX click-ready azide motif", "required_tags": ["rx_click_azide_partner", "rx_role_cycloaddition"]},
+    {"label": "SMARTS-RX click-ready alkyne motif", "required_tags": ["rx_click_terminal_alkyne_partner", "rx_role_cycloaddition"]},
+
+    {"label": "planar aromatic pi-system", "required_tags": ["planar", "aromatic pi-system"]},
+    {"label": "HBD/HBA pair", "required_tags": ["HBD/HBA pair"]}
   ]
 }

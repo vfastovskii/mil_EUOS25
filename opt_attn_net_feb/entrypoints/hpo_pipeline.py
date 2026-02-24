@@ -583,12 +583,13 @@ class HPODataBuilder:
                 log_event("INFO", "hpo_data.folds", folds=list(map(int, folds)), n_folds=int(len(folds_info)))
 
             with log_step("hpo_data.load_and_merge_instances"):
-                ids_conf_hpo, conf_ids_hpo, Xinst_hpo = load_and_merge_instances(
+                ids_conf_hpo, conf_ids_hpo, Xinst_hpo, inst_meta_hpo = load_and_merge_instances(
                     p.feat3d_scaled,
                     p.feat3d_qm_scaled,
                     allowed_ids=set(ids_hpo),
                     id_col=c.id_col,
                     conf_col=c.conf_col,
+                    return_meta=True,
                 )
                 _, starts_hpo, counts_hpo, id2pos_hpo, Xinst_sorted_hpo, _ = build_instance_index(
                     ids_conf_hpo,
@@ -600,6 +601,9 @@ class HPODataBuilder:
                     "hpo_data.instances_ready",
                     n_conf=int(Xinst_sorted_hpo.shape[0]),
                     inst_dim=int(Xinst_sorted_hpo.shape[1]),
+                    inst_geom_dim=int(inst_meta_hpo["geom_dim"]),
+                    inst_qm_dim=int(inst_meta_hpo["qm_dim"]),
+                    n_qm_cols=int(len(inst_meta_hpo.get("qm_cols", ()))),
                     n_ids_with_bags=int(len(id2pos_hpo)),
                 )
 
@@ -803,12 +807,13 @@ class MILPipelineOrchestrator:
                     .astype(str)
                     .tolist()
                 )
-                ids_conf_all, conf_ids_all, Xinst_all = load_and_merge_instances(
+                ids_conf_all, conf_ids_all, Xinst_all, inst_meta_all = load_and_merge_instances(
                     p.feat3d_scaled,
                     p.feat3d_qm_scaled,
                     allowed_ids=allowed_final,
                     id_col=c.id_col,
                     conf_col=c.conf_col,
+                    return_meta=True,
                 )
                 _, starts_all, counts_all, id2pos_all, Xinst_sorted_all, conf_sorted_all = build_instance_index(
                     ids_conf_all,
@@ -821,6 +826,9 @@ class MILPipelineOrchestrator:
                     n_ids_with_bags=int(len(id2pos_all)),
                     n_conf=int(Xinst_sorted_all.shape[0]),
                     inst_dim=int(Xinst_sorted_all.shape[1]),
+                    inst_geom_dim=int(inst_meta_all["geom_dim"]),
+                    inst_qm_dim=int(inst_meta_all["qm_dim"]),
+                    n_qm_cols=int(len(inst_meta_all.get("qm_cols", ()))),
                 )
 
             with log_step("pipeline.final.build_config"):
@@ -836,6 +844,9 @@ class MILPipelineOrchestrator:
                     id2pos=id2pos_all,
                     Xinst_sorted=Xinst_sorted_all,
                     conf_sorted=conf_sorted_all,
+                    inst_geom_dim=int(inst_meta_all["geom_dim"]),
+                    inst_qm_dim=int(inst_meta_all["qm_dim"]),
+                    inst_qm_cols=tuple(str(x) for x in inst_meta_all.get("qm_cols", ())),
                 )
                 final_cfg = FinalTrainConfig(
                     seed=int(self.config.runtime.seed),
