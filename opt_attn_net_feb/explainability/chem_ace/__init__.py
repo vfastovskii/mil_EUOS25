@@ -30,6 +30,11 @@ from .types import (
     TCAVRecord,
     TagAssignment,
 )
+from .semantics import (
+    ActivityAwareSemanticCalibrator,
+    ActivityCalibrationConfig,
+    ActivityCalibratedTagRecord,
+)
 
 __all__ = [
     "BRICSPatchConfig",
@@ -51,4 +56,7 @@ __all__ = [
     "SemanticTaggingConfig",
     "TCAVRecord",
     "TagAssignment",
+    "ActivityCalibrationConfig",
+    "ActivityCalibratedTagRecord",
+    "ActivityAwareSemanticCalibrator",
 ]

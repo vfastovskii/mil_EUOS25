@@ -1312,6 +1312,16 @@ class MILFinalTrainer:
                     if chem_bundle.a_priori_vs_concepts_infer_csv is None
                     else str(chem_bundle.a_priori_vs_concepts_infer_csv)
                 ),
+                "activity_calibrated_tags_csv": (
+                    None
+                    if chem_bundle.activity_calibrated_tags_csv is None
+                    else str(chem_bundle.activity_calibrated_tags_csv)
+                ),
+                "activity_calibration_summary_json": (
+                    None
+                    if chem_bundle.activity_calibration_summary_json is None
+                    else str(chem_bundle.activity_calibration_summary_json)
+                ),
                 "prediction_explanations_csv": (
                     None if explained_pred_path is None else str(explained_pred_path)
                 ),

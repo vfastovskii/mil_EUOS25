@@ -34,6 +34,10 @@ from ..explainability.chem_ace.rules.rdkit_fragment_rules import (
     generate_fragment_rules_from_smiles,
     merge_rules,
 )
+from ..explainability.chem_ace.semantics.calibration import (
+    ActivityAwareSemanticCalibrator,
+    ActivityCalibrationConfig,
+)
 from ..explainability.chem_ace.types import (
     ConceptCandidate,
     ConceptMembership,
@@ -82,6 +86,22 @@ class FinalExplainabilityConfig:
     chem_ace_top_concepts: int = 64
     # <=0 disables distance gating for inference-time nearest-centroid assignment.
     chem_ace_infer_max_distance: float = -1.0
+    # Supervised semantic confidence calibration from train-scope activity labels.
+    run_activity_calibration: bool = True
+    activity_calibration_min_concept_support: int = 12
+    activity_calibration_min_tag_support: int = 24
+    activity_calibration_prior_strength: float = 32.0
+    activity_calibration_min_w: float = 0.40
+    activity_calibration_task_weight: float = 0.70
+    activity_calibration_bitmask_weight: float = 0.30
+    activity_calibration_bitmask_min_count: int = 20
+    activity_calibration_bitmask_exclude_zero: bool = True
+    activity_calibration_mix_base: float = 0.60
+    activity_calibration_keep_threshold: float = 0.55
+    activity_calibration_min_confidence: float = 0.05
+    activity_calibration_max_confidence: float = 0.99
+    activity_calibration_ratio_cap: float = 8.0
+    activity_calibration_fallback_top1_if_empty: bool = True
 
     lambda_vol_output_dir: Optional[str] = None
     lambda_vol_db_uri: Optional[str] = None
@@ -129,6 +149,8 @@ class ChemACEBundle:
     a_priori_vs_concepts_csv: Optional[str] = None
     a_priori_tags_infer_csv: Optional[str] = None
     a_priori_vs_concepts_infer_csv: Optional[str] = None
+    activity_calibrated_tags_csv: Optional[str] = None
+    activity_calibration_summary_json: Optional[str] = None
 
 
 def build_positive_concept_targets(
@@ -759,6 +781,105 @@ def _export_a_priori_and_concept_views(
     }
 
 
+def _extract_binary_labels_for_ids(
+    *,
+    df_full: pd.DataFrame,
+    id_col: str,
+    ids: Sequence[str],
+    task_cols: Sequence[str] = TASK_COLS,
+) -> tuple[list[str], np.ndarray]:
+    """Return (ids_aligned, y_binary) for requested IDs using first row per ID."""
+    if len(ids) == 0:
+        return [], np.zeros((0, len(task_cols)), dtype=np.int64)
+    missing = [str(c) for c in task_cols if str(c) not in df_full.columns]
+    if missing:
+        raise ValueError(f"Missing task columns for activity calibration: {missing}")
+
+    frame = df_full[[id_col, *[str(c) for c in task_cols]]].copy()
+    frame[id_col] = frame[id_col].astype(str)
+    frame = frame.drop_duplicates(subset=[id_col], keep="first")
+    for c in task_cols:
+        frame[str(c)] = pd.to_numeric(frame[str(c)], errors="coerce").fillna(0.0)
+
+    id_to_y: dict[str, np.ndarray] = {}
+    for row in frame.itertuples(index=False):
+        rid = str(getattr(row, id_col))
+        vals = np.asarray([getattr(row, str(c)) for c in task_cols], dtype=np.float32)
+        id_to_y[rid] = (vals > 0.0).astype(np.int64)
+
+    ordered_ids: list[str] = []
+    y_rows: list[np.ndarray] = []
+    for rid in ids:
+        r = str(rid)
+        yv = id_to_y.get(r)
+        if yv is None:
+            continue
+        ordered_ids.append(r)
+        y_rows.append(yv)
+    y = (
+        np.stack(y_rows, axis=0).astype(np.int64)
+        if len(y_rows) > 0
+        else np.zeros((0, len(task_cols)), dtype=np.int64)
+    )
+    n_missing = int(len(ids) - len(ordered_ids))
+    log_event(
+        "INFO",
+        "explainability.chem_ace.activity_calibration.labels_ready",
+        n_requested_ids=int(len(ids)),
+        n_labels_ids=int(len(ordered_ids)),
+        n_missing_ids=int(n_missing),
+        n_tasks=int(len(task_cols)),
+    )
+    return ordered_ids, y
+
+
+def _export_activity_calibrated_tags(
+    *,
+    out_dir: Path,
+    rows: Sequence[Any],
+    summary: Mapping[str, Any],
+) -> tuple[Optional[str], Optional[str]]:
+    """Persist activity-calibrated semantic tag rows and summary artifacts."""
+    if len(rows) == 0:
+        return None, None
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "concept_tags_calibrated.csv"
+    json_path = out_dir / "concept_tags_calibration_summary.json"
+
+    data = [
+        {
+            "concept_id": str(r.concept_id),
+            "tag": str(r.tag),
+            "provenance": str(r.provenance),
+            "base_confidence": float(r.base_confidence),
+            "calibrated_confidence": float(r.calibrated_confidence),
+            "keep": int(bool(r.keep)),
+            "concept_support": int(r.concept_support),
+            "tag_support": int(r.tag_support),
+            "concept_task_score": float(r.concept_task_score),
+            "concept_bitmask_score": float(r.concept_bitmask_score),
+            "tag_task_score": float(r.tag_task_score),
+            "tag_bitmask_score": float(r.tag_bitmask_score),
+            "selected_task": str(r.selected_task),
+            "selected_task_ratio": float(r.selected_task_ratio),
+            "selected_bitmask": int(r.selected_bitmask),
+            "selected_bitmask_ratio": float(r.selected_bitmask_ratio),
+        }
+        for r in rows
+    ]
+    pd.DataFrame(data).to_csv(csv_path, index=False)
+    json_path.write_text(json.dumps(dict(summary), indent=2, sort_keys=False))
+
+    log_event(
+        "INFO",
+        "explainability.chem_ace.activity_calibration.exports",
+        path_csv=str(csv_path),
+        path_summary=str(json_path),
+        n_rows=int(len(data)),
+    )
+    return str(csv_path), str(json_path)
+
+
 def prepare_chem_ace_bundle(
     *,
     config: FinalExplainabilityConfig,
@@ -860,6 +981,22 @@ def prepare_chem_ace_bundle(
         patch_cap_per_mol=int(config.chem_ace_patch_cap_per_mol),
         target_total_patches=int(config.chem_ace_target_total_patches),
         persist_patch_embeddings=bool(config.chem_ace_persist_patch_embeddings),
+    )
+    log_event(
+        "INFO",
+        "explainability.chem_ace.activity_calibration.config",
+        enabled=bool(config.run_activity_calibration),
+        min_concept_support=int(config.activity_calibration_min_concept_support),
+        min_tag_support=int(config.activity_calibration_min_tag_support),
+        prior_strength=float(config.activity_calibration_prior_strength),
+        min_w=float(config.activity_calibration_min_w),
+        task_weight=float(config.activity_calibration_task_weight),
+        bitmask_weight=float(config.activity_calibration_bitmask_weight),
+        bitmask_min_count=int(config.activity_calibration_bitmask_min_count),
+        bitmask_exclude_zero=bool(config.activity_calibration_bitmask_exclude_zero),
+        mix_base=float(config.activity_calibration_mix_base),
+        keep_threshold=float(config.activity_calibration_keep_threshold),
+        ratio_cap=float(config.activity_calibration_ratio_cap),
     )
 
     ace_cfg = ChemACEConfig(
@@ -1100,10 +1237,77 @@ def prepare_chem_ace_bundle(
             qm_feature_names=tuple(str(x) for x in inst_qm_cols),
         )
 
+    activity_calibrated_tags_csv: Optional[str] = None
+    activity_calibration_summary_json: Optional[str] = None
     concept_mol_map_train, concept_conf_map_train = _build_concept_membership_maps(
         concept_set=concept_set,
         patches=patches_train,
     )
+    if bool(config.run_activity_calibration):
+        calibration_rows: list[Any] = []
+        calibration_summary: dict[str, Any] = {}
+        with log_step("explainability.chem_ace.calibrate_semantics", phase="discover_train"):
+            ids_calib, y_calib = _extract_binary_labels_for_ids(
+                df_full=df_full,
+                id_col=id_col,
+                ids=ids_discover,
+                task_cols=TASK_COLS,
+            )
+            if len(ids_calib) > 0 and len(tagging) > 0:
+                calibrator = ActivityAwareSemanticCalibrator(
+                    config=ActivityCalibrationConfig(
+                        enabled=True,
+                        min_concept_support=int(config.activity_calibration_min_concept_support),
+                        min_tag_support=int(config.activity_calibration_min_tag_support),
+                        prior_strength=float(config.activity_calibration_prior_strength),
+                        min_w=float(config.activity_calibration_min_w),
+                        task_weight=float(config.activity_calibration_task_weight),
+                        bitmask_weight=float(config.activity_calibration_bitmask_weight),
+                        bitmask_min_count=int(config.activity_calibration_bitmask_min_count),
+                        bitmask_exclude_zero=bool(config.activity_calibration_bitmask_exclude_zero),
+                        mix_base=float(config.activity_calibration_mix_base),
+                        keep_threshold=float(config.activity_calibration_keep_threshold),
+                        min_confidence=float(config.activity_calibration_min_confidence),
+                        max_confidence=float(config.activity_calibration_max_confidence),
+                        ratio_cap=float(config.activity_calibration_ratio_cap),
+                        fallback_top1_if_empty=bool(config.activity_calibration_fallback_top1_if_empty),
+                    ),
+                    task_cols=TASK_COLS,
+                )
+                tagging, calibration_rows, calibration_summary = calibrator.calibrate(
+                    tagging_results=tagging,
+                    concept_mol_map_train=concept_mol_map_train,
+                    ids_train=ids_calib,
+                    y_train=y_calib,
+                )
+            else:
+                calibration_summary = {
+                    "enabled": True,
+                    "reason": "empty_labels_or_tags",
+                    "n_ids": int(len(ids_calib)),
+                    "n_tagging_results": int(len(tagging)),
+                }
+                log_event(
+                    "WARN",
+                    "explainability.chem_ace.calibrate_semantics.skipped",
+                    **calibration_summary,
+                )
+
+        if len(calibration_rows) > 0:
+            # Keep base tags (already persisted) and append calibrated tags with explicit provenance.
+            cal_tags = [tag for res in tagging for tag in res.tags]
+            if len(cal_tags) > 0:
+                with log_step(
+                    "explainability.chem_ace.calibrate_semantics.persist_tags",
+                    n_tags=int(len(cal_tags)),
+                ):
+                    pipeline.repository.upsert_tags(cal_tags)
+            activity_calibrated_tags_csv, activity_calibration_summary_json = _export_activity_calibrated_tags(
+                out_dir=ace_out_dir,
+                rows=calibration_rows,
+                summary=calibration_summary,
+            )
+
     concept_mol_map_infer: dict[str, set[str]] = {}
     concept_conf_map_infer: dict[str, set[tuple[str, str]]] = {}
     n_patches_infer = 0
@@ -1269,6 +1473,8 @@ def prepare_chem_ace_bundle(
         "a_priori_vs_concepts_csv": a_priori_paths.get("a_priori_vs_concepts_csv"),
         "a_priori_tags_infer_csv": a_priori_paths.get("a_priori_tags_infer_csv"),
         "a_priori_vs_concepts_infer_csv": a_priori_paths.get("a_priori_vs_concepts_infer_csv"),
+        "activity_calibrated_tags_csv": activity_calibrated_tags_csv,
+        "activity_calibration_summary_json": activity_calibration_summary_json,
     }
     (ace_out_dir / "chem_ace_pipeline_summary.json").write_text(json.dumps(summary, indent=2))
 
@@ -1319,6 +1525,8 @@ def prepare_chem_ace_bundle(
             if a_priori_paths.get("a_priori_vs_concepts_infer_csv") is None
             else str(a_priori_paths["a_priori_vs_concepts_infer_csv"])
         ),
+        activity_calibrated_tags_csv=activity_calibrated_tags_csv,
+        activity_calibration_summary_json=activity_calibration_summary_json,
     )
 
 

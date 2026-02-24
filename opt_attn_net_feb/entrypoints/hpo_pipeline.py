@@ -203,6 +203,21 @@ class CLIExplainabilityConfig:
     chem_ace_persist_patch_embeddings: bool
     chem_ace_top_concepts: int
     chem_ace_infer_max_distance: float
+    run_activity_calibration: bool
+    activity_calibration_min_concept_support: int
+    activity_calibration_min_tag_support: int
+    activity_calibration_prior_strength: float
+    activity_calibration_min_w: float
+    activity_calibration_task_weight: float
+    activity_calibration_bitmask_weight: float
+    activity_calibration_bitmask_min_count: int
+    activity_calibration_bitmask_exclude_zero: bool
+    activity_calibration_mix_base: float
+    activity_calibration_keep_threshold: float
+    activity_calibration_min_confidence: float
+    activity_calibration_max_confidence: float
+    activity_calibration_ratio_cap: float
+    activity_calibration_fallback_top1_if_empty: bool
     lambda_vol_output_dir: str | None
     lambda_vol_db_uri: str | None
     lambda_vol_layer_name: str
@@ -390,6 +405,23 @@ class PipelineConfigFactory:
                 chem_ace_persist_patch_embeddings=bool(args.chem_ace_persist_patch_embeddings),
                 chem_ace_top_concepts=int(args.chem_ace_top_concepts),
                 chem_ace_infer_max_distance=float(args.chem_ace_infer_max_distance),
+                run_activity_calibration=bool(args.run_activity_calibration),
+                activity_calibration_min_concept_support=int(args.activity_calibration_min_concept_support),
+                activity_calibration_min_tag_support=int(args.activity_calibration_min_tag_support),
+                activity_calibration_prior_strength=float(args.activity_calibration_prior_strength),
+                activity_calibration_min_w=float(args.activity_calibration_min_w),
+                activity_calibration_task_weight=float(args.activity_calibration_task_weight),
+                activity_calibration_bitmask_weight=float(args.activity_calibration_bitmask_weight),
+                activity_calibration_bitmask_min_count=int(args.activity_calibration_bitmask_min_count),
+                activity_calibration_bitmask_exclude_zero=bool(args.activity_calibration_bitmask_exclude_zero),
+                activity_calibration_mix_base=float(args.activity_calibration_mix_base),
+                activity_calibration_keep_threshold=float(args.activity_calibration_keep_threshold),
+                activity_calibration_min_confidence=float(args.activity_calibration_min_confidence),
+                activity_calibration_max_confidence=float(args.activity_calibration_max_confidence),
+                activity_calibration_ratio_cap=float(args.activity_calibration_ratio_cap),
+                activity_calibration_fallback_top1_if_empty=bool(
+                    args.activity_calibration_fallback_top1_if_empty
+                ),
                 lambda_vol_output_dir=(
                     None if args.lambda_vol_output_dir is None else str(args.lambda_vol_output_dir)
                 ),
@@ -887,6 +919,49 @@ class MILPipelineOrchestrator:
                         ),
                         chem_ace_top_concepts=int(self.config.explainability.chem_ace_top_concepts),
                         chem_ace_infer_max_distance=float(self.config.explainability.chem_ace_infer_max_distance),
+                        run_activity_calibration=bool(self.config.explainability.run_activity_calibration),
+                        activity_calibration_min_concept_support=int(
+                            self.config.explainability.activity_calibration_min_concept_support
+                        ),
+                        activity_calibration_min_tag_support=int(
+                            self.config.explainability.activity_calibration_min_tag_support
+                        ),
+                        activity_calibration_prior_strength=float(
+                            self.config.explainability.activity_calibration_prior_strength
+                        ),
+                        activity_calibration_min_w=float(
+                            self.config.explainability.activity_calibration_min_w
+                        ),
+                        activity_calibration_task_weight=float(
+                            self.config.explainability.activity_calibration_task_weight
+                        ),
+                        activity_calibration_bitmask_weight=float(
+                            self.config.explainability.activity_calibration_bitmask_weight
+                        ),
+                        activity_calibration_bitmask_min_count=int(
+                            self.config.explainability.activity_calibration_bitmask_min_count
+                        ),
+                        activity_calibration_bitmask_exclude_zero=bool(
+                            self.config.explainability.activity_calibration_bitmask_exclude_zero
+                        ),
+                        activity_calibration_mix_base=float(
+                            self.config.explainability.activity_calibration_mix_base
+                        ),
+                        activity_calibration_keep_threshold=float(
+                            self.config.explainability.activity_calibration_keep_threshold
+                        ),
+                        activity_calibration_min_confidence=float(
+                            self.config.explainability.activity_calibration_min_confidence
+                        ),
+                        activity_calibration_max_confidence=float(
+                            self.config.explainability.activity_calibration_max_confidence
+                        ),
+                        activity_calibration_ratio_cap=float(
+                            self.config.explainability.activity_calibration_ratio_cap
+                        ),
+                        activity_calibration_fallback_top1_if_empty=bool(
+                            self.config.explainability.activity_calibration_fallback_top1_if_empty
+                        ),
                         lambda_vol_output_dir=self.config.explainability.lambda_vol_output_dir,
                         lambda_vol_db_uri=self.config.explainability.lambda_vol_db_uri,
                         lambda_vol_layer_name=str(self.config.explainability.lambda_vol_layer_name),
@@ -1098,6 +1173,37 @@ def _parse_args(argv: Any | None = None):
             "Max L2 distance for nearest-centroid assignment on infer scope "
             "(<=0 disables distance gating)."
         ),
+    )
+    ap.add_argument(
+        "--run_activity_calibration",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Calibrate semantic tag confidence from train-scope activity labels "
+            "(task + 16-bitmask supervision)."
+        ),
+    )
+    ap.add_argument("--activity_calibration_min_concept_support", type=int, default=12)
+    ap.add_argument("--activity_calibration_min_tag_support", type=int, default=24)
+    ap.add_argument("--activity_calibration_prior_strength", type=float, default=32.0)
+    ap.add_argument("--activity_calibration_min_w", type=float, default=0.40)
+    ap.add_argument("--activity_calibration_task_weight", type=float, default=0.70)
+    ap.add_argument("--activity_calibration_bitmask_weight", type=float, default=0.30)
+    ap.add_argument("--activity_calibration_bitmask_min_count", type=int, default=20)
+    ap.add_argument(
+        "--activity_calibration_bitmask_exclude_zero",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    ap.add_argument("--activity_calibration_mix_base", type=float, default=0.60)
+    ap.add_argument("--activity_calibration_keep_threshold", type=float, default=0.55)
+    ap.add_argument("--activity_calibration_min_confidence", type=float, default=0.05)
+    ap.add_argument("--activity_calibration_max_confidence", type=float, default=0.99)
+    ap.add_argument("--activity_calibration_ratio_cap", type=float, default=8.0)
+    ap.add_argument(
+        "--activity_calibration_fallback_top1_if_empty",
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
     ap.add_argument("--lambda_vol_output_dir", default=None)
     ap.add_argument("--lambda_vol_db_uri", default=None)

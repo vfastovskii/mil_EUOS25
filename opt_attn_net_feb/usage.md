@@ -71,6 +71,16 @@ Useful controls:
 - `--chem_ace_output_dir /path/to/chem_ace_out`
 - `--chem_ace_conformer_sdf /path/to/precomputed_conformers.sdf`
 - `--chem_ace_sdf_conf_id_prop conf_id` (falls back to SDF record name if missing)
+- `--run_activity_calibration` / `--no-run_activity_calibration` (default: enabled)
+- `--activity_calibration_keep_threshold 0.55`
+- `--activity_calibration_min_concept_support 12`
+- `--activity_calibration_min_tag_support 24`
+- `--activity_calibration_prior_strength 32.0`
+- `--activity_calibration_min_w 0.40`
+- `--activity_calibration_task_weight 0.70`
+- `--activity_calibration_bitmask_weight 0.30`
+- `--activity_calibration_bitmask_min_count 20`
+- `--activity_calibration_ratio_cap 8.0`
 - `--cpu_workers -1`
 
 Anti-leakage behavior:
@@ -78,6 +88,7 @@ Anti-leakage behavior:
 - Chem-ACE concept discovery in final pipeline is train-only.
 - Leaderboard explainability is inference-only: leaderboard patches are assigned to frozen train centroids (no reclustering).
 - Use `--chem_ace_infer_max_distance` to drop far leaderboard assignments (`<=0` disables gating).
+- Activity calibration is train-only and leakage-safe: it uses only train IDs and train labels/bitmasks.
 
 Behavior for conformers:
 
@@ -167,6 +178,9 @@ Final outputs include:
   - `a_priori_vs_concepts.csv`
   - `a_priori_tags_infer_scope.csv`
   - `a_priori_vs_concepts_infer_scope.csv`
+- Chem-ACE activity-calibrated semantic exports (when enabled):
+  - `concept_tags_calibrated.csv`
+  - `concept_tags_calibration_summary.json`
 - Lambda-Vol tensor/log/html artifacts in `lambda_vol_output_dir` (or `<study_dir>/lambda_vol`)
 - Concept-RL policy history JSON (`concept_rl_policy_history.json`) inside final run directory when enabled
 - Ricci artifacts (`ricci_edges_long.csv`, `ricci_task_summary.csv`, `ricci_flow_tensors.npz`) inside Lambda-Vol output

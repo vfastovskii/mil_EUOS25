@@ -1,692 +1,561 @@
 # Chem-ACE (Automatic Concept Discovery + Semantic Tagging)
 
-This document is the detailed technical reference for Chem-ACE in this repository:
+This document is the code-aligned technical reference for the current Chem-ACE implementation in this repository.
 
-- what a "patch" is
-- why patches are computed
-- how patch generation differs for 2D vs 3D
-- how patches are embedded, clustered, tagged, and consumed downstream
-- what exactly happens for conformer-aware 3D patching
+It explains:
 
-Code references are provided so behavior can be verified directly.
+- how patches are created from 2D/3D/3D-QM context
+- how those patches are embedded and clustered into concepts
+- how semantic tags are assigned and calibrated using activity/bitmask supervision
+- how anti-leakage train/infer split behavior is enforced
+- how outputs are consumed downstream (Lambda-Vol, Concept-RL, prediction text explanations)
+- what each major runtime log stage means
 
-## 1) Why Chem-ACE exists in this project
-
-Chem-ACE converts raw molecules into reusable concept units, then links those concepts to model behavior.
-The goal is not only to produce importance numbers, but to produce:
-
-- cluster-level concepts
-- semantic concept labels
-- concept-to-task influence signals (TCAV/CAV)
-- concept prevalence/support signals for MIL and Lambda-Vol monitoring
-
-In practice, Chem-ACE runs as a stage in the final pipeline when `--run_chem_ace` is enabled (and is automatically enabled if Lambda-Vol or Concept-RL is requested).
-
-Primary orchestration:
+Primary implementation entrypoints:
 
 - `training/explainability_runtime.py`
 - `explainability/chem_ace/concepts/pipeline.py`
+- `explainability/chem_ace/semantics/taggers.py`
+- `explainability/chem_ace/semantics/calibration.py`
 
-## 2) Patch definition (core object)
+## 1) Runtime Scope and Trigger Conditions
 
-A patch is a deterministic molecular part candidate.
-Data model:
+Chem-ACE runs in final pipeline when `--run_chem_ace` is enabled.
 
-- `PatchRecord` in `explainability/chem_ace/types.py`
+Chem-ACE is automatically enabled if either of these is requested:
 
-Fields:
+- `--run_lambda_vol`
+- `--run_concept_rl`
 
-- `patch_id`: unique, deterministic, includes molecule + conformer context
-- `mol_id`: molecule identifier
-- `conf_id`: conformer identifier, `None` for 2D-only patches
-- `patch_type`: generator type (`local_subgraph`, `brics`, `murcko`, `murcko_framework`, `pharm3d`)
-- `atom_indices`: atom IDs in the source molecule for this patch
-- `patch_hash`: deterministic content hash of patch payload
-- optional fields: `smarts`, `fragment_repr`, `feature_metadata`
+This is normalized in `entrypoints/hpo_pipeline.py`.
 
-### Identity rules
+## 2) Anti-Leakage Contract (Current Behavior)
 
-Implemented in `explainability/chem_ace/patches/base.py`:
+Chem-ACE now follows strict two-phase behavior:
 
-1. `patch_hash` hashes patch content only:
-   - type
-   - atom indices
-   - SMARTS/fragment
-   - metadata
-2. `patch_id` hashes `(mol_id, conf_id, patch_hash)`.
+1. `discover_train` phase:
+- generate patches only from train IDs
+- embed only train patches
+- discover concepts only on train embeddings
+- tag concepts only from train memberships
+
+2. `infer_scope` phase:
+- generate/embed patches for infer IDs (leaderboard scope)
+- assign infer patches to frozen train centroids
+- optional distance gate via `--chem_ace_infer_max_distance`
+- no concept re-clustering and no concept-definition updates
+
+This is enforced in `prepare_chem_ace_bundle(...)`.
+
+## 3) Data Modalities and Feature Basis
+
+Chem-ACE uses all three feature modalities already prepared for MIL training:
+
+- 2D molecular vector (`x2d` per molecule ID)
+- 3D geometry + QM vector (`xinst` per `(mol_id, conf_id)`)
+- curated molecular graph from `curated_SMILES`
+
+For semantic interpretation, task labels are from:
+
+- `Transmittance_340`
+- `Transmittance_450`
+- `Fluorescence_340_450`
+- `Fluorescence_more_than_480`
+
+Bitmask IDs are built from the 4 binary tasks in this order (LSB-first):
+
+- bit 0: `Transmittance_340`
+- bit 1: `Transmittance_450`
+- bit 2: `Fluorescence_340_450`
+- bit 3: `Fluorescence_more_than_480`
+
+## 4) Patch Object and Identity
+
+Patch model is `PatchRecord` in `explainability/chem_ace/types.py`.
+
+Key fields:
+
+- `patch_id`
+- `mol_id`
+- `conf_id` (`None` for 2D-only patches)
+- `patch_type`
+- `atom_indices`
+- `patch_hash`
+- optional `smarts`, `fragment_repr`, `feature_metadata`
+
+Identity rules:
+
+1. `patch_hash` depends on patch content (not molecule ID).
+2. `patch_id` is derived from `(mol_id, conf_id, patch_hash)`.
 
 Consequence:
 
-- same motif at different conformers has same `patch_hash` but different `patch_id`
-- this is required for conformer-aware downstream analysis
+- same motif across conformers can share `patch_hash`
+- but still gets distinct `patch_id` when `conf_id` differs
 
-## 3) Patch generators implemented
+## 5) Patch Generators and 2D/3D Split
 
-Patch generators implement `PatchGenerator.generate(mol_id, mol, conf_id)`.
+Patch generators:
 
-### 3.1 Local subgraph (`local_subgraph`)
+- `local_subgraph`
+- `brics`
+- `murcko`
+- `murcko_framework`
+- `pharm3d`
 
-File:
+Generator split in `ChemACEPipeline`:
 
-- `explainability/chem_ace/patches/local_subgraph.py`
+- 2D generators: run once per molecule with `conf_id=None`
+- 3D generators (`requires_conformer=True`): run per conformer
 
-Logic:
+Current default for local subgraph radii:
 
-1. iterate every atom as center
-2. for each configured radius, extract atom environment
-3. include center atom (default `include_center_atom=True`)
-4. export best-effort `fragment_repr` and `smarts`
-5. store metadata:
-   - `center_atom`
-   - `radius`
+- `(1,)`
 
-Default radius configuration in current code:
+This was tightened to reduce patch explosion.
 
-- `radii=(1,)`
+## 6) Conformer Ingestion (SDF-Backed, No On-The-Fly Generation)
 
-This was intentionally tightened to reduce patch explosion.
+Current final runtime does not compute conformers.
 
-### 3.2 BRICS (`brics`)
+Conformers are loaded from provided SDF (`--chem_ace_conformer_sdf`) and matched by:
 
-File:
+1. configured property (`--chem_ace_sdf_conf_id_prop`, default `conf_id`)
+2. fallback `_Name`
 
-- `explainability/chem_ace/patches/brics.py`
+If a requested conformer is missing in SDF:
 
-Logic:
+- it is skipped for 3D patching
+- no fallback conformer generation is performed
 
-1. break BRICS bonds
-2. enumerate fragments
-3. preserve original atom indices via `_orig_idx`
-4. export fragment SMARTS/SMILES
-5. emit patch per unique BRICS fragment
+Per-molecule conformers are merged only when atom counts are compatible.
 
-### 3.3 Murcko scaffold (`murcko`, `murcko_framework`)
+## 7) Patch Volume Controls and Dynamic Auto-Cap
 
-File:
+Main controls:
 
-- `explainability/chem_ace/patches/murcko.py`
+- `--chem_ace_max_ids`
+- `--chem_ace_max_confs_per_id`
+- `--chem_ace_local_radii`
+- `--chem_ace_patch_cap_per_mol`
+- `--chem_ace_target_total_patches`
 
-Logic:
-
-1. compute Murcko scaffold
-2. map scaffold back to source atom indices
-3. emit scaffold patch
-4. optionally emit generic framework patch (`murcko_framework`)
-
-### 3.4 3D pharmacophore (`pharm3d`)
-
-File:
-
-- `explainability/chem_ace/patches/pharm3d.py`
-
-Logic:
-
-1. requires conformers (`requires_conformer=True`)
-2. build RDKit feature factory (`BaseFeatures.fdef`)
-3. compute ChemicalFeatures for target conformer
-4. per feature, create patch using feature atom IDs
-5. store metadata:
-   - `family`
-   - `feature_type`
-   - `position` (`x`, `y`, `z`)
-
-## 4) 2D vs 3D generation flow (critical behavior)
-
-Pipeline file:
-
-- `explainability/chem_ace/concepts/pipeline.py`
-
-Generators are split by `requires_conformer`:
-
-- `patch_generators_2d`: run once per molecule with `conf_id=None`
-- `patch_generators_3d`: run per conformer with real `conf_id`
-
-For each molecule:
-
-1. run all 2D generators exactly once
-2. if conformers are available, run all 3D generators for each conformer
-3. deduplicate by `patch_id`
-4. apply deterministic per-molecule patch cap
-
-This means:
-
-- 2D patches are not multiplied by conformer count
-- only truly 3D patch types scale with conformer count
-
-## 5) 3D conformer ingestion and matching
-
-Runtime file:
-
-- `training/explainability_runtime.py`
-
-### 5.1 Source of conformers
-
-Conformers are loaded from precomputed SDF when `--chem_ace_conformer_sdf` is passed.
-Chem-ACE does not generate conformers in this final runtime path.
-
-### 5.2 How conformer IDs are resolved
-
-SDF lookup key priority:
-
-1. property `--chem_ace_sdf_conf_id_prop` (default `conf_id`)
-2. fallback to `_Name` property
-
-Functions:
-
-- `_load_sdf_conformers_by_conf_id(...)`
-
-### 5.3 Per-molecule conformer merge
-
-For each molecule ID, candidate `conf_id`s come from instance data.
-Then:
-
-1. locate corresponding entries in SDF map
-2. keep only conformers with compatible atom count
-3. merge conformers into one RDKit molecule
-4. store map `_chemace_conf_id_map: {external_conf_id -> internal_conf_index}`
-
-Function:
-
-- `_merge_sdf_conformers_for_molecule(...)`
-
-Skipped categories are counted and logged:
-
-- missing in SDF
-- incompatible atom counts
-- missing conformer IDs
-- duplicates in SDF index
-
-### 5.4 How `pharm3d` picks conformer index
-
-`Pharm3DPatchGenerator._resolve_conf_idx(...)`:
-
-1. try `int(conf_id)` as direct RDKit conformer index
-2. else try `_chemace_conf_id_map`
-3. else if exactly one conformer exists, use index `0`
-4. else skip patch
-
-This guarantees no silent wrong conformer assignment.
-
-### 5.5 Exact scope used for `n_molecules` in logs
-
-The `n_molecules` printed at:
-
-- `explainability.chem_ace.generate_patches n_molecules=...`
-
-is **not** "all rows in labels".
-
-In the final pipeline it is built from:
-
-1. IDs in split `train`
-2. after dropping IDs with no valid conformer bags
-3. after applying `--chem_ace_max_ids` (if > 0)
-4. after deduplication to unique IDs
-
-This is an intentional anti-leakage policy with two phases:
-
-- concept discovery uses train-only IDs
-- leaderboard IDs are **not** used to define/update concept clusters
-- leaderboard explainability uses inference-only assignment:
-  - generate leaderboard patches + embeddings
-  - assign each leaderboard patch to nearest frozen train centroid
-  - optional distance gate via `--chem_ace_infer_max_distance`
-  - no reclustering on leaderboard
-
-Additional scope logs now emitted:
-
-- `final.prepare_chem_ace_bundle.scope n_train_ids=... n_leaderboard_ids=... n_scope_ids=... scope_splits=train anti_leakage=enabled`
-- `explainability.chem_ace.scope_ids n_discover_ids_input=... n_discover_ids_selected=... n_infer_ids_input=... n_infer_ids_selected=... chem_ace_max_ids=...`
-- `explainability.chem_ace.generate_patches phase=discover_train|infer_scope ...`
-- `explainability.chem_ace.embed_patches phase=discover_train|infer_scope ...`
-- `explainability.chem_ace.infer_memberships ...`
-
-## 6) Patch volume control and scaling
-
-Config sources:
-
-- `explainability/chem_ace/config.py`
-- `training/explainability_runtime.py`
-
-Key controls:
-
-- `--chem_ace_max_ids` (default `0` = all IDs in scope)
-- `--chem_ace_max_confs_per_id` (default `0` = all conformers per molecule)
-- `--chem_ace_local_radii` (default `1`)
-- `--chem_ace_patch_cap_per_mol` (default `0`, means auto)
-- `--chem_ace_target_total_patches` (default `1200000`)
-- `--chem_ace_infer_max_distance` (default `-1.0`, disabled; if `>0`, drops far leaderboard assignments)
-
-### Auto-cap math
-
-If `patch_cap_per_mol <= 0`, pipeline computes:
+If `chem_ace_patch_cap_per_mol <= 0`, auto-cap is used:
 
 - `raw_cap = ceil(target_total_patches / n_molecules)`
-- then clips to `[16, 256]`
+- clipped to `[16, 256]`
 
-So final cap is:
+If molecule exceeds cap:
 
-- `cap = min(256, max(16, raw_cap))`
+- deterministic SHA1-based sampling keeps a stable subset
 
-### Deterministic sampling under cap
+## 8) Patch Embedding in Final Runtime (Feature Projection Path)
 
-If a molecule produces more than `cap` patches:
+Final integration uses feature fusion embedding in `_build_feature_patch_embeddings(...)`.
 
-1. rank patches by deterministic SHA1 key based on `(mol_id, patch_id, constant-salt)`
-2. keep top `cap`
+Per patch vector = concat of:
 
-This ensures reproducible subset selection across runs with same inputs.
+1. `v2d`:
+- molecule-level 2D vector
+- truncate/pad to effective `max_2d_dim`
+- if `--chem_ace_max_2d_dim <= 0`, full raw 2D dim is used dynamically
 
-## 7) What happens after patches are generated
+2. `v3dqm`:
+- conformer vector from `(mol_id, conf_id)` if available
+- else molecule mean over conformers
+- else zeros
+- truncate/pad to effective `max_3dqm_dim`
+- if `--chem_ace_max_3dqm_dim <= 0`, full raw merged 3D+QM dim is used dynamically
 
-### 7.1 Persistence
+3. patch descriptor block:
+- 10 structural descriptors:
+  - atom count
+  - aromatic fraction
+  - hetero fraction
+  - formal charge sum
+  - conjugated bond fraction
+  - ring bond fraction
+  - mean atomic number
+  - std atomic number
+  - mean degree
+  - std degree
+- plus 5-way patch-type one-hot
 
-Patches are persisted in DB:
+Descriptor scaling:
 
-- `patches` table
-- parent `molecules` / `conformers` rows
+- `RobustScaler` fitted on discover-train descriptor rows (`max_fit_samples=200000`)
+- transform is reused for infer-scope patches
 
-Large writes use chunked upsert for SQLite in:
+## 9) Embedding Persistence Policy (Disk Safety)
 
-- `explainability/chem_ace/db/repository.py`
+Default:
 
-### 7.2 Patch embedding
+- `--no-chem_ace_persist_patch_embeddings` (effective default)
 
-There are two general Chem-ACE embedding interfaces:
+Meaning:
 
-- `masked_input` (hook activation from masked forward)
-- `node_pooling` (pool node activations on patch atoms)
+- patch embeddings stay in memory for concept discovery
+- no per-patch `.npy/.json` cache writes
+- no patch-embedding DB upsert
 
-Files:
+When explicitly enabled with `--chem_ace_persist_patch_embeddings`:
 
-- `explainability/chem_ace/embedding/base.py`
-- `explainability/chem_ace/embedding/strategies.py`
+- per-patch embedding cache files are written
+- embedding DB rows are persisted
 
-### Current final MIL pipeline embedding path
+This default is intentional to avoid disk exhaustion on very large patch counts.
 
-In this repository's final runtime integration, patch vectors are currently built via feature fusion (`feature_projection`) in:
+## 10) Concept Discovery (Current Defaults)
 
-- `_build_feature_patch_embeddings(...)` in `training/explainability_runtime.py`
+Discovery config defaults in `ConceptDiscoveryConfig`:
 
-Per patch vector is:
+- `algorithms=("kmeans",)`
+- `kmeans_k=0` (auto)
+- `kmeans_minibatch_over=200000`
+- `kmeans_minibatch_size=4096`
 
-1. 2D molecular vector (truncate/pad to resolved 2D dim)
-   - `chem_ace_max_2d_dim > 0`: use that cap
-   - `chem_ace_max_2d_dim <= 0`: auto-use full 2D raw dimension
-2. 3D+QM vector:
-   - use conformer-specific `(mol_id, conf_id)` when available
-   - else use molecule-level mean across conformers
-   - else zero vector
-3. patch descriptors:
-   - 10 structural stats (size, aromaticity, hetero fraction, charge, conjugation, ring, atomic number/degree stats)
-   - 10 structural stats are transformed by `RobustScaler` (fitted on discover-train patch descriptors; reused on infer-scope)
-   - 5-way patch-type one-hot
+KMeans `k` resolution:
 
-Embedding record stays in-memory by default. Per-patch embedding file/DB persistence is optional via `--chem_ace_persist_patch_embeddings`.
+- if `kmeans_k > 1`: use configured `k` (bounded to sample count)
+- else: `k = floor(sqrt(n_embeddings))` (bounded)
 
-### 7.3 Concept discovery
+Optional algorithms still exist but are guarded for memory:
 
-File:
+- hierarchical:
+  - `hierarchical_max_samples=25000`
+  - `hierarchical_max_pairwise_gb=8.0`
+- hdbscan:
+  - `hdbscan_max_samples=300000`
 
-- `explainability/chem_ace/concepts/clustering.py`
+Pipeline logs the effective concept-discovery configuration before clustering.
 
-Algorithms:
+## 11) Semantic Tagging Pipeline
 
-- Default: k-means only (MiniBatchKMeans at large `N`)
-- Optional (if explicitly enabled in config): hierarchical, HDBSCAN
+Tagging entry:
 
-Flow:
+- `explainability.chem_ace.tag_concepts` in runtime
 
-1. cluster embeddings per algorithm
-   - k-means switches to MiniBatchKMeans for large `N` (`kmeans_minibatch_over`)
-   - if `kmeans_k <= 1`, cluster count is auto-selected as `sqrt(n_embeddings)` (no fixed hardcoded `k`)
-   - hierarchical is guarded by `hierarchical_max_samples` and `hierarchical_max_pairwise_gb` to avoid O(N^2) memory blowups
-   - HDBSCAN is guarded by `hdbscan_max_samples`
-   - if one algorithm fails/skips, others still run
-2. compute support and coherence
-3. filter by `min_support` and `min_coherence`
-4. compute centroid + medoid patch
-5. deduplicate near-duplicate concepts by centroid cosine similarity
-6. persist immutable concept-set snapshot + concept + membership rows
+Tagging orchestration:
 
-### 7.4 Semantic tagging and naming
+- concept membership index build
+- per-concept semantic tagging (parallelized by CPU workers)
+- DB persistence of labels and tags
 
-File:
+Per-concept semantic extraction includes:
 
-- `explainability/chem_ace/semantics/taggers.py`
-- `explainability/chem_ace/rules/default_naming_rules.json`
-- `explainability/chem_ace/rules/default_functional_group_rules.json`
-- `explainability/chem_ace/rules/smartsrx.json`
-
-Computed descriptor families:
-
-- charge/formal + Gasteiger
-- aromaticity/conjugation
-- geometry from conformer coordinates (if conformers available and resolvable)
-- geometry from 3D descriptor vectors (column-name token families from `geom_cols`)
+- formal charge/Gasteiger stats
+- aromaticity and conjugation descriptors
+- planarity/rotatable-bond geometry from conformers
 - pharmacophore counts
-- SMARTS functional-group coverage (carboxylate, amide, sulfonamide, phosphates, amines, heteroaromatics, halogen motifs, boron motifs, ring classes, etc.)
-- SMARTS-RX reactivity-function coverage (electrophile/nucleophile/acid-base/leaving-group/redox/coordination/cycloaddition motifs)
-- QM descriptor semantics from per-conformer QM columns (token-mapped families such as HOMO/LUMO/gap, dipole, polarizability, hardness/softness, electrophilicity/nucleophilicity, charge-transfer/Fukui/ESP proxies)
-- optional Open Babel descriptor summary (`logP`, `TPSA`, `MR`) when `openbabel.pybel` is available
+- SMARTS functional matches
+- SMARTS-RX matches and role rates
+- geometry family summary from 3D descriptor vectors
+- QM family summary from QM descriptor vectors
+- optional OpenBabel summary (`logP`, `TPSA`, `MR`)
 
-3D geometry tags are derived from two sources:
+Cross-modal tags combine structural + geometric + QM signals.
 
-1. coordinate-derived:
-   - planarity RMSD
-   - rotatable-bond proxy for rigid/flexible labels
-2. descriptor-derived (from `inst_geom_cols` + `inst_geom_dim`, per patch):
-   - family summaries for distance / angle / dihedral / planarity / shape / size / inertia / surface-volume / ring-strain / hbond-geometry
-   - global 3D descriptor blocks (RDF / MORSE / WHIM / GETAWAY / 3D autocorrelation tokens)
-   - tags gated by:
-     - `geom_min_vectors_for_tagging`
-     - `geom_z_threshold`
-     - `geom_strong_z_threshold`
+Naming:
 
-Per-concept descriptor evidence now includes family-coverage diagnostics:
+- rule-based naming first
+- fallback descriptor-driven naming
 
-- `geom_summary.family_coverage`
-- `geom_summary.n_family_matched_features`
-- `geom_summary.n_unmatched_features`
-- `geom_summary.top_unmatched_features`
+## 12) Detailed Tagging Logs (Latest Update)
 
-Cross-modal tags are also emitted when signals agree across modalities:
+Tagging now has explicit substep logs:
 
-- SMARTS-RX electrophile + QM electrophilicity -> `electrophilic reaction-center motif`
-- SMARTS-RX nucleophile + QM nucleophilicity -> `nucleophilic reaction-center motif`
-- aromatic + planar geometry + QM gap signal -> `planar conjugated electronic motif`
-- HBD/HBA + QM dipole signal -> `polar donor-acceptor electronic motif`
+From `concepts/pipeline.py`:
 
-Tag outputs include:
+- `explainability.chem_ace.tag_concepts.membership_index`
+- `explainability.chem_ace.tag_concepts.compute` (`START/PROGRESS/DONE`)
+- `explainability.chem_ace.tag_concepts.compute_one` (`FAIL` with concept id)
+- `explainability.chem_ace.tag_concepts.persist` (`START/PROGRESS/DONE`)
 
-- `tag`
-- `confidence`
-- `provenance`
-- `evidence_json`
+From `semantics/taggers.py`:
 
-Concept receives `label_auto` from:
+- OpenBabel backend status:
+  - `explainability.chem_ace.tag_concepts.openbabel` with `enabled` and reason/backend
+- per concept:
+  - `explainability.chem_ace.tag_concepts.tag_one` (`START/DONE`)
+  - `explainability.chem_ace.tag_concepts.compute_descriptors` (`START/DONE`)
+  - `explainability.chem_ace.tag_concepts.compute_descriptors.loop` (`PROGRESS` for large concepts)
+  - `explainability.chem_ace.tag_concepts.compute_descriptors.summary`
+  - `explainability.chem_ace.tag_concepts.openbabel_summary` (`START/DONE` when OpenBabel is enabled)
 
-1. rule-based registry
-2. fallback descriptor-based description
+This is the authoritative answer to what happens at `[START] explainability.chem_ace.tag_concepts`.
 
-Rule loading behavior:
+## 13) Activity-Aware Semantic Calibration (Latest Update)
 
-1. naming rules: explicit `naming_rules_path` if set, else bundled `default_naming_rules.json`
-2. functional rules: explicit `functional_rules_path` if set, else bundled `default_functional_group_rules.json`
-3. SMARTS-RX rules: explicit `smarts_rx_rules_path` if set, else bundled `smartsrx.json` (legacy fallback: `default_smarts_rx_rules.json`)
-4. invalid SMARTS are skipped with warning; pipeline continues
+A new supervised calibration layer is integrated:
 
-SMARTS-RX file formats supported:
+- module: `explainability/chem_ace/semantics/calibration.py`
+- class: `ActivityAwareSemanticCalibrator`
 
-1. canonical: `{ "rules": [ {tag, smarts, role, min_patch_rate, confidence, provenance}, ... ] }`
-2. SMARTS-RX generated registry: `{ "data": [ {category, subcategory, specific_type, smarts}, ... ] }`
-   - loader auto-derives:
-     - `tag = rx_<specific_type|subcategory|category>` (normalized)
-     - `role = <category>` (normalized)
-     - defaults for confidence/threshold/provenance when missing
+When it runs:
 
-Molecule-level baseline exports (a priori, structure-only):
+- after base concept tags are generated on `discover_train`
+- using train IDs only and train task labels only
+- before concept metadata is finalized for downstream outputs
 
-1. `a_priori_tags.csv`:
-   - one row per molecule in Chem-ACE scope
-   - tags from functional SMARTS / RDKit fragment rules / SMARTS-RX only
-2. `a_priori_vs_concepts.csv`:
-   - same rows, plus concept-level post-discovery annotations
-3. `a_priori_tags_infer_scope.csv`:
-   - infer/test subset (leaderboard scope in final run)
-4. `a_priori_vs_concepts_infer_scope.csv`:
-   - infer/test subset with concept-level annotations
+### 13.1 What it calibrates
 
-RDKit Fragments augmentation:
+It calibrates confidence for each `(concept, tag)` pair.
 
-1. during final Chem-ACE runtime, rules are auto-augmented from the labels table `curated_SMILES` column using all available `rdkit.Chem.Fragments.fr_*` functions
-2. generated rules are merged with bundled defaults and written to:
-   - `<chem_ace_output_dir>/rules_autogen/default_functional_group_rules.dataset.json`
-   - `<chem_ace_output_dir>/rules_autogen/functional_group_fragment_stats.json`
-3. this merged path is injected into `SemanticTaggingConfig.functional_rules_path` for concept tagging
-4. tags from these rules use `provenance = "rdkit_fragment_tagger"`
+It does not redefine concepts and does not use infer/leaderboard labels.
 
-Manual regeneration command:
+### 13.2 Signals used
 
-```bash
-python -m explainability.chem_ace.rules.generate_fragment_rules_from_labels \
-  --labels_csv /path/to/master_table_labels_final_modelling_ready_1401_with_cv_split.csv \
-  --smiles_col curated_SMILES \
-  --output_json /path/to/default_functional_group_rules.json \
-  --stats_json /path/to/functional_group_fragment_stats.json
-```
+For each concept and each tag:
 
-QM semantic interpretation logic:
+- task enrichment profile (4 tasks)
+- bitmask enrichment profile (up to 16 masks; optional exclusion of mask `0`)
+- support counts with shrinkage/saturation
 
-1. concept-level QM vectors are pulled from conformer-specific `(mol_id, conf_id)` rows
-2. if conformer vector is missing, molecule-level mean vector is used as fallback
-3. vector is split into geometry + QM by `inst_geom_dim` and `inst_qm_dim`
-4. geometry and QM feature names are passed explicitly (`geom_cols`, `qm_cols`) and normalized
-5. descriptor families are assigned by normalized column-name token matching
-6. tags are emitted only when enough QM vectors are available (`qm_min_vectors_for_tagging`)
-7. thresholds:
-   - moderate: `qm_z_threshold`
-   - strong: `qm_strong_z_threshold`
+### 13.3 Core scoring logic (implemented)
 
-Descriptor basis from `docs/quantum_descriptors_list.pdf` is now explicitly covered in family token maps:
+For a selected sample mask `M` (concept-membership or tag-membership over train IDs):
 
-- frontier/conceptual DFT:
-  - `homo_eV`, `lumo_eV`, `gap_eV`, `mu_eV`, `eta_eV`, `softness_1_per_eV`, `chi_eV`, `omega_eV`
-- electrostatics:
-  - `dipole_D`, `quad_norm_au`, `quad_trace_au`
-- bond-order and conjugation:
-  - `bo_sum`, `bo_max`, `bo_mean_bonds`, `bo_conj_sum`, `bo_conj_mean`
-- atomic-charge distribution:
-  - `q_min`, `q_max`, `q_mean`, `q_std`, `q_abs_sum`, `q_range`, `q_pos_top3_mean`, `q_neg_top3_mean`
-- charge-separation geometry:
-  - `q_abs_r_mean`, `q_abs_r2_rms`, `d_pos_neg`
-- redox and local reactivity:
-  - `vip_eV`, `vea_eV`, `fplus_max`, `fplus_sum_pos`, `fplus_top3_mean`, `fminus_max`, `fminus_sum_pos`, `fminus_top3_mean`
+1. Task channel:
+- `task_prev = mean(y_train, axis=0)`
+- `task_post = (hits + task_prev * prior_strength) / (|M| + prior_strength)`
+- `task_ratio = task_post / task_prev`
+- ratio normalized to `[0,1]` via clipping to `[1, ratio_cap]`
+- `task_score = (1 - min_w) * mean(norm) + min_w * min(norm)`
 
-Additional QM tags now include:
+2. Bitmask channel:
+- same smoothed ratio logic over selected bitmask IDs
+- candidate masks filtered by `bitmask_min_count`
+- optional exclusion of all-negative mask id `0`
+- best normalized bitmask ratio is used as bitmask score
 
-- ionization/electron-affinity profile tags
-- bond-order rigidification + conjugated bond-order network
-- polarized atomic-charge landscape + long-range charge-separation profile
-- Fukui+ / Fukui- hotspot profile tags
-- anisotropic quadrupole field
+3. Channel fusion:
+- `fused = weighted_mean(task_score, bitmask_score; task_weight, bitmask_weight)`
 
-Photophysics proxy tags (heuristic, not TD-DFT):
+4. Support scaling:
+- concept/tag supports are mapped by sqrt saturation to `[0,1]`
+- combined as average support scale
 
-- `transmittance-favored photophysics proxy`
-- `fluorescence-favored photophysics proxy`
-- `red-shifted absorption proxy`
-- `blue-shifted transparency proxy`
+5. Final confidence:
+- `total_score = (0.6 * concept_fused + 0.4 * tag_fused) * support_scale`
+- `calibrated_conf = clip((1 - mix_base) * base_conf + mix_base * total_score, min_confidence, max_confidence)`
 
-These are emitted by combining QM families with geometry/conjugation cues and are intentionally marked as proxy semantics.
+6. Keep rule:
+- keep tag if `calibrated_conf >= keep_threshold`
+- if none kept and `fallback_top1_if_empty=true`, keep top-1 tag
 
-SMARTS-RX semantics:
+### 13.4 Persistence behavior
 
-1. each SMARTS-RX rule defines `tag`, `smarts`, `role`, `min_patch_rate`, `confidence`
-2. tags are emitted as rule-level tags (e.g., `rx_michael_acceptor`) plus role tags (`rx_role_electrophile`)
-3. naming rules can combine structural tags + SMARTS-RX tags (for example: `rx_michael_acceptor` + `rx_role_electrophile`)
-4. this gives concept labels that explicitly encode predicted reactivity class, not only structure
+Base tags are still persisted by `tag_and_store_concepts`.
 
-### 7.5 Downstream usage in Lambda-Vol and Concept-RL
+Calibrated tags are additionally persisted with provenance suffix:
 
-After concept discovery, runtime builds:
+- `|activity_calibrated`
 
-- `concept_mol_map`: concept -> molecule IDs
-- `concept_conf_map`: concept -> (`mol_id`, `conf_id`) pairs
+`concept_metadata` used downstream is built from calibrated result set.
 
-These are used by Lambda-Vol monitoring to compute per-task/per-concept:
+### 13.5 Calibration outputs
 
-- prevalence
-- attention support
-- TCAV
+Written in Chem-ACE output dir when calibration produces rows:
 
-They are also used to build positive concept target sets for Concept-RL.
+- `concept_tags_calibrated.csv`
+- `concept_tags_calibration_summary.json`
 
-Ricci geometry details for Lambda-Vol are documented in:
+Also included in:
 
-- `RICCI_FLOW_README.md`
+- `chem_ace_pipeline_summary.json`
+- final `explainability_artifacts.json`
 
-## 8) Dedicated 3D patch lifecycle (end-to-end)
+## 14) A Priori Molecule-Level Semantic Baseline
 
-For one `(mol_id, conf_id)`:
+Chem-ACE exports structure-only baseline tags (independent of concept clustering):
 
-1. molecule is built from `curated_SMILES` and Hs added
-2. conformer from SDF is matched by configured property or `_Name`
-3. conformer is merged into molecule; mapping is recorded
-4. `pharm3d` extracts conformer-specific feature patches
-5. each 3D patch keeps:
-   - `conf_id`
-   - atom indices
-   - pharmacophore metadata with 3D coordinates
-6. embedding stage pulls conformer-specific 3D/QM vector when present
-7. patch participates in clustering with all other patch types
-8. if selected into concept:
-   - contributes to concept support
-   - contributes to geometry/pharmacophore tags
-   - contributes to conformer-level concept presence in Lambda-Vol metrics
+- `a_priori_tags.csv`
+- `a_priori_vs_concepts.csv`
+- `a_priori_tags_infer_scope.csv`
+- `a_priori_vs_concepts_infer_scope.csv`
 
-If conformer is missing or incompatible:
+These use:
 
-- no 3D patch is generated for that `conf_id`
-- 2D patching still proceeds for the molecule
+- functional SMARTS rules
+- RDKit fragment rules
+- SMARTS-RX rules
 
-## 9) Runtime logging and expected long steps
+No concept discovery required for baseline tag generation itself.
 
-Chem-ACE emits structured progress events for:
+## 15) Functional Rule Auto-Augmentation from Dataset SMILES
 
-- patch generation
-- patch persistence
-- embedding compute
-- embedding persistence
+During runtime, functional rules are auto-augmented from `curated_SMILES` via RDKit `Chem.Fragments.fr_*` functions.
 
-Patch generation progress now includes explicit 2D/3D visibility:
+Generated artifacts:
 
-- `patches` total accumulated patches
-- `patches_2d` accumulated patches with `conf_id=None`
-- `patches_3d` accumulated conformer-aware patches (`conf_id!=None`)
-- `mols_with_conf_done` processed molecules that had at least one conformer candidate
-- `mols_with_3d_patches_done` processed molecules that produced at least one 3D patch
+- `rules_autogen/default_functional_group_rules.dataset.json`
+- `rules_autogen/functional_group_fragment_stats.json`
 
-End-of-stage summary log:
+Merged rule file is injected into semantic config for the run.
 
-- `explainability.chem_ace.generate_patches.summary ... patches_total=... patches_2d=... patches_3d=...`
+## 16) OpenBabel Usage Semantics
 
-Post-generation ready log:
+OpenBabel usage is optional.
 
-- `explainability.chem_ace.patches_ready n_patches=... n_patches_2d=... n_patches_3d=...`
+If enabled and available:
 
-Typical pattern:
+- backend availability is logged at tagger initialization
+- per-concept OpenBabel summary step is logged
 
-1. `generate_patches` reaches `100%`
-2. then DB persistence starts
-3. then embedding compute starts
-4. then concept discovery/tagging
+If missing:
 
-So "no new patch progress after 100%" can be normal if it is in persistence/embedding stages.
+- warning log is emitted
+- pipeline continues with RDKit-only semantics
 
-## 10) CLI knobs relevant to patching
+## 17) Main Runtime Stages and What They Mean
 
-From `entrypoints/hpo_pipeline.py`:
+For `discover_train` phase:
+
+1. `explainability.chem_ace.generate_patches`
+2. `explainability.chem_ace.embed_patches`
+3. `explainability.chem_ace.discover_concepts`
+4. `explainability.chem_ace.tag_concepts`
+5. `explainability.chem_ace.calibrate_semantics` (if enabled)
+
+For `infer_scope` phase:
+
+1. `explainability.chem_ace.generate_patches`
+2. `explainability.chem_ace.embed_patches`
+3. `explainability.chem_ace.infer_memberships`
+4. `explainability.chem_ace.persist_inferred_memberships` (if any)
+
+If progress appears to stall after patch generation reaches 100%, typical next heavy sections are:
+
+- patch/embedding persistence (if enabled)
+- clustering
+- per-concept semantic tagging descriptor loops
+
+## 18) CLI Controls (Current)
+
+Core enable flags:
 
 - `--run_chem_ace`
+- `--run_lambda_vol`
+- `--run_concept_rl`
+
+Patch/conformer controls:
+
 - `--curated_smiles_col`
 - `--chem_ace_conformer_sdf`
 - `--chem_ace_sdf_conf_id_prop`
 - `--chem_ace_max_ids`
-- `--chem_ace_max_confs_per_id` (`<=0` means use all conformers per molecule)
+- `--chem_ace_max_confs_per_id`
 - `--chem_ace_local_radii`
 - `--chem_ace_patch_cap_per_mol`
 - `--chem_ace_target_total_patches`
-- `--chem_ace_max_2d_dim` (`<=0` means auto-use full 2D raw dimension)
-- `--chem_ace_max_3dqm_dim` (`<=0` means auto-use full merged 3D+QM raw dimension)
-- `--chem_ace_persist_patch_embeddings` (default `false`; keeps embeddings in memory only to prevent huge disk writes)
-- `--chem_ace_top_concepts`
+
+Embedding/storage controls:
+
+- `--chem_ace_max_2d_dim`
+- `--chem_ace_max_3dqm_dim`
+- `--chem_ace_persist_patch_embeddings` / `--no-chem_ace_persist_patch_embeddings`
 - `--cpu_workers`
 
-Example final-only run with pre-optimized params:
+Concept/infer controls:
 
-```bash
-python opt_net_fast.py \
-  --do_mil \
-  --best_params_json /path/to/best_params.json \
-  --run_chem_ace \
-  --chem_ace_conformer_sdf /path/to/conformers.sdf \
-  --chem_ace_sdf_conf_id_prop _Name \
-  --curated_smiles_col curated_SMILES \
-  --chem_ace_local_radii 1 \
-  --chem_ace_patch_cap_per_mol 0 \
-  --chem_ace_target_total_patches 1200000 \
-  --cpu_workers 18
-```
+- `--chem_ace_top_concepts`
+- `--chem_ace_infer_max_distance`
 
-## 11) Outputs and artifacts
+Activity calibration controls:
 
-Main outputs (default under run `study_dir`):
+- `--run_activity_calibration` / `--no-run_activity_calibration`
+- `--activity_calibration_min_concept_support`
+- `--activity_calibration_min_tag_support`
+- `--activity_calibration_prior_strength`
+- `--activity_calibration_min_w`
+- `--activity_calibration_task_weight`
+- `--activity_calibration_bitmask_weight`
+- `--activity_calibration_bitmask_min_count`
+- `--activity_calibration_bitmask_exclude_zero` / `--no-activity_calibration_bitmask_exclude_zero`
+- `--activity_calibration_mix_base`
+- `--activity_calibration_keep_threshold`
+- `--activity_calibration_min_confidence`
+- `--activity_calibration_max_confidence`
+- `--activity_calibration_ratio_cap`
+- `--activity_calibration_fallback_top1_if_empty` / `--no-activity_calibration_fallback_top1_if_empty`
 
-- Chem-ACE DB: `chem_ace/chem_ace.sqlite3`
-- cached embeddings: `chem_ace/chem_ace_cache/...`
-- vector artifacts: `chem_ace/artifacts/...`
-- run summary: `chem_ace/chem_ace_pipeline_summary.json`
+## 19) Output Artifacts (Current)
 
-Persisted DB entities include:
+Primary Chem-ACE outputs in `chem_ace_output_dir` (default: `<study_dir>/chem_ace`):
 
-- runs, tasks
-- molecules, conformers
-- patches, patch_embeddings
-- concept_sets (immutable snapshots), concepts, memberships
-- concept_tags
-- CAV/TCAV rows when TCAV is computed
-- optional MIL concept epoch metrics
+- `chem_ace.sqlite3`
+- `chem_ace_pipeline_summary.json`
+- rule augmentation artifacts under `rules_autogen/`
+- a priori semantic CSVs
+- calibrated semantic CSV/JSON (if enabled and non-empty)
 
-## 12) Package layout
+Potential embedding cache directory (only if embedding persistence enabled):
+
+- `chem_ace_cache/`
+
+Final run summary output (`final_best_train_vs_leaderboard/explainability_artifacts.json`) includes pointers for:
+
+- Chem-ACE core artifacts
+- a priori views
+- activity-calibration artifacts
+- Lambda-Vol artifacts
+- Concept-RL policy history
+- prediction explanation CSV
+
+## 20) Downstream Consumption
+
+Chem-ACE concept maps feed:
+
+- Lambda-Vol concept-pressure tracking
+- Ricci diagnostics over concept relations
+- Concept-RL target concept selection
+- text explanations exported with per-task predictions/attention
+
+## 21) Known Limits and Practical Guidance
+
+- Patch counts can still be very large on huge datasets with many conformers.
+- Keep local radii conservative (`1` default) and use dynamic/fixed patch caps.
+- Leave embedding persistence disabled unless explicitly required.
+- For large runs, keep concept discovery on scalable settings (`kmeans` default).
+- Semantic tagging is CPU-heavy by design due to chemistry operations.
+- OpenBabel is optional; missing backend does not break runtime.
+
+## 22) Code Map
+
+Core:
 
 - `explainability/chem_ace/config.py`
 - `explainability/chem_ace/types.py`
 - `explainability/chem_ace/optional_deps.py`
-- `explainability/chem_ace/patches/*`
-- `explainability/chem_ace/embedding/*`
+
+Patches:
+
+- `explainability/chem_ace/patches/base.py`
+- `explainability/chem_ace/patches/local_subgraph.py`
+- `explainability/chem_ace/patches/brics.py`
+- `explainability/chem_ace/patches/murcko.py`
+- `explainability/chem_ace/patches/pharm3d.py`
+
+Concept discovery and pipeline:
+
 - `explainability/chem_ace/concepts/clustering.py`
 - `explainability/chem_ace/concepts/pipeline.py`
-- `explainability/chem_ace/cav/tcav.py`
-- `explainability/chem_ace/rules/smartsrx.json`
-- `explainability/chem_ace/semantics/*`
-- `explainability/chem_ace/db/*`
+
+Semantics:
+
+- `explainability/chem_ace/semantics/taggers.py`
+- `explainability/chem_ace/semantics/calibration.py`
+- `explainability/chem_ace/semantics/naming.py`
+
+DB and analytics:
+
+- `explainability/chem_ace/db/models.py`
+- `explainability/chem_ace/db/repository.py`
 - `explainability/chem_ace/analytics/queries.py`
-- `entrypoints/chem_ace_demo.py`
 
-## 13) External descriptor ecosystem for larger semantic coverage
+Runtime integration:
 
-Current implementation is RDKit-first, then optional Open Babel.
+- `training/explainability_runtime.py`
+- `entrypoints/hpo_pipeline.py`
+- `training/execution.py`
 
-Recommended expansion path:
-
-1. RDKit functional hierarchy:
-   - import hierarchy names/SMARTS from RDKit functional-group hierarchy file
-   - auto-generate additional SMARTS rules into a versioned JSON registry
-2. SMARTS-RX rule expansion:
-   - curate rule blocks by reaction family (SNAr, SN2, acylation, Michael addition, click, metal coordination, redox)
-   - keep each rule explicit: `(tag, smarts, role, min_patch_rate, confidence)` and version the JSON registry
-3. Open Babel descriptors:
-   - use `obabel -L descriptors` to enumerate plugins available in your environment
-   - map selected descriptors to semantic tags (lipophilicity, polarity, refractivity, etc.)
-4. QM parser toolchains:
-   - if raw quantum outputs are available, parse with cclib and map parsed attributes to schema-level descriptor families
-5. high-dimensional descriptor toolkits:
-   - Mordred / PaDEL-style descriptors can be used for extra concept annotation channels, then compressed to stable semantic families
-
-Design constraint:
-
-- keep semantic tags interpretable and sparse; large descriptor sets should feed family-level tags, not raw-feature labels.
-
-## 14) Assumptions and known limitations
-
-- RDKit is required for full Chem-ACE behavior.
-- HDBSCAN is optional; pipeline degrades gracefully if missing.
-- Final MIL integration currently uses feature-fusion patch embedding (`feature_projection`) rather than hook-based embedding strategies.
-- Patch volume can still be large; use radius/cap/target knobs aggressively on big datasets.
-
-## 15) TODO (advanced extensions)
-
-- richer 3D pharmacophore grouping and spatial motifs
-- direct MIL attention-region extraction as native patch type
-- tighter coupling between concept clusters and intervention policies
-- active-learning hooks for concept-balanced data acquisition
