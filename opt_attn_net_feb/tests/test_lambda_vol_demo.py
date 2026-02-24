@@ -13,7 +13,7 @@ if str(PKG_ROOT) not in sys.path:
 try:
     from ..entrypoints.lambda_vol_demo import main as lambda_vol_demo_main
 except Exception:  # pragma: no cover
-    from entrypoints.lambda_vol_demo import main as lambda_vol_demo_main
+    from opt_attn_net_feb.entrypoints.lambda_vol_demo import main as lambda_vol_demo_main
 
 
 class LambdaVolDemoSmokeTest(unittest.TestCase):

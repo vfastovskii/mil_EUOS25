@@ -16,10 +16,10 @@ try:
     from ..explainability.lambda_vol.ricci import ConceptRicciFlowAnalyzer
     from ..explainability.lambda_vol.types import RicciTaskSummary
 except Exception:  # pragma: no cover
-    from explainability.lambda_vol.config import DetectorConfig, RicciConfig
-    from explainability.lambda_vol.detectors import ConceptPressureDetector
-    from explainability.lambda_vol.ricci import ConceptRicciFlowAnalyzer
-    from explainability.lambda_vol.types import RicciTaskSummary
+    from ..explainability.lambda_vol.config import DetectorConfig, RicciConfig
+    from ..explainability.lambda_vol.detectors import ConceptPressureDetector
+    from ..explainability.lambda_vol.ricci import ConceptRicciFlowAnalyzer
+    from ..explainability.lambda_vol.types import RicciTaskSummary
 
 
 class LambdaVolRicciTest(unittest.TestCase):

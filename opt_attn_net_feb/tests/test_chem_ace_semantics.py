@@ -10,8 +10,8 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 if str(PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(PKG_ROOT))
 
-from explainability.chem_ace.config import SemanticTaggingConfig
-from explainability.chem_ace.semantics.taggers import SemanticTagger
+from ..explainability.chem_ace.config import SemanticTaggingConfig
+from ..explainability.chem_ace.semantics.taggers import SemanticTagger
 
 
 class ChemACESemanticsTest(unittest.TestCase):

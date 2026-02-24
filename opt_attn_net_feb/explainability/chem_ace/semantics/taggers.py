@@ -59,23 +59,43 @@ class SemanticTagger:
     """Compute semantic descriptors and map them to chemist-readable tags."""
 
     _GEOM_FAMILY_TOKENS: Mapping[str, tuple[str, ...]] = {
-        "distance": ("dist", "distance", "bondlen", "bond_length", "pair_dist", "nearest"),
-        "angle": ("angle", "bend", "bond_angle"),
-        "dihedral": ("dihedral", "torsion", "phi", "psi", "chi"),
-        "planarity": ("planar", "planarity", "out_of_plane", "oop", "flatness"),
-        "shape": ("shape", "asphericity", "eccentricity", "spherocity", "globularity", "anisotropy"),
-        "size": ("radius_gyration", "rg", "gyration", "span", "diameter"),
-        "inertia": ("inertia", "principal", "pmi", "moment"),
-        "surface_volume": ("surface", "sasa", "vsa", "psa", "volume"),
-        "ring_strain": ("strain", "ring_strain", "angle_strain", "torsional_strain"),
-        "hbond_geometry": ("hb", "hbond", "donor_acceptor", "d_a", "donnor", "acceptor"),
+        "distance": (
+            "dist",
+            "distance",
+            "bondlen",
+            "bond_length",
+            "pair_dist",
+            "nearest",
+            "euclid",
+            "radius",
+        ),
+        "angle": ("angle", "bend", "bond_angle", "valence_angle"),
+        "dihedral": ("dihedral", "torsion", "phi", "psi", "chi", "omega", "tor"),
+        "planarity": ("planar", "planarity", "out_of_plane", "oop", "flatness", "pbf"),
+        "shape": (
+            "shape",
+            "asphericity",
+            "eccentricity",
+            "spherocity",
+            "globularity",
+            "anisotropy",
+            "inertialshape",
+            "npr",
+        ),
+        "size": ("radius_gyration", "rgyr", "gyration", "span", "diameter", "extent"),
+        "inertia": ("inertia", "principal", "pmi", "moment", "rotconst", "rotational"),
+        "surface_volume": ("surface", "sasa", "vsa", "psa", "volume", "molarvolume", "labuteasa"),
+        "ring_strain": ("strain", "ring_strain", "angle_strain", "torsional_strain", "ring_tension"),
+        "hbond_geometry": ("hb", "hbond", "donor_acceptor", "d_a", "dha", "dha_angle"),
+        "global_3d_fingerprint": ("rdf", "morse", "whim", "getaway", "autocorr3d", "moran3d", "geary3d"),
     }
 
     _QM_FAMILY_TOKENS: Mapping[str, tuple[str, ...]] = {
         "homo": ("homo", "ehomo", "eps_homo"),
         "lumo": ("lumo", "elumo", "eps_lumo"),
         "gap": ("gap", "homo_lumo", "bandgap", "deltae"),
-        "dipole": ("dipole", "mu", "moment"),
+        "chemical_potential": ("mu_ev", "chemical_potential"),
+        "dipole": ("dipole_d", "dipole", "dipolemoment"),
         "polarizability": ("polariz", "alpha"),
         "hardness": ("hardness", "eta"),
         "softness": ("softness", "sigma_soft", "soft"),
@@ -84,11 +104,28 @@ class SemanticTagger:
         "nucleophilicity": ("nucleophil",),
         "charge_transfer": ("charge_transfer", "ct", "deltaq", "charge_sep"),
         "esp": ("esp", "electrostatic", "mep"),
-        "fukui": ("fukui",),
+        "fukui": ("fukui", "fplus", "fminus"),
+        "fukui_plus": ("fplus",),
+        "fukui_minus": ("fminus",),
+        "ionization_potential": ("vip", "ip", "ionization_potential"),
+        "electron_affinity": ("vea", "ea", "electron_affinity"),
+        "bond_order": ("bo_sum", "bo_max", "bo_mean", "bond_order", "bo_"),
+        "bond_order_conjugation": ("bo_conj", "conj_bo"),
+        "atomic_charge_distribution": (
+            "q_min",
+            "q_max",
+            "q_mean",
+            "q_std",
+            "q_abs_sum",
+            "q_range",
+            "q_pos_top3_mean",
+            "q_neg_top3_mean",
+        ),
+        "charge_spread_distance": ("q_abs_r_mean", "q_abs_r2_rms", "d_pos_neg"),
         "nbo": ("nbo",),
         "mulliken": ("mulliken",),
         "npa": ("npa",),
-        "quadrupole": ("quadrupole",),
+        "quadrupole": ("quadrupole", "quad_norm", "quad_trace"),
     }
 
     def __init__(self, config: SemanticTaggingConfig):
@@ -751,6 +788,10 @@ class SemanticTagger:
             feature_names=feat_names,
             family_tokens=family_tokens,
         )
+        matched_idxs: set[int] = set()
+        for idxs in family_index.values():
+            matched_idxs.update(int(i) for i in idxs)
+
         family_stats: dict[str, dict[str, float]] = {}
         for family, idxs in family_index.items():
             if len(idxs) == 0:
@@ -763,11 +804,27 @@ class SemanticTagger:
                 "z_std": float(np.std(vals)),
             }
 
+        unmatched_idx = [i for i in range(dim) if i not in matched_idxs]
+        unmatched_top_idx = sorted(unmatched_idx, key=lambda i: float(abs_mean[int(i)]), reverse=True)[: min(12, len(unmatched_idx))]
+        unmatched_top_features = [
+            {
+                "name": str(feat_names[int(i)]),
+                "abs_z_mean": float(abs_mean[int(i)]),
+                "z_mean": float(mean[int(i)]),
+                "z_std": float(std[int(i)]),
+            }
+            for i in unmatched_top_idx
+        ]
+
         return {
             "n_vectors": int(n_vectors),
             "n_features": int(dim),
             "top_features": top_features,
             "family_stats": family_stats,
+            "n_family_matched_features": int(len(matched_idxs)),
+            "n_unmatched_features": int(max(0, dim - len(matched_idxs))),
+            "family_coverage": float(len(matched_idxs) / max(1, dim)),
+            "top_unmatched_features": unmatched_top_features,
         }
 
     def _summarize_openbabel_descriptors(self, *, molecules_by_id: Mapping[str, Any]) -> dict[str, Any]:
@@ -1013,6 +1070,66 @@ class SemanticTagger:
                 )
             )
 
+        size_abs = float(fam("size").get("abs_z_mean", 0.0))
+        size_mean = float(fam("size").get("z_mean", 0.0))
+        if size_abs >= thr:
+            if size_mean >= 0.0:
+                tags.append(
+                    self._mk_tag(
+                        concept_id,
+                        "expanded conformer envelope",
+                        min(1.0, 0.55 + 0.20 * size_abs),
+                        "geometry_descriptor_tagger",
+                        descriptors,
+                    )
+                )
+            else:
+                tags.append(
+                    self._mk_tag(
+                        concept_id,
+                        "compact conformer envelope",
+                        min(1.0, 0.55 + 0.20 * size_abs),
+                        "geometry_descriptor_tagger",
+                        descriptors,
+                    )
+                )
+
+        inertia_abs = float(fam("inertia").get("abs_z_mean", 0.0))
+        if inertia_abs >= thr:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "anisotropic inertia profile",
+                    min(1.0, 0.55 + 0.18 * inertia_abs),
+                    "geometry_descriptor_tagger",
+                    descriptors,
+                )
+            )
+
+        hbond_geom_abs = float(fam("hbond_geometry").get("abs_z_mean", 0.0))
+        if hbond_geom_abs >= thr:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "hydrogen-bond geometry pattern",
+                    min(1.0, 0.55 + 0.18 * hbond_geom_abs),
+                    "geometry_descriptor_tagger",
+                    descriptors,
+                )
+            )
+
+        global_3d_abs = float(fam("global_3d_fingerprint").get("abs_z_mean", 0.0))
+        if global_3d_abs >= thr:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "rich 3D field signature",
+                    min(1.0, 0.55 + 0.18 * global_3d_abs),
+                    "geometry_descriptor_tagger",
+                    descriptors,
+                )
+            )
+
         return tags
 
     def _pharmacophore_tags(self, *, concept_id: str, descriptors: Mapping[str, Any]) -> list[TagAssignment]:
@@ -1117,6 +1234,165 @@ class SemanticTagger:
         esp_abs = float(fam("esp").get("abs_z_mean", 0.0))
         if esp_abs >= strong_thr:
             tags.append(self._mk_tag(concept_id, "electrostatic potential contrast", min(1.0, 0.55 + 0.2 * esp_abs), "qm_descriptor_tagger", descriptors))
+
+        mu_abs = float(fam("chemical_potential").get("abs_z_mean", 0.0))
+        mu_mean = float(fam("chemical_potential").get("z_mean", 0.0))
+        if mu_abs >= thr:
+            if mu_mean >= 0.0:
+                tags.append(
+                    self._mk_tag(
+                        concept_id,
+                        "elevated chemical potential profile",
+                        min(1.0, 0.55 + 0.18 * mu_abs),
+                        "qm_descriptor_tagger",
+                        descriptors,
+                    )
+                )
+            else:
+                tags.append(
+                    self._mk_tag(
+                        concept_id,
+                        "reduced chemical potential profile",
+                        min(1.0, 0.55 + 0.18 * mu_abs),
+                        "qm_descriptor_tagger",
+                        descriptors,
+                    )
+                )
+
+        ip_abs = float(fam("ionization_potential").get("abs_z_mean", 0.0))
+        ip_mean = float(fam("ionization_potential").get("z_mean", 0.0))
+        if ip_abs >= thr:
+            if ip_mean >= 0.0:
+                tags.append(
+                    self._mk_tag(
+                        concept_id,
+                        "high ionization-potential profile",
+                        min(1.0, 0.55 + 0.2 * ip_abs),
+                        "qm_descriptor_tagger",
+                        descriptors,
+                    )
+                )
+            else:
+                tags.append(
+                    self._mk_tag(
+                        concept_id,
+                        "low ionization-potential profile",
+                        min(1.0, 0.55 + 0.2 * ip_abs),
+                        "qm_descriptor_tagger",
+                        descriptors,
+                    )
+                )
+
+        ea_abs = float(fam("electron_affinity").get("abs_z_mean", 0.0))
+        ea_mean = float(fam("electron_affinity").get("z_mean", 0.0))
+        if ea_abs >= thr:
+            if ea_mean >= 0.0:
+                tags.append(
+                    self._mk_tag(
+                        concept_id,
+                        "high electron-affinity profile",
+                        min(1.0, 0.55 + 0.2 * ea_abs),
+                        "qm_descriptor_tagger",
+                        descriptors,
+                    )
+                )
+            else:
+                tags.append(
+                    self._mk_tag(
+                        concept_id,
+                        "low electron-affinity profile",
+                        min(1.0, 0.55 + 0.2 * ea_abs),
+                        "qm_descriptor_tagger",
+                        descriptors,
+                    )
+                )
+
+        bo_abs = float(fam("bond_order").get("abs_z_mean", 0.0))
+        bo_mean = float(fam("bond_order").get("z_mean", 0.0))
+        if bo_abs >= thr and bo_mean >= 0.0:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "bond-order rigidification profile",
+                    min(1.0, 0.55 + 0.2 * bo_abs),
+                    "qm_descriptor_tagger",
+                    descriptors,
+                )
+            )
+
+        bo_conj_abs = float(fam("bond_order_conjugation").get("abs_z_mean", 0.0))
+        bo_conj_mean = float(fam("bond_order_conjugation").get("z_mean", 0.0))
+        if bo_conj_abs >= thr and bo_conj_mean >= 0.0:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "conjugated bond-order network",
+                    min(1.0, 0.55 + 0.2 * bo_conj_abs),
+                    "qm_descriptor_tagger",
+                    descriptors,
+                )
+            )
+
+        charge_abs = float(fam("atomic_charge_distribution").get("abs_z_mean", 0.0))
+        if charge_abs >= thr:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "polarized atomic-charge landscape",
+                    min(1.0, 0.55 + 0.18 * charge_abs),
+                    "qm_descriptor_tagger",
+                    descriptors,
+                )
+            )
+
+        spread_abs = float(fam("charge_spread_distance").get("abs_z_mean", 0.0))
+        spread_mean = float(fam("charge_spread_distance").get("z_mean", 0.0))
+        if spread_abs >= thr and spread_mean >= 0.0:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "long-range charge-separation profile",
+                    min(1.0, 0.55 + 0.18 * spread_abs),
+                    "qm_descriptor_tagger",
+                    descriptors,
+                )
+            )
+
+        fplus_abs = float(fam("fukui_plus").get("abs_z_mean", 0.0))
+        if fplus_abs >= thr:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "nucleophilic hotspot profile (Fukui+)",
+                    min(1.0, 0.55 + 0.2 * fplus_abs),
+                    "qm_descriptor_tagger",
+                    descriptors,
+                )
+            )
+
+        fminus_abs = float(fam("fukui_minus").get("abs_z_mean", 0.0))
+        if fminus_abs >= thr:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "electrophilic hotspot profile (Fukui-)",
+                    min(1.0, 0.55 + 0.2 * fminus_abs),
+                    "qm_descriptor_tagger",
+                    descriptors,
+                )
+            )
+
+        quad_abs = float(fam("quadrupole").get("abs_z_mean", 0.0))
+        if quad_abs >= thr:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "anisotropic quadrupole field",
+                    min(1.0, 0.55 + 0.18 * quad_abs),
+                    "qm_descriptor_tagger",
+                    descriptors,
+                )
+            )
 
         return tags
 
@@ -1228,6 +1504,61 @@ class SemanticTagger:
                     "polar donor-acceptor electronic motif",
                     min(1.0, 0.58 + 0.18 * dip),
                     "cross_modal_tagger",
+                    descriptors,
+                )
+            )
+
+        # Heuristic photophysics proxy tags for transmittance / fluorescence behavior.
+        # These are intentionally labeled as "proxy" because they do not use explicit excited-state observables.
+        gap_mean = float(qfam_stat("gap").get("z_mean", 0.0))
+        gap_abs = float(qfam_stat("gap").get("abs_z_mean", 0.0))
+        hard_mean = float(qfam_stat("hardness").get("z_mean", 0.0))
+        dip_abs = float(qfam_stat("dipole").get("abs_z_mean", 0.0))
+        ct_abs = float(qfam_stat("charge_transfer").get("abs_z_mean", 0.0))
+        bo_conj_abs = float(qfam_stat("bond_order_conjugation").get("abs_z_mean", 0.0))
+        fplus_abs = float(qfam_stat("fukui_plus").get("abs_z_mean", 0.0))
+        fminus_abs = float(qfam_stat("fukui_minus").get("abs_z_mean", 0.0))
+
+        if gap_abs >= thr_q and gap_mean >= thr_q and hard_mean >= 0.0 and ct_abs < thr_q and dip_abs < max(thr_q, 0.9):
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "transmittance-favored photophysics proxy",
+                    min(1.0, 0.55 + 0.12 * (gap_abs + max(0.0, gap_mean) + max(0.0, hard_mean))),
+                    "photophysics_proxy_tagger",
+                    descriptors,
+                )
+            )
+
+        if bo_conj_abs >= thr_q and planar >= thr_g and (ct_abs >= thr_q or dip_abs >= thr_q):
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "fluorescence-favored photophysics proxy",
+                    min(1.0, 0.55 + 0.10 * (bo_conj_abs + planar + max(ct_abs, dip_abs))),
+                    "photophysics_proxy_tagger",
+                    descriptors,
+                )
+            )
+
+        if gap_mean <= -thr_q and (ct_abs >= thr_q or fminus_abs >= thr_q):
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "red-shifted absorption proxy",
+                    min(1.0, 0.55 + 0.10 * (abs(gap_mean) + max(ct_abs, fminus_abs))),
+                    "photophysics_proxy_tagger",
+                    descriptors,
+                )
+            )
+
+        if gap_mean >= thr_q and fplus_abs < thr_q and fminus_abs < thr_q:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "blue-shifted transparency proxy",
+                    min(1.0, 0.55 + 0.10 * (gap_mean + gap_abs)),
+                    "photophysics_proxy_tagger",
                     descriptors,
                 )
             )

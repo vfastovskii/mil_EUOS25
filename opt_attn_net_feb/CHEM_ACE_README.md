@@ -373,10 +373,18 @@ Computed descriptor families:
    - rotatable-bond proxy for rigid/flexible labels
 2. descriptor-derived (from `inst_geom_cols` + `inst_geom_dim`, per patch):
    - family summaries for distance / angle / dihedral / planarity / shape / size / inertia / surface-volume / ring-strain / hbond-geometry
+   - global 3D descriptor blocks (RDF / MORSE / WHIM / GETAWAY / 3D autocorrelation tokens)
    - tags gated by:
      - `geom_min_vectors_for_tagging`
      - `geom_z_threshold`
      - `geom_strong_z_threshold`
+
+Per-concept descriptor evidence now includes family-coverage diagnostics:
+
+- `geom_summary.family_coverage`
+- `geom_summary.n_family_matched_features`
+- `geom_summary.n_unmatched_features`
+- `geom_summary.top_unmatched_features`
 
 Cross-modal tags are also emitted when signals agree across modalities:
 
@@ -455,6 +463,38 @@ QM semantic interpretation logic:
 7. thresholds:
    - moderate: `qm_z_threshold`
    - strong: `qm_strong_z_threshold`
+
+Descriptor basis from `docs/quantum_descriptors_list.pdf` is now explicitly covered in family token maps:
+
+- frontier/conceptual DFT:
+  - `homo_eV`, `lumo_eV`, `gap_eV`, `mu_eV`, `eta_eV`, `softness_1_per_eV`, `chi_eV`, `omega_eV`
+- electrostatics:
+  - `dipole_D`, `quad_norm_au`, `quad_trace_au`
+- bond-order and conjugation:
+  - `bo_sum`, `bo_max`, `bo_mean_bonds`, `bo_conj_sum`, `bo_conj_mean`
+- atomic-charge distribution:
+  - `q_min`, `q_max`, `q_mean`, `q_std`, `q_abs_sum`, `q_range`, `q_pos_top3_mean`, `q_neg_top3_mean`
+- charge-separation geometry:
+  - `q_abs_r_mean`, `q_abs_r2_rms`, `d_pos_neg`
+- redox and local reactivity:
+  - `vip_eV`, `vea_eV`, `fplus_max`, `fplus_sum_pos`, `fplus_top3_mean`, `fminus_max`, `fminus_sum_pos`, `fminus_top3_mean`
+
+Additional QM tags now include:
+
+- ionization/electron-affinity profile tags
+- bond-order rigidification + conjugated bond-order network
+- polarized atomic-charge landscape + long-range charge-separation profile
+- Fukui+ / Fukui- hotspot profile tags
+- anisotropic quadrupole field
+
+Photophysics proxy tags (heuristic, not TD-DFT):
+
+- `transmittance-favored photophysics proxy`
+- `fluorescence-favored photophysics proxy`
+- `red-shifted absorption proxy`
+- `blue-shifted transparency proxy`
+
+These are emitted by combining QM families with geometry/conjugation cues and are intentionally marked as proxy semantics.
 
 SMARTS-RX semantics:
 

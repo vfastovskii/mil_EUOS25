@@ -920,14 +920,31 @@ QM family mapping:
 - descriptor names are normalized and matched by token to families:
   - HOMO, LUMO, gap, dipole, polarizability, hardness, softness
   - electrophilicity, nucleophilicity, charge-transfer, ESP, Fukui, NBO, Mulliken/NPA
+  - chemical potential (`mu_eV`), ionization potential (`vip_eV`), electron affinity (`vea_eV`)
+  - bond-order (`bo_*`), conjugated bond-order (`bo_conj_*`)
+  - atomic-charge distribution (`q_*`) and charge-separation distance (`q_abs_r_*`, `d_pos_neg`)
+  - quadrupole (`quad_norm_au`, `quad_trace_au`)
 - family stats are computed as concept-level `abs_z_mean`, `z_mean`, `z_std`
 - tags are emitted from thresholded family stats (e.g., `large HOMO-LUMO gap`, `high dipole moment`, `electrophile-like electronic profile`)
+
+Photophysics proxy formalism (heuristic):
+- no explicit excited-state observables are used in current pipeline; tags are proxy-level and evidence-backed by family stats
+- transmittance proxy:
+  - higher gap/hardness with lower charge-transfer and dipole activity
+- fluorescence proxy:
+  - stronger conjugated bond-order + geometry planarity with elevated dipole or charge-transfer signatures
+- additional proxy outputs:
+  - `red-shifted absorption proxy`
+  - `blue-shifted transparency proxy`
 
 3D geometry family mapping:
 - geometry descriptor names are normalized and token-matched to families:
   - distance, angle, dihedral, planarity, shape, size, inertia, surface_volume, ring_strain, hbond_geometry
+  - global_3d_fingerprint (RDF / MORSE / WHIM / GETAWAY / 3D autocorrelation token families)
 - family stats are computed as concept-level `abs_z_mean`, `z_mean`, `z_std`
 - tags are emitted from thresholded family stats (e.g., `torsionally active geometry`, `shape-anisotropic geometry`, `ring-strained geometry`)
+- evidence also reports coverage diagnostics:
+  - `family_coverage`, `n_family_matched_features`, `n_unmatched_features`, `top_unmatched_features`
 
 Cross-modal semantic tags:
 - `electrophilic reaction-center motif`: SMARTS-RX electrophile role + elevated QM electrophilicity
