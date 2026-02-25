@@ -457,6 +457,50 @@ class LambdaVolArtifactExporter:
             epochs=np.asarray([int(x) for x in epochs], dtype=np.int64),
         )
 
+    @staticmethod
+    def _robust_normalize(
+        values: np.ndarray,
+        *,
+        q_low: float = 5.0,
+        q_high: float = 95.0,
+    ) -> np.ndarray:
+        arr = np.asarray(values, dtype=np.float32)
+        if arr.size == 0:
+            return np.asarray(arr, dtype=np.float32)
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        lo = float(np.percentile(arr, q_low))
+        hi = float(np.percentile(arr, q_high))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo + 1e-8:
+            lo = float(np.min(arr))
+            hi = float(np.max(arr))
+        if hi <= lo + 1e-8:
+            return np.zeros_like(arr, dtype=np.float32)
+        out = (arr - lo) / float(hi - lo)
+        return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+    @staticmethod
+    def _size_from_score(
+        score: np.ndarray,
+        *,
+        min_size: float,
+        max_size: float,
+        gamma: float = 2.0,
+    ) -> np.ndarray:
+        s = np.asarray(score, dtype=np.float32)
+        s = np.clip(s, 0.0, 1.0)
+        s = np.power(s, float(max(0.5, gamma)))
+        return (float(min_size) + (float(max_size) - float(min_size)) * s).astype(np.float32)
+
+    @staticmethod
+    def _symmetric_color_limits(values: np.ndarray, *, q: float = 98.0) -> tuple[float, float]:
+        v = np.asarray(values, dtype=np.float32)
+        if v.size == 0:
+            return -1.0, 1.0
+        v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+        a = float(np.percentile(np.abs(v), q))
+        a = max(1e-6, a)
+        return -a, a
+
     def _build_concept_xyz(self, *, tensors: Mapping[str, np.ndarray]) -> np.ndarray:
         rho = np.asarray(tensors["rho"], dtype=np.float32)
         tcav = np.asarray(tensors["tcav"], dtype=np.float32)
@@ -557,7 +601,27 @@ class LambdaVolArtifactExporter:
                         }
                     )
             frame = pd.DataFrame(rows)
-            frame["size"] = np.clip(frame["prevalence"].to_numpy(dtype=np.float32), 0.01, 1.0)
+            abs_pressure = np.abs(frame["pressure"].to_numpy(dtype=np.float32))
+            pos_tcav = np.maximum(frame["tcav"].to_numpy(dtype=np.float32), 0.0)
+            attn = np.maximum(frame["attention_support"].to_numpy(dtype=np.float32), 0.0)
+            prev = np.maximum(frame["prevalence"].to_numpy(dtype=np.float32), 0.0)
+            contribution = (
+                0.50 * self._robust_normalize(abs_pressure)
+                + 0.25 * self._robust_normalize(pos_tcav)
+                + 0.15 * self._robust_normalize(attn)
+                + 0.10 * self._robust_normalize(prev)
+            )
+            frame["contribution"] = contribution.astype(np.float32)
+            frame["size"] = self._size_from_score(
+                frame["contribution"].to_numpy(dtype=np.float32),
+                min_size=3.0,
+                max_size=42.0,
+                gamma=2.4,
+            )
+            cmin, cmax = self._symmetric_color_limits(
+                frame["pressure"].to_numpy(dtype=np.float32),
+                q=98.0,
+            )
 
             fig = px.scatter_3d(
                 frame,
@@ -567,7 +631,7 @@ class LambdaVolArtifactExporter:
                 animation_frame="epoch",
                 color="pressure",
                 size="size",
-                size_max=24,
+                size_max=42,
                 hover_name="concept_id",
                 hover_data={
                     "task_id": True,
@@ -575,14 +639,37 @@ class LambdaVolArtifactExporter:
                     "prevalence": ":.3f",
                     "attention_support": ":.3f",
                     "drift": ":.3f",
+                    "contribution": ":.3f",
                     "size": False,
                     "z1": False,
                     "z2": False,
                     "z3": False,
                 },
                 title=f"Concept Manifold (Task={task_ids[ti]})",
+                color_continuous_scale="RdBu_r",
+                range_color=(cmin, cmax),
             )
-            fig.update_layout(scene=dict(xaxis_title="z1", yaxis_title="z2", zaxis_title="z3"))
+            fig.update_layout(
+                template="plotly_white",
+                font=dict(family="Helvetica, Arial, sans-serif", size=13),
+                margin=dict(l=10, r=10, t=60, b=10),
+                scene=dict(
+                    xaxis_title="z1",
+                    yaxis_title="z2",
+                    zaxis_title="z3",
+                    bgcolor="rgba(248,250,252,1.0)",
+                    xaxis=dict(showbackground=True, backgroundcolor="rgba(245,247,250,1.0)", gridcolor="rgba(120,120,120,0.20)"),
+                    yaxis=dict(showbackground=True, backgroundcolor="rgba(245,247,250,1.0)", gridcolor="rgba(120,120,120,0.20)"),
+                    zaxis=dict(showbackground=True, backgroundcolor="rgba(245,247,250,1.0)", gridcolor="rgba(120,120,120,0.20)"),
+                ),
+                coloraxis_colorbar=dict(title="pressure"),
+            )
+            fig.update_traces(marker=dict(line=dict(width=0.6, color="rgba(20,20,20,0.30)")))
+            if getattr(fig.layout, "updatemenus", None):
+                for menu in fig.layout.updatemenus:
+                    menu["bgcolor"] = "rgba(255,255,255,0.95)"
+                    menu["bordercolor"] = "rgba(180,180,180,0.6)"
+                    menu["font"] = dict(size=12)
 
             html_path = out_dir / f"concept_manifold_{task_ids[ti]}.html"
             fig.write_html(html_path, include_plotlyjs="cdn")
@@ -615,6 +702,8 @@ class LambdaVolArtifactExporter:
                     "rho",
                     "drift",
                     "tcav",
+                    "contribution",
+                    "task_axis_span",
                 ]
             )
 
@@ -638,41 +727,116 @@ class LambdaVolArtifactExporter:
                             "tcav": float(tcav[ti, ci, ei]),
                         }
                     )
-        return pd.DataFrame(rows)
+        out = pd.DataFrame(rows)
+        if out.empty:
+            out["contribution"] = []
+            out["task_axis_span"] = []
+            return out
+
+        abs_rho = np.abs(out["rho"].to_numpy(dtype=np.float32))
+        abs_drift = np.abs(out["drift"].to_numpy(dtype=np.float32))
+        pos_tcav = np.maximum(out["tcav"].to_numpy(dtype=np.float32), 0.0)
+        contrib = (
+            0.55 * self._robust_normalize(abs_rho)
+            + 0.30 * self._robust_normalize(pos_tcav)
+            + 0.15 * self._robust_normalize(abs_drift)
+        )
+        out["contribution"] = contrib.astype(np.float32)
+        # Half-span for z-axis elongation in lattice view.
+        out["task_axis_span"] = (
+            0.03 + 0.42 * np.power(np.clip(contrib, 0.0, 1.0), 1.5)
+        ).astype(np.float32)
+        return out
 
     def _export_plotly_lattice(self, *, out_html: Path, lattice_df: pd.DataFrame) -> None:
-        import plotly.express as px
+        import plotly.graph_objects as go
 
         if lattice_df.empty:
             out_html.write_text("No lattice data.")
             return
 
         lattice_df = lattice_df.copy()
-        lattice_df["size"] = np.clip(np.abs(lattice_df["drift"].to_numpy(dtype=np.float32)), 0.01, 1.0)
-
-        fig = px.scatter_3d(
-            lattice_df,
-            x="epoch",
-            y="concept_index",
-            z="task_index",
-            color="rho",
-            size="size",
-            size_max=16,
-            hover_name="concept_id",
-            hover_data={
-                "task_id": True,
-                "rho": ":.3f",
-                "drift": ":.3f",
-                "tcav": ":.3f",
-                "size": False,
-            },
-            title="Pressure Field Lattice (task, concept, epoch)",
+        contribution = lattice_df["contribution"].to_numpy(dtype=np.float32)
+        lattice_df["size"] = self._size_from_score(
+            contribution,
+            min_size=2.5,
+            max_size=28.0,
+            gamma=2.3,
         )
+        cmin, cmax = self._symmetric_color_limits(lattice_df["rho"].to_numpy(dtype=np.float32), q=98.0)
+
+        marker_trace = go.Scatter3d(
+            x=lattice_df["epoch"],
+            y=lattice_df["concept_index"],
+            z=lattice_df["task_index"],
+            mode="markers",
+            marker=dict(
+                size=lattice_df["size"],
+                color=lattice_df["rho"],
+                colorscale="RdBu_r",
+                cmin=cmin,
+                cmax=cmax,
+                opacity=0.90,
+                colorbar=dict(title="rho"),
+                line=dict(width=0.5, color="rgba(20,20,20,0.25)"),
+            ),
+            customdata=np.stack(
+                [
+                    lattice_df["task_id"].astype(str).to_numpy(),
+                    lattice_df["concept_id"].astype(str).to_numpy(),
+                    lattice_df["rho"].to_numpy(dtype=np.float32),
+                    lattice_df["drift"].to_numpy(dtype=np.float32),
+                    lattice_df["tcav"].to_numpy(dtype=np.float32),
+                    lattice_df["contribution"].to_numpy(dtype=np.float32),
+                ],
+                axis=1,
+            ),
+            hovertemplate=(
+                "task=%{customdata[0]}<br>"
+                "concept=%{customdata[1]}<br>"
+                "rho=%{customdata[2]:.3f}<br>"
+                "drift=%{customdata[3]:.3f}<br>"
+                "tcav=%{customdata[4]:.3f}<br>"
+                "contribution=%{customdata[5]:.3f}<extra></extra>"
+            ),
+            name="concept state",
+        )
+
+        x_line: list[float] = []
+        y_line: list[float] = []
+        z_line: list[float] = []
+        for row in lattice_df.itertuples(index=False):
+            x = float(row.epoch)
+            y = float(row.concept_index)
+            z = float(row.task_index)
+            dz = float(row.task_axis_span)
+            x_line.extend([x, x, np.nan])
+            y_line.extend([y, y, np.nan])
+            z_line.extend([z - dz, z + dz, np.nan])
+        elongation_trace = go.Scatter3d(
+            x=x_line,
+            y=y_line,
+            z=z_line,
+            mode="lines",
+            line=dict(color="rgba(35,35,35,0.38)", width=2.0),
+            hoverinfo="skip",
+            name="task-axis elongation",
+        )
+
+        fig = go.Figure(data=[elongation_trace, marker_trace])
         fig.update_layout(
+            template="plotly_white",
+            font=dict(family="Helvetica, Arial, sans-serif", size=13),
+            margin=dict(l=10, r=10, t=60, b=10),
+            title="Pressure Field Lattice (Task, Concept, Epoch)",
             scene=dict(
                 xaxis_title="Epoch",
                 yaxis_title="Concept Index",
                 zaxis_title="Task Index",
+                bgcolor="rgba(248,250,252,1.0)",
+                xaxis=dict(showbackground=True, backgroundcolor="rgba(245,247,250,1.0)", gridcolor="rgba(120,120,120,0.20)"),
+                yaxis=dict(showbackground=True, backgroundcolor="rgba(245,247,250,1.0)", gridcolor="rgba(120,120,120,0.20)"),
+                zaxis=dict(showbackground=True, backgroundcolor="rgba(245,247,250,1.0)", gridcolor="rgba(120,120,120,0.20)"),
             )
         )
         fig.write_html(out_html, include_plotlyjs="cdn")
@@ -695,59 +859,117 @@ class LambdaVolArtifactExporter:
             return
 
         rho_last = np.asarray(tensors["rho"], dtype=np.float32)
-        if rho_last.size > 0:
-            node_value = np.mean(rho_last[:, :, -1], axis=0)
+        tcav_last = np.asarray(tensors["tcav"], dtype=np.float32)
+        attn_last = np.asarray(tensors["attention_support"], dtype=np.float32)
+
+        if rho_last.size > 0 and rho_last.shape[2] > 0:
+            rho_mean_abs = np.mean(np.abs(rho_last[:, :, -1]), axis=0)
+            rho_mean_signed = np.mean(rho_last[:, :, -1], axis=0)
         else:
-            node_value = np.zeros((n,), dtype=np.float32)
+            rho_mean_abs = np.zeros((n,), dtype=np.float32)
+            rho_mean_signed = np.zeros((n,), dtype=np.float32)
+        if tcav_last.size > 0 and tcav_last.shape[2] > 0:
+            tcav_mean = np.mean(np.maximum(tcav_last[:, :, -1], 0.0), axis=0)
+        else:
+            tcav_mean = np.zeros((n,), dtype=np.float32)
+        if attn_last.size > 0 and attn_last.shape[2] > 0:
+            attn_mean = np.mean(np.maximum(attn_last[:, :, -1], 0.0), axis=0)
+        else:
+            attn_mean = np.zeros((n,), dtype=np.float32)
 
-        thr = np.percentile(np.abs(cmat[np.triu_indices(n, k=1)]), 75) if n >= 2 else 0.0
-        thr = float(max(thr, 1e-6))
+        node_score = (
+            0.60 * self._robust_normalize(rho_mean_abs)
+            + 0.25 * self._robust_normalize(tcav_mean)
+            + 0.15 * self._robust_normalize(attn_mean)
+        )
+        node_size = self._size_from_score(
+            node_score,
+            min_size=7.0,
+            max_size=44.0,
+            gamma=2.3,
+        )
 
-        edge_x: list[float] = []
-        edge_y: list[float] = []
-        edge_z: list[float] = []
-        edge_color: list[float] = []
+        abs_upper = np.abs(cmat[np.triu_indices(n, k=1)]) if n >= 2 else np.asarray([], dtype=np.float32)
+        if abs_upper.size == 0:
+            thr = 0.0
+            mx = 0.0
+        else:
+            thr = float(max(np.percentile(abs_upper, 70.0), 1e-6))
+            mx = float(max(np.max(abs_upper), thr + 1e-6))
 
+        edge_traces: list[Any] = []
         for i in range(n):
             for j in range(i + 1, n):
                 w = float(cmat[i, j])
-                if abs(w) < thr:
+                aw = abs(w)
+                if aw < thr:
                     continue
-                edge_x.extend([float(concept_xyz[i, 0]), float(concept_xyz[j, 0]), np.nan])
-                edge_y.extend([float(concept_xyz[i, 1]), float(concept_xyz[j, 1]), np.nan])
-                edge_z.extend([float(concept_xyz[i, 2]), float(concept_xyz[j, 2]), np.nan])
-                edge_color.extend([w, w, w])
+                width = float(1.0 + 7.0 * ((aw - thr) / (mx - thr + 1e-8)))
+                color = "rgba(210,55,70,0.55)" if w >= 0.0 else "rgba(45,95,210,0.55)"
+                edge_traces.append(
+                    go.Scatter3d(
+                        x=[float(concept_xyz[i, 0]), float(concept_xyz[j, 0])],
+                        y=[float(concept_xyz[i, 1]), float(concept_xyz[j, 1])],
+                        z=[float(concept_xyz[i, 2]), float(concept_xyz[j, 2])],
+                        mode="lines",
+                        line=dict(color=color, width=width),
+                        hovertemplate=(
+                            f"{str(concept_ids[i])} → {str(concept_ids[j])}<br>"
+                            f"coupling={w:.4f}<extra></extra>"
+                        ),
+                        showlegend=False,
+                        name="coupling",
+                    )
+                )
 
-        edge_trace = go.Scatter3d(
-            x=edge_x,
-            y=edge_y,
-            z=edge_z,
-            mode="lines",
-            line=dict(color="rgba(120,120,120,0.4)", width=2),
-            hoverinfo="none",
-            name="coupling",
-        )
-
+        rho_cmin, rho_cmax = self._symmetric_color_limits(rho_mean_signed, q=98.0)
         node_trace = go.Scatter3d(
             x=concept_xyz[:, 0],
             y=concept_xyz[:, 1],
             z=concept_xyz[:, 2],
-            mode="markers+text",
+            mode="markers",
             marker=dict(
-                size=np.clip((node_value - np.min(node_value) + 1e-3) * 20.0, 5.0, 24.0),
-                color=node_value,
-                colorscale="Viridis",
+                size=node_size,
+                color=rho_mean_signed,
+                colorscale="RdBu_r",
+                cmin=rho_cmin,
+                cmax=rho_cmax,
                 colorbar=dict(title="pressure(last)"),
+                line=dict(width=0.7, color="rgba(20,20,20,0.35)"),
             ),
-            text=[str(c) for c in concept_ids],
-            textposition="top center",
+            customdata=np.stack(
+                [
+                    np.asarray([str(c) for c in concept_ids], dtype=object),
+                    np.asarray(node_score, dtype=np.float32),
+                    np.asarray(tcav_mean, dtype=np.float32),
+                    np.asarray(attn_mean, dtype=np.float32),
+                ],
+                axis=1,
+            ),
+            hovertemplate=(
+                "concept=%{customdata[0]}<br>"
+                "contribution=%{customdata[1]:.3f}<br>"
+                "tcav(last)=%{customdata[2]:.3f}<br>"
+                "attn(last)=%{customdata[3]:.3f}<extra></extra>"
+            ),
             name="concepts",
         )
 
-        fig = go.Figure(data=[edge_trace, node_trace])
+        fig = go.Figure(data=[*edge_traces, node_trace])
         fig.update_layout(
+            template="plotly_white",
+            font=dict(family="Helvetica, Arial, sans-serif", size=13),
+            margin=dict(l=10, r=10, t=60, b=10),
             title="Concept Coupling Spillover Graph",
-            scene=dict(xaxis_title="z1", yaxis_title="z2", zaxis_title="z3"),
+            scene=dict(
+                xaxis_title="z1",
+                yaxis_title="z2",
+                zaxis_title="z3",
+                bgcolor="rgba(248,250,252,1.0)",
+                xaxis=dict(showbackground=True, backgroundcolor="rgba(245,247,250,1.0)", gridcolor="rgba(120,120,120,0.20)"),
+                yaxis=dict(showbackground=True, backgroundcolor="rgba(245,247,250,1.0)", gridcolor="rgba(120,120,120,0.20)"),
+                zaxis=dict(showbackground=True, backgroundcolor="rgba(245,247,250,1.0)", gridcolor="rgba(120,120,120,0.20)"),
+            ),
         )
         fig.write_html(out_html, include_plotlyjs="cdn")
 
@@ -765,17 +987,36 @@ class LambdaVolArtifactExporter:
         heatmap_dir.mkdir(parents=True, exist_ok=True)
 
         rho = np.asarray(tensors["rho"], dtype=np.float32)
+        tcav = np.asarray(tensors["tcav"], dtype=np.float32)
         n_tasks = len(task_ids)
 
         for ti in range(n_tasks):
             z = rho[ti]
+            t = tcav[ti] if tcav.size > 0 else np.zeros_like(z, dtype=np.float32)
+            # Reorder concepts by contribution to make dominant concepts immediately visible.
+            concept_score = (
+                0.70 * np.mean(np.abs(z), axis=1)
+                + 0.30 * np.mean(np.maximum(t, 0.0), axis=1)
+            )
+            order = np.argsort(concept_score)[::-1]
+            z = z[order]
+            y_labels = [str(concept_ids[int(i)]) for i in order]
+            zmin, zmax = self._symmetric_color_limits(z, q=98.0)
             fig = px.imshow(
                 z,
                 x=[int(i) for i in range(z.shape[1])],
-                y=[str(c) for c in concept_ids],
+                y=y_labels,
                 labels={"x": "epoch", "y": "concept", "color": "rho"},
                 title=f"Task {task_ids[ti]} pressure heatmap",
                 aspect="auto",
+                color_continuous_scale="RdBu_r",
+                zmin=zmin,
+                zmax=zmax,
+            )
+            fig.update_layout(
+                template="plotly_white",
+                font=dict(family="Helvetica, Arial, sans-serif", size=12),
+                margin=dict(l=10, r=10, t=56, b=10),
             )
             fig.write_html(heatmap_dir / f"pressure_heatmap_{task_ids[ti]}.html", include_plotlyjs="cdn")
 
@@ -805,7 +1046,17 @@ class LambdaVolArtifactExporter:
             color="component",
             facet_row="task_id",
             title="Trend vs Dissipation",
+            color_discrete_map={
+                "trend_loop": "#c0392b",
+                "dissipation": "#1f5aa6",
+            },
         )
+        fig.update_layout(
+            template="plotly_white",
+            font=dict(family="Helvetica, Arial, sans-serif", size=12),
+            margin=dict(l=10, r=10, t=56, b=10),
+        )
+        fig.update_traces(line=dict(width=2.5))
         fig.write_html(out_dir / "trend_vs_dissipation.html", include_plotlyjs="cdn")
 
     @staticmethod
