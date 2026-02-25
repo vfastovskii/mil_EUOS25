@@ -6,7 +6,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from ....utils.progress import log_event
-from ...types import TagAssignment
+from ..types import TagAssignment
 from .taggers import SemanticTaggingResult
 
 

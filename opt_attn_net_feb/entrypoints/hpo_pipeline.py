@@ -219,6 +219,20 @@ class CLIExplainabilityConfig:
     activity_calibration_max_confidence: float
     activity_calibration_ratio_cap: float
     activity_calibration_fallback_top1_if_empty: bool
+    chem_ace_use_advanced_geom_topology: bool
+    chem_ace_advanced_geom_topology_max_patches: int
+    chem_ace_advanced_geom_topology_min_atoms: int
+    chem_ace_advanced_geom_topology_max_torsion_paths: int
+    chem_ace_advanced_geom_use_convex_hull: bool
+    chem_ace_advanced_geom_use_persistent_homology: bool
+    chem_ace_advanced_geom_persistence_max_atoms: int
+    chem_ace_use_orca_descriptors: bool
+    chem_ace_orca_descriptors_path: str | None
+    chem_ace_orca_conf_id_col: str
+    chem_ace_orca_mol_id_col: str
+    chem_ace_orca_descriptor_cols: tuple[str, ...]
+    chem_ace_orca_min_vectors_for_tagging: int
+    chem_ace_orca_z_threshold: float
     lambda_vol_output_dir: str | None
     lambda_vol_db_uri: str | None
     lambda_vol_layer_name: str
@@ -424,6 +438,36 @@ class PipelineConfigFactory:
                 activity_calibration_fallback_top1_if_empty=bool(
                     args.activity_calibration_fallback_top1_if_empty
                 ),
+                chem_ace_use_advanced_geom_topology=bool(args.chem_ace_use_advanced_geom_topology),
+                chem_ace_advanced_geom_topology_max_patches=int(
+                    args.chem_ace_advanced_geom_topology_max_patches
+                ),
+                chem_ace_advanced_geom_topology_min_atoms=int(
+                    args.chem_ace_advanced_geom_topology_min_atoms
+                ),
+                chem_ace_advanced_geom_topology_max_torsion_paths=int(
+                    args.chem_ace_advanced_geom_topology_max_torsion_paths
+                ),
+                chem_ace_advanced_geom_use_convex_hull=bool(
+                    args.chem_ace_advanced_geom_use_convex_hull
+                ),
+                chem_ace_advanced_geom_use_persistent_homology=bool(
+                    args.chem_ace_advanced_geom_use_persistent_homology
+                ),
+                chem_ace_advanced_geom_persistence_max_atoms=int(
+                    args.chem_ace_advanced_geom_persistence_max_atoms
+                ),
+                chem_ace_use_orca_descriptors=bool(args.chem_ace_use_orca_descriptors),
+                chem_ace_orca_descriptors_path=(
+                    None
+                    if args.chem_ace_orca_descriptors_path is None
+                    else str(args.chem_ace_orca_descriptors_path)
+                ),
+                chem_ace_orca_conf_id_col=str(args.chem_ace_orca_conf_id_col),
+                chem_ace_orca_mol_id_col=str(args.chem_ace_orca_mol_id_col),
+                chem_ace_orca_descriptor_cols=tuple(str(x) for x in args.chem_ace_orca_descriptor_cols),
+                chem_ace_orca_min_vectors_for_tagging=int(args.chem_ace_orca_min_vectors_for_tagging),
+                chem_ace_orca_z_threshold=float(args.chem_ace_orca_z_threshold),
                 lambda_vol_output_dir=(
                     None if args.lambda_vol_output_dir is None else str(args.lambda_vol_output_dir)
                 ),
@@ -973,6 +1017,46 @@ class MILPipelineOrchestrator:
                         ),
                         activity_calibration_fallback_top1_if_empty=bool(
                             self.config.explainability.activity_calibration_fallback_top1_if_empty
+                        ),
+                        chem_ace_use_advanced_geom_topology=bool(
+                            self.config.explainability.chem_ace_use_advanced_geom_topology
+                        ),
+                        chem_ace_advanced_geom_topology_max_patches=int(
+                            self.config.explainability.chem_ace_advanced_geom_topology_max_patches
+                        ),
+                        chem_ace_advanced_geom_topology_min_atoms=int(
+                            self.config.explainability.chem_ace_advanced_geom_topology_min_atoms
+                        ),
+                        chem_ace_advanced_geom_topology_max_torsion_paths=int(
+                            self.config.explainability.chem_ace_advanced_geom_topology_max_torsion_paths
+                        ),
+                        chem_ace_advanced_geom_use_convex_hull=bool(
+                            self.config.explainability.chem_ace_advanced_geom_use_convex_hull
+                        ),
+                        chem_ace_advanced_geom_use_persistent_homology=bool(
+                            self.config.explainability.chem_ace_advanced_geom_use_persistent_homology
+                        ),
+                        chem_ace_advanced_geom_persistence_max_atoms=int(
+                            self.config.explainability.chem_ace_advanced_geom_persistence_max_atoms
+                        ),
+                        chem_ace_use_orca_descriptors=bool(
+                            self.config.explainability.chem_ace_use_orca_descriptors
+                        ),
+                        chem_ace_orca_descriptors_path=self.config.explainability.chem_ace_orca_descriptors_path,
+                        chem_ace_orca_conf_id_col=str(
+                            self.config.explainability.chem_ace_orca_conf_id_col
+                        ),
+                        chem_ace_orca_mol_id_col=str(
+                            self.config.explainability.chem_ace_orca_mol_id_col
+                        ),
+                        chem_ace_orca_descriptor_cols=tuple(
+                            self.config.explainability.chem_ace_orca_descriptor_cols
+                        ),
+                        chem_ace_orca_min_vectors_for_tagging=int(
+                            self.config.explainability.chem_ace_orca_min_vectors_for_tagging
+                        ),
+                        chem_ace_orca_z_threshold=float(
+                            self.config.explainability.chem_ace_orca_z_threshold
                         ),
                         lambda_vol_output_dir=self._suffix_output_dir(
                             base_dir=self.config.explainability.lambda_vol_output_dir,
@@ -1524,6 +1608,45 @@ def _parse_args(argv: Any | None = None):
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    ap.add_argument(
+        "--chem_ace_use_advanced_geom_topology",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable advanced geometry/topology descriptors from conformer coordinates.",
+    )
+    ap.add_argument("--chem_ace_advanced_geom_topology_max_patches", type=int, default=3000)
+    ap.add_argument("--chem_ace_advanced_geom_topology_min_atoms", type=int, default=4)
+    ap.add_argument("--chem_ace_advanced_geom_topology_max_torsion_paths", type=int, default=96)
+    ap.add_argument(
+        "--chem_ace_advanced_geom_use_convex_hull",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use convex-hull based surface/cavity proxies when scipy is available.",
+    )
+    ap.add_argument(
+        "--chem_ace_advanced_geom_use_persistent_homology",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use ripser-based H1 persistence features when ripser is available.",
+    )
+    ap.add_argument("--chem_ace_advanced_geom_persistence_max_atoms", type=int, default=48)
+    ap.add_argument(
+        "--chem_ace_use_orca_descriptors",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable optional external ORCA descriptor table integration for semantics.",
+    )
+    ap.add_argument("--chem_ace_orca_descriptors_path", default=None)
+    ap.add_argument("--chem_ace_orca_conf_id_col", default="conf_id")
+    ap.add_argument("--chem_ace_orca_mol_id_col", default="ID")
+    ap.add_argument(
+        "--chem_ace_orca_descriptor_cols",
+        nargs="+",
+        default=[],
+        help="Optional explicit ORCA descriptor columns; defaults to all numeric non-ID columns.",
+    )
+    ap.add_argument("--chem_ace_orca_min_vectors_for_tagging", type=int, default=8)
+    ap.add_argument("--chem_ace_orca_z_threshold", type=float, default=0.50)
     ap.add_argument("--lambda_vol_output_dir", default=None)
     ap.add_argument("--lambda_vol_db_uri", default=None)
     ap.add_argument("--lambda_vol_layer_name", default="mixer_post_norm")

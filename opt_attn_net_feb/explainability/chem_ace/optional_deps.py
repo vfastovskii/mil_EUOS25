@@ -44,6 +44,24 @@ def has_openbabel_pybel() -> bool:
         return False
 
 
+def has_scipy() -> bool:
+    """Return True when scipy is importable."""
+    try:
+        import_module("scipy")
+        return True
+    except Exception:
+        return False
+
+
+def has_ripser() -> bool:
+    """Return True when ripser is importable."""
+    try:
+        import_module("ripser")
+        return True
+    except Exception:
+        return False
+
+
 def require_rdkit() -> ModuleType:
     """Import and return the RDKit root module or raise a clear error."""
     return _import_module("rdkit", "pip install rdkit")
@@ -67,13 +85,27 @@ def require_openbabel_pybel() -> ModuleType:
     )
 
 
+def require_scipy() -> ModuleType:
+    """Import and return scipy module or raise a clear error."""
+    return _import_module("scipy", "pip install scipy")
+
+
+def require_ripser() -> ModuleType:
+    """Import and return ripser module or raise a clear error."""
+    return _import_module("ripser", "pip install ripser")
+
+
 __all__ = [
     "OptionalDependencyError",
     "has_hdbscan",
     "has_openbabel_pybel",
+    "has_ripser",
     "has_rdkit",
+    "has_scipy",
     "require_hdbscan",
     "require_openbabel_pybel",
+    "require_ripser",
     "require_rdkit",
+    "require_scipy",
     "require_sqlalchemy",
 ]

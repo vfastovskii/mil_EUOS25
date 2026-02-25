@@ -1,26 +1,346 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha1
 import json
 import logging
+import math
 from pathlib import Path
 import re
 import time
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 import numpy as np
+import pandas as pd
 
 from ..config import SemanticTaggingConfig
 from ..optional_deps import (
     OptionalDependencyError,
+    has_ripser,
+    has_scipy,
     require_openbabel_pybel,
+    require_ripser,
     require_rdkit,
+    require_scipy,
 )
 from ..types import PatchRecord, TagAssignment
 from .naming import NamingRegistry, choose_label
 from ....utils.progress import log_event
 
 logger = logging.getLogger(__name__)
+
+
+_VDW_RADII: Mapping[int, float] = {
+    1: 1.20,   # H
+    6: 1.70,   # C
+    7: 1.55,   # N
+    8: 1.52,   # O
+    9: 1.47,   # F
+    15: 1.80,  # P
+    16: 1.80,  # S
+    17: 1.75,  # Cl
+    35: 1.85,  # Br
+    53: 1.98,  # I
+}
+
+
+@dataclass(frozen=True)
+class AdvancedGeometryTopologyConfig:
+    """Controls optional geometry/topology descriptor extraction for semantic tagging."""
+
+    enabled: bool = True
+    max_patches: int = 3000
+    min_atoms: int = 4
+    max_torsion_paths: int = 96
+    use_convex_hull: bool = True
+    use_persistent_homology: bool = True
+    persistence_max_atoms: int = 48
+
+
+def select_patch_ids_for_advanced(
+    *,
+    patch_ids: Sequence[str],
+    max_patches: int,
+) -> set[str]:
+    """Deterministically downsample patch IDs for advanced geometry computations."""
+    cap = int(max(0, max_patches))
+    if cap <= 0 or len(patch_ids) <= cap:
+        return {str(x) for x in patch_ids}
+
+    ranked: list[tuple[str, str]] = []
+    for pid in patch_ids:
+        p = str(pid)
+        h = sha1(f"chemace_adv_geom_v1|{p}".encode("utf-8")).hexdigest()
+        ranked.append((h, p))
+    ranked.sort(key=lambda x: x[0])
+    return {p for _, p in ranked[:cap]}
+
+
+def compute_patch_advanced_metrics(
+    *,
+    coords: np.ndarray,
+    atom_numbers: Sequence[int],
+    adjacency: Mapping[int, Sequence[int]],
+    config: AdvancedGeometryTopologyConfig,
+) -> dict[str, float]:
+    """Compute advanced geometry/topology metrics for one patch."""
+    arr = np.asarray(coords, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        return {}
+    n_atoms = int(arr.shape[0])
+    if n_atoms < int(max(3, config.min_atoms)):
+        return {}
+
+    centered = arr - np.mean(arr, axis=0, keepdims=True)
+    sq_norm = np.sum(np.square(centered), axis=1)
+    radius_gyration = float(np.sqrt(np.mean(sq_norm)))
+
+    cov = np.matmul(centered.T, centered) / float(max(1, n_atoms))
+    eig = np.linalg.eigvalsh(cov)
+    eig = np.asarray(np.maximum(eig, 0.0), dtype=np.float64)
+    eig.sort()
+    lam3, lam2, lam1 = float(eig[0]), float(eig[1]), float(eig[2])
+    denom = float(max(1e-8, lam1 + lam2 + lam3))
+    shape_anisotropy = float((lam1 - lam3) / max(1e-8, lam1))
+    shape_asphericity = float(lam1 - 0.5 * (lam2 + lam3))
+    shape_acylindricity = float(lam2 - lam3)
+    shape_planarity_index = float(lam3 / max(1e-8, lam1))
+    shape_compactness = float((lam1 * lam2 * lam3) ** (1.0 / 3.0) / max(1e-8, denom / 3.0))
+
+    edges = int(sum(len(v) for v in adjacency.values()) // 2)
+    components = int(_count_components(adjacency=adjacency, n_nodes=n_atoms))
+    cycle_rank = float(max(0, edges - n_atoms + components))
+
+    torsion_angles = _sample_dihedral_angles(
+        coords=arr,
+        adjacency=adjacency,
+        max_paths=int(max(1, config.max_torsion_paths)),
+    )
+    torsion_entropy = float(0.0)
+    torsion_abs_mean = float(0.0)
+    if torsion_angles.size > 0:
+        torsion_abs_mean = float(np.mean(np.abs(torsion_angles)) / math.pi)
+        hist, _ = np.histogram(torsion_angles, bins=12, range=(-math.pi, math.pi), density=False)
+        probs = hist.astype(np.float64)
+        probs = probs / float(max(1.0, float(np.sum(probs))))
+        nz = probs[probs > 0.0]
+        if nz.size > 0:
+            torsion_entropy = float(-np.sum(nz * np.log(nz)) / math.log(12.0))
+
+    hull_volume = float("nan")
+    hull_area = float("nan")
+    hull_surface_volume_ratio = float("nan")
+    cavity_void_fraction = float("nan")
+    packing_fraction = float("nan")
+    point_density = float("nan")
+    if bool(config.use_convex_hull) and n_atoms >= 4 and has_scipy():
+        try:
+            scipy_mod = require_scipy()
+            hull = scipy_mod.spatial.ConvexHull(arr)
+            hull_volume = float(hull.volume)
+            hull_area = float(hull.area)
+            if np.isfinite(hull_volume) and hull_volume > 1e-8:
+                hull_surface_volume_ratio = float(hull_area / hull_volume)
+                point_density = float(n_atoms / hull_volume)
+                vdw_vol = float(_vdw_volume(atom_numbers))
+                packing_fraction = float(np.clip(vdw_vol / hull_volume, 0.0, 1.0))
+                cavity_void_fraction = float(np.clip(1.0 - packing_fraction, 0.0, 1.0))
+        except Exception:
+            pass
+
+    h1_count = float(cycle_rank)
+    h1_persistence_sum = float(cycle_rank)
+    h1_persistence_max = float(cycle_rank)
+    if (
+        bool(config.use_persistent_homology)
+        and has_ripser()
+        and n_atoms <= int(max(4, config.persistence_max_atoms))
+    ):
+        try:
+            ripser_mod = require_ripser()
+            dmat = _pairwise_distances(arr)
+            out = ripser_mod.ripser(dmat, maxdim=1, distance_matrix=True)
+            dgms = out.get("dgms", [])
+            h1 = np.asarray(dgms[1], dtype=np.float64) if len(dgms) > 1 else np.zeros((0, 2), dtype=np.float64)
+            if h1.size > 0:
+                birth = h1[:, 0]
+                death = h1[:, 1]
+                finite = np.isfinite(birth) & np.isfinite(death) & (death > birth)
+                life = death[finite] - birth[finite]
+                if life.size > 0:
+                    h1_count = float(life.size)
+                    h1_persistence_sum = float(np.sum(life))
+                    h1_persistence_max = float(np.max(life))
+                else:
+                    h1_count = 0.0
+                    h1_persistence_sum = 0.0
+                    h1_persistence_max = 0.0
+            else:
+                h1_count = 0.0
+                h1_persistence_sum = 0.0
+                h1_persistence_max = 0.0
+        except Exception:
+            pass
+
+    return {
+        "n_atoms": float(n_atoms),
+        "radius_gyration": float(radius_gyration),
+        "shape_anisotropy": float(shape_anisotropy),
+        "shape_asphericity": float(shape_asphericity),
+        "shape_acylindricity": float(shape_acylindricity),
+        "shape_planarity_index": float(shape_planarity_index),
+        "shape_compactness": float(shape_compactness),
+        "cycle_rank": float(cycle_rank),
+        "torsion_entropy_norm": float(torsion_entropy),
+        "torsion_abs_mean": float(torsion_abs_mean),
+        "hull_volume": float(hull_volume),
+        "hull_area": float(hull_area),
+        "hull_surface_volume_ratio": float(hull_surface_volume_ratio),
+        "cavity_void_fraction": float(cavity_void_fraction),
+        "packing_fraction": float(packing_fraction),
+        "point_density": float(point_density),
+        "h1_count": float(h1_count),
+        "h1_persistence_sum": float(h1_persistence_sum),
+        "h1_persistence_max": float(h1_persistence_max),
+    }
+
+
+def summarize_advanced_metrics(rows: Sequence[Mapping[str, float]]) -> dict[str, Any]:
+    """Aggregate advanced geometry/topology metrics into a JSON-friendly summary."""
+    if len(rows) == 0:
+        return {
+            "enabled": True,
+            "n_patches_evaluated": 0,
+            "metrics": {},
+        }
+
+    keys: set[str] = set()
+    for row in rows:
+        for k in row.keys():
+            keys.add(str(k))
+
+    metrics: dict[str, dict[str, float]] = {}
+    for key in sorted(keys):
+        vals = [float(row.get(key, float("nan"))) for row in rows]
+        arr = np.asarray(vals, dtype=np.float64)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            continue
+        q = np.quantile(arr, [0.1, 0.5, 0.9])
+        mean = float(np.mean(arr))
+        std = float(np.std(arr))
+        cv = float(std / (abs(mean) + 1e-8))
+        metrics[str(key)] = {
+            "mean": mean,
+            "std": std,
+            "cv": cv,
+            "min": float(np.min(arr)),
+            "q10": float(q[0]),
+            "median": float(q[1]),
+            "q90": float(q[2]),
+            "max": float(np.max(arr)),
+        }
+
+    return {
+        "enabled": True,
+        "n_patches_evaluated": int(len(rows)),
+        "metrics": metrics,
+    }
+
+
+def _count_components(*, adjacency: Mapping[int, Sequence[int]], n_nodes: int) -> int:
+    seen: set[int] = set()
+    components = 0
+    for node in range(int(n_nodes)):
+        if node in seen:
+            continue
+        components += 1
+        stack = [int(node)]
+        while stack:
+            cur = int(stack.pop())
+            if cur in seen:
+                continue
+            seen.add(cur)
+            for nxt in adjacency.get(cur, ()):
+                ni = int(nxt)
+                if ni not in seen:
+                    stack.append(ni)
+    return int(components)
+
+
+def _sample_dihedral_angles(
+    *,
+    coords: np.ndarray,
+    adjacency: Mapping[int, Sequence[int]],
+    max_paths: int,
+) -> np.ndarray:
+    n = int(coords.shape[0])
+    if n < 4:
+        return np.zeros((0,), dtype=np.float64)
+
+    seen_paths: set[tuple[int, int, int, int]] = set()
+    angles: list[float] = []
+
+    for j in range(n):
+        nbr_j = [int(x) for x in adjacency.get(j, ())]
+        for k in nbr_j:
+            if j >= k:
+                continue
+            left = [i for i in nbr_j if int(i) != int(k)]
+            right = [l for l in adjacency.get(k, ()) if int(l) != int(j)]
+            for i in left:
+                for l in right:
+                    ii, jj, kk, ll = int(i), int(j), int(k), int(l)
+                    if ii == ll:
+                        continue
+                    p = (ii, jj, kk, ll)
+                    pr = (ll, kk, jj, ii)
+                    key = p if p <= pr else pr
+                    if key in seen_paths:
+                        continue
+                    seen_paths.add(key)
+                    angle = _dihedral(coords[ii], coords[jj], coords[kk], coords[ll])
+                    if np.isfinite(angle):
+                        angles.append(float(angle))
+                    if len(angles) >= int(max_paths):
+                        return np.asarray(angles, dtype=np.float64)
+    return np.asarray(angles, dtype=np.float64)
+
+
+def _dihedral(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> float:
+    b0 = p1 - p0
+    b1 = p2 - p1
+    b2 = p3 - p2
+
+    n1 = np.cross(b0, b1)
+    n2 = np.cross(b1, b2)
+    n1n = np.linalg.norm(n1)
+    n2n = np.linalg.norm(n2)
+    b1n = np.linalg.norm(b1)
+    if n1n <= 1e-12 or n2n <= 1e-12 or b1n <= 1e-12:
+        return float("nan")
+
+    n1 = n1 / n1n
+    n2 = n2 / n2n
+    m1 = np.cross(n1, b1 / b1n)
+    x = float(np.dot(n1, n2))
+    y = float(np.dot(m1, n2))
+    return float(np.arctan2(y, x))
+
+
+def _pairwise_distances(x: np.ndarray) -> np.ndarray:
+    diff = x[:, None, :] - x[None, :, :]
+    sq = np.sum(np.square(diff), axis=-1)
+    np.maximum(sq, 0.0, out=sq)
+    return np.sqrt(sq).astype(np.float64, copy=False)
+
+
+def _vdw_volume(atom_numbers: Sequence[int]) -> float:
+    vol = 0.0
+    for z in atom_numbers:
+        r = float(_VDW_RADII.get(int(z), 1.70))
+        vol += (4.0 / 3.0) * math.pi * (r ** 3)
+    return float(vol)
 
 
 @dataclass(frozen=True)
@@ -130,6 +450,21 @@ class SemanticTagger:
         "quadrupole": ("quadrupole", "quad_norm", "quad_trace"),
     }
 
+    _ORCA_FAMILY_TOKENS: Mapping[str, tuple[str, ...]] = {
+        "homo": ("homo", "ehomo"),
+        "lumo": ("lumo", "elumo"),
+        "gap": ("gap", "homo_lumo", "deltae"),
+        "excitation_energy": ("exc", "s1", "t1", "vertical_exc", "transition_energy"),
+        "oscillator_strength": ("fosc", "osc", "oscillator", "f_"),
+        "transition_dipole": ("transition_dipole", "tdm", "mu_trans"),
+        "singlet_triplet_gap": ("s1_t1", "delta_st", "singlet_triplet"),
+        "spin_orbit": ("soc", "spin_orbit"),
+        "charge_transfer_excited": ("ct_exc", "charge_transfer_excited", "excited_ct", "nto"),
+        "reorganization_energy": ("reorg", "lambda_reorg"),
+        "radiative_rate": ("kr", "radiative_rate"),
+        "nonradiative_rate": ("knr", "nonradiative_rate"),
+    }
+
     def __init__(self, config: SemanticTaggingConfig):
         self.config = config
         self.registry = self._load_naming_registry(config.naming_rules_path)
@@ -140,6 +475,21 @@ class SemanticTagger:
         )
         self.smarts_rx_rules = self._load_smarts_rx_rules(config.smarts_rx_rules_path)
         self._smarts_rx_patterns = self._compile_smarts_rx_patterns(self.smarts_rx_rules)
+        self._advanced_geom_cfg = AdvancedGeometryTopologyConfig(
+            enabled=bool(self.config.use_advanced_geom_topology),
+            max_patches=int(self.config.advanced_geom_topology_max_patches),
+            min_atoms=int(self.config.advanced_geom_topology_min_atoms),
+            max_torsion_paths=int(self.config.advanced_geom_topology_max_torsion_paths),
+            use_convex_hull=bool(self.config.advanced_geom_use_convex_hull),
+            use_persistent_homology=bool(self.config.advanced_geom_use_persistent_homology),
+            persistence_max_atoms=int(self.config.advanced_geom_persistence_max_atoms),
+        )
+        (
+            self._orca_vectors_by_conf_id,
+            self._orca_vectors_by_mol_id,
+            self._orca_feature_names,
+            self._orca_enabled,
+        ) = self._load_orca_descriptor_index()
         self._openbabel_pybel = self._init_openbabel_backend()
 
     @staticmethod
@@ -349,6 +699,158 @@ class SemanticTagger:
             logger.info("Open Babel pybel is unavailable; skipping Open Babel semantic descriptors")
             return None
 
+    def _load_orca_descriptor_index(
+        self,
+    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], tuple[str, ...], bool]:
+        """
+        Load optional external ORCA descriptors and build conf/molecule lookup maps.
+
+        Expected table columns:
+        - conf identifier (default: `conf_id`)
+        - molecule identifier (default: `ID`)
+        - numeric ORCA descriptor columns (auto-inferred or explicitly listed)
+        """
+        if not bool(self.config.use_orca_descriptors):
+            log_event(
+                "INFO",
+                "explainability.chem_ace.tag_concepts.orca",
+                enabled=False,
+                reason="disabled_by_config",
+            )
+            return {}, {}, (), False
+
+        path_raw = self.config.orca_descriptors_path
+        if path_raw is None or not str(path_raw).strip():
+            log_event(
+                "WARN",
+                "explainability.chem_ace.tag_concepts.orca",
+                enabled=False,
+                reason="missing_orca_descriptors_path",
+            )
+            return {}, {}, (), False
+
+        path = Path(str(path_raw))
+        if not path.exists():
+            log_event(
+                "WARN",
+                "explainability.chem_ace.tag_concepts.orca",
+                enabled=False,
+                reason="orca_descriptors_path_not_found",
+                path=str(path),
+            )
+            return {}, {}, (), False
+
+        try:
+            suffix = path.suffix.lower()
+            if suffix in {".parquet", ".pq"}:
+                df = pd.read_parquet(path)
+            elif suffix in {".json"}:
+                df = pd.read_json(path)
+            else:
+                df = pd.read_csv(path)
+        except Exception as exc:
+            log_event(
+                "WARN",
+                "explainability.chem_ace.tag_concepts.orca",
+                enabled=False,
+                reason="read_failed",
+                path=str(path),
+                error=repr(exc),
+            )
+            return {}, {}, (), False
+
+        if df.empty:
+            log_event(
+                "WARN",
+                "explainability.chem_ace.tag_concepts.orca",
+                enabled=False,
+                reason="empty_table",
+                path=str(path),
+            )
+            return {}, {}, (), False
+
+        conf_col = str(self.config.orca_conf_id_col)
+        mol_col = str(self.config.orca_mol_id_col)
+        explicit_cols = [str(x) for x in self.config.orca_descriptor_cols if str(x).strip()]
+
+        work = df.copy()
+        for col in (conf_col, mol_col):
+            if col in work.columns:
+                work[col] = work[col].astype(str)
+                work.loc[work[col].str.lower().isin(["", "nan", "none"]), col] = ""
+
+        if len(explicit_cols) > 0:
+            descriptor_cols = [c for c in explicit_cols if c in work.columns]
+        else:
+            descriptor_cols = []
+            for col in work.columns:
+                if col in {conf_col, mol_col}:
+                    continue
+                try:
+                    series = pd.to_numeric(work[col], errors="coerce")
+                except Exception:
+                    continue
+                if int(series.notna().sum()) <= 0:
+                    continue
+                descriptor_cols.append(str(col))
+
+        if len(descriptor_cols) == 0:
+            log_event(
+                "WARN",
+                "explainability.chem_ace.tag_concepts.orca",
+                enabled=False,
+                reason="no_numeric_descriptor_columns",
+                path=str(path),
+            )
+            return {}, {}, (), False
+
+        mat = np.asarray(
+            work[descriptor_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64),
+            dtype=np.float64,
+        )
+        med = np.nanmedian(mat, axis=0)
+        q25 = np.nanpercentile(mat, 25.0, axis=0)
+        q75 = np.nanpercentile(mat, 75.0, axis=0)
+        iqr = q75 - q25
+        iqr = np.where(np.isfinite(iqr) & (np.abs(iqr) > 1e-12), iqr, 1.0)
+        z = (mat - med.reshape(1, -1)) / iqr.reshape(1, -1)
+        z = np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+        by_conf: dict[str, np.ndarray] = {}
+        by_mol_lists: dict[str, list[np.ndarray]] = {}
+        for i in range(int(z.shape[0])):
+            vec = np.asarray(z[i], dtype=np.float32)
+            conf_id = ""
+            mol_id = ""
+            if conf_col in work.columns:
+                conf_id = str(work.iloc[i][conf_col]).strip()
+            if mol_col in work.columns:
+                mol_id = str(work.iloc[i][mol_col]).strip()
+            if conf_id:
+                by_conf.setdefault(conf_id, vec)
+            if mol_id:
+                if mol_id not in by_mol_lists:
+                    by_mol_lists[mol_id] = []
+                by_mol_lists[mol_id].append(vec)
+
+        by_mol: dict[str, np.ndarray] = {}
+        for mol_id, vectors in by_mol_lists.items():
+            if len(vectors) == 0:
+                continue
+            by_mol[str(mol_id)] = np.mean(np.stack(vectors, axis=0), axis=0).astype(np.float32)
+
+        log_event(
+            "INFO",
+            "explainability.chem_ace.tag_concepts.orca",
+            enabled=True,
+            path=str(path),
+            n_rows=int(z.shape[0]),
+            n_descriptor_cols=int(len(descriptor_cols)),
+            n_conf_indexed=int(len(by_conf)),
+            n_mol_indexed=int(len(by_mol)),
+        )
+        return by_conf, by_mol, tuple(str(c) for c in descriptor_cols), True
+
     def tag_concept(
         self,
         *,
@@ -386,8 +888,10 @@ class SemanticTagger:
         tags.extend(self._charge_tags(concept_id=concept_id, descriptors=descriptors))
         tags.extend(self._conjugation_tags(concept_id=concept_id, descriptors=descriptors))
         tags.extend(self._geometry_tags(concept_id=concept_id, descriptors=descriptors))
+        tags.extend(self._advanced_geometry_topology_tags(concept_id=concept_id, descriptors=descriptors))
         tags.extend(self._pharmacophore_tags(concept_id=concept_id, descriptors=descriptors))
         tags.extend(self._qm_tags(concept_id=concept_id, descriptors=descriptors))
+        tags.extend(self._orca_tags(concept_id=concept_id, descriptors=descriptors))
         tags.extend(self._openbabel_tags(concept_id=concept_id, descriptors=descriptors))
         tags.extend(self._cross_modal_tags(concept_id=concept_id, descriptors=descriptors))
         tags = self._deduplicate_tags(tags)
@@ -461,6 +965,12 @@ class SemanticTagger:
         rot_bond_counts: list[int] = []
         geom_vectors: list[np.ndarray] = []
         qm_vectors: list[np.ndarray] = []
+        orca_vectors: list[np.ndarray] = []
+        advanced_geom_rows: list[dict[str, float]] = []
+        advanced_selected_patch_ids = select_patch_ids_for_advanced(
+            patch_ids=[str(p.patch_id) for p in concept_patches],
+            max_patches=int(self._advanced_geom_cfg.max_patches),
+        )
 
         pharm_counts = {
             "Donor": 0,
@@ -578,15 +1088,17 @@ class SemanticTagger:
             heteroaromatic = any(a.GetIsAromatic() and a.GetAtomicNum() not in {1, 6} for a in atoms)
             heteroaromatic_flags.append(1 if heteroaromatic else 0)
 
+            conf_idx_patch: Optional[int] = None
+            coords_patch: Optional[np.ndarray] = None
             if mol.GetNumConformers() > 0 and len(atom_ids) >= 3:
-                conf_idx = self._resolve_conf_idx(mol=mol, conf_id=patch.conf_id)
-                if conf_idx is not None:
-                    conf = mol.GetConformer(int(conf_idx))
-                    coords = np.asarray(
+                conf_idx_patch = self._resolve_conf_idx(mol=mol, conf_id=patch.conf_id)
+                if conf_idx_patch is not None:
+                    conf = mol.GetConformer(int(conf_idx_patch))
+                    coords_patch = np.asarray(
                         [[conf.GetAtomPosition(i).x, conf.GetAtomPosition(i).y, conf.GetAtomPosition(i).z] for i in atom_ids],
                         dtype=np.float64,
                     )
-                    planarity_rmsd.append(float(self._planarity_rmsd(coords)))
+                    planarity_rmsd.append(float(self._planarity_rmsd(coords_patch)))
                 else:
                     planarity_rmsd.append(float("nan"))
             elif len(atom_ids) >= 3:
@@ -711,6 +1223,29 @@ class SemanticTagger:
                 geom_vectors.append(geom_vec.astype(np.float32, copy=False))
             if qm_vec is not None and qm_vec.size > 0:
                 qm_vectors.append(qm_vec.astype(np.float32, copy=False))
+            orca_vec = self._resolve_orca_vector_for_patch(patch=patch)
+            if orca_vec is not None and orca_vec.size > 0:
+                orca_vectors.append(orca_vec.astype(np.float32, copy=False))
+
+            if (
+                bool(self._advanced_geom_cfg.enabled)
+                and (str(patch.patch_id) in advanced_selected_patch_ids)
+                and (coords_patch is not None)
+                and (coords_patch.shape[0] >= int(max(3, self._advanced_geom_cfg.min_atoms)))
+            ):
+                local_adj = self._build_local_patch_adjacency(
+                    atom_indices=atom_ids,
+                    patch_bonds=patch_bonds,
+                )
+                atom_numbers = [int(a.GetAtomicNum()) for a in atoms]
+                adv = compute_patch_advanced_metrics(
+                    coords=coords_patch,
+                    atom_numbers=atom_numbers,
+                    adjacency=local_adj,
+                    config=self._advanced_geom_cfg,
+                )
+                if len(adv) > 0:
+                    advanced_geom_rows.append(adv)
             if emit_progress and ((done % progress_every) == 0 or done == n_patches):
                 log_event(
                     "PROGRESS",
@@ -720,6 +1255,7 @@ class SemanticTagger:
                     total=n_patches,
                     pct=f"{(100.0 * done / max(1, n_patches)):.1f}",
                     valid_patches=int(valid_patch_count),
+                    advanced_samples=int(len(advanced_geom_rows)),
                 )
 
         functional_patch_rate = {
@@ -746,6 +1282,10 @@ class SemanticTagger:
             qm_vectors=qm_vectors,
             qm_feature_names=qm_names,
         )
+        orca_summary = self._summarize_orca_vectors(
+            orca_vectors=orca_vectors,
+        )
+        advanced_geom_topology_summary = summarize_advanced_metrics(advanced_geom_rows)
         log_event(
             "INFO",
             "explainability.chem_ace.tag_concepts.compute_descriptors.summary",
@@ -757,6 +1297,8 @@ class SemanticTagger:
             smarts_rx_overlap_hits=int(smarts_rx_overlap_hits_total),
             geom_vectors=int(len(geom_vectors)),
             qm_vectors=int(len(qm_vectors)),
+            orca_vectors=int(len(orca_vectors)),
+            advanced_geom_patches=int(len(advanced_geom_rows)),
         )
         if self._openbabel_pybel is not None:
             log_event(
@@ -808,6 +1350,8 @@ class SemanticTagger:
             "smarts_rx_role_rate": smarts_rx_role_rate,
             "geom_summary": geom_summary,
             "qm_summary": qm_summary,
+            "orca_summary": orca_summary,
+            "advanced_geometry_topology": advanced_geom_topology_summary,
             "openbabel_descriptor_summary": openbabel_summary,
         }
         log_event(
@@ -844,6 +1388,30 @@ class SemanticTagger:
             fallback_prefix="qm",
             family_tokens=self._QM_FAMILY_TOKENS,
         )
+
+    def _summarize_orca_vectors(
+        self,
+        *,
+        orca_vectors: Sequence[np.ndarray],
+    ) -> dict[str, Any]:
+        return self._summarize_vector_block(
+            vectors=orca_vectors,
+            feature_names=self._orca_feature_names,
+            fallback_prefix="orca",
+            family_tokens=self._ORCA_FAMILY_TOKENS,
+        )
+
+    def _resolve_orca_vector_for_patch(self, *, patch: PatchRecord) -> Optional[np.ndarray]:
+        if not bool(self._orca_enabled):
+            return None
+        if patch.conf_id is not None:
+            vec = self._orca_vectors_by_conf_id.get(str(patch.conf_id))
+            if vec is not None:
+                return np.asarray(vec, dtype=np.float32).reshape(-1)
+        vec = self._orca_vectors_by_mol_id.get(str(patch.mol_id))
+        if vec is not None:
+            return np.asarray(vec, dtype=np.float32).reshape(-1)
+        return None
 
     def _summarize_vector_block(
         self,
@@ -1242,6 +1810,95 @@ class SemanticTagger:
 
         return tags
 
+    def _advanced_geometry_topology_tags(self, *, concept_id: str, descriptors: Mapping[str, Any]) -> list[TagAssignment]:
+        ag = descriptors.get("advanced_geometry_topology", {})
+        if not isinstance(ag, Mapping):
+            return []
+        if int(ag.get("n_patches_evaluated", 0)) <= 0:
+            return []
+
+        metrics = ag.get("metrics", {})
+        if not isinstance(metrics, Mapping):
+            return []
+
+        def m(name: str, key: str = "mean") -> float:
+            row = metrics.get(name, {})
+            if isinstance(row, Mapping):
+                return float(row.get(key, 0.0))
+            return 0.0
+
+        tags: list[TagAssignment] = []
+        anis = m("shape_anisotropy")
+        torsion_ent = m("torsion_entropy_norm")
+        cycle_rank = m("cycle_rank")
+        h1_sum = m("h1_persistence_sum")
+        void_frac = m("cavity_void_fraction")
+        sv_ratio = m("hull_surface_volume_ratio")
+        packing = m("packing_fraction")
+        rg_cv = m("radius_gyration", "cv")
+
+        if anis >= 0.55:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "anisotropic 3D shape envelope",
+                    min(1.0, 0.55 + 0.25 * anis),
+                    "advanced_geometry_topology_tagger",
+                    descriptors,
+                )
+            )
+        if torsion_ent >= 0.45 or rg_cv >= 0.45:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "torsionally diverse conformer ensemble",
+                    min(1.0, 0.55 + 0.22 * max(torsion_ent, rg_cv)),
+                    "advanced_geometry_topology_tagger",
+                    descriptors,
+                )
+            )
+        if cycle_rank >= 1.0 or h1_sum >= 0.8:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "loop-rich topology",
+                    min(1.0, 0.55 + 0.20 * max(cycle_rank, h1_sum)),
+                    "advanced_geometry_topology_tagger",
+                    descriptors,
+                )
+            )
+        if np.isfinite(void_frac) and void_frac >= 0.15:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "cavity-prone geometry",
+                    min(1.0, 0.55 + 0.30 * void_frac),
+                    "advanced_geometry_topology_tagger",
+                    descriptors,
+                )
+            )
+        if np.isfinite(sv_ratio) and sv_ratio >= 2.4:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "high-curvature molecular surface",
+                    min(1.0, 0.55 + 0.05 * (sv_ratio - 2.4)),
+                    "advanced_geometry_topology_tagger",
+                    descriptors,
+                )
+            )
+        if np.isfinite(packing) and packing >= 0.82:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "densely packed local geometry",
+                    min(1.0, 0.55 + 0.30 * packing),
+                    "advanced_geometry_topology_tagger",
+                    descriptors,
+                )
+            )
+        return tags
+
     def _pharmacophore_tags(self, *, concept_id: str, descriptors: Mapping[str, Any]) -> list[TagAssignment]:
         tags: list[TagAssignment] = []
         counts = descriptors.get("pharmacophore_counts", {})
@@ -1506,6 +2163,108 @@ class SemanticTagger:
 
         return tags
 
+    def _orca_tags(self, *, concept_id: str, descriptors: Mapping[str, Any]) -> list[TagAssignment]:
+        osum = descriptors.get("orca_summary", {})
+        if not isinstance(osum, Mapping):
+            return []
+        n_vectors = int(osum.get("n_vectors", 0))
+        if n_vectors < int(self.config.orca_min_vectors_for_tagging):
+            return []
+
+        family_stats = osum.get("family_stats", {})
+        if not isinstance(family_stats, Mapping):
+            family_stats = {}
+        thr = float(self.config.orca_z_threshold)
+
+        def fam(name: str) -> Mapping[str, Any]:
+            item = family_stats.get(name, {})
+            if isinstance(item, Mapping):
+                return item
+            return {}
+
+        tags: list[TagAssignment] = []
+        fosc_abs = float(fam("oscillator_strength").get("abs_z_mean", 0.0))
+        fosc_mean = float(fam("oscillator_strength").get("z_mean", 0.0))
+        eexc_abs = float(fam("excitation_energy").get("abs_z_mean", 0.0))
+        eexc_mean = float(fam("excitation_energy").get("z_mean", 0.0))
+        st_abs = float(fam("singlet_triplet_gap").get("abs_z_mean", 0.0))
+        soc_abs = float(fam("spin_orbit").get("abs_z_mean", 0.0))
+        ctex_abs = float(fam("charge_transfer_excited").get("abs_z_mean", 0.0))
+        kr_abs = float(fam("radiative_rate").get("abs_z_mean", 0.0))
+        knr_abs = float(fam("nonradiative_rate").get("abs_z_mean", 0.0))
+
+        if fosc_abs >= thr and fosc_mean >= 0.0:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "bright excited-state manifold",
+                    min(1.0, 0.55 + 0.22 * fosc_abs),
+                    "orca_descriptor_tagger",
+                    descriptors,
+                )
+            )
+        if eexc_abs >= thr and eexc_mean <= -thr:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "low-energy excitation profile",
+                    min(1.0, 0.55 + 0.20 * eexc_abs),
+                    "orca_descriptor_tagger",
+                    descriptors,
+                )
+            )
+        if ctex_abs >= thr:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "excited-state charge-transfer motif",
+                    min(1.0, 0.55 + 0.20 * ctex_abs),
+                    "orca_descriptor_tagger",
+                    descriptors,
+                )
+            )
+        if st_abs >= thr:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "singlet-triplet split electronic manifold",
+                    min(1.0, 0.55 + 0.18 * st_abs),
+                    "orca_descriptor_tagger",
+                    descriptors,
+                )
+            )
+        if soc_abs >= thr:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "spin-orbit coupled transition channel",
+                    min(1.0, 0.55 + 0.18 * soc_abs),
+                    "orca_descriptor_tagger",
+                    descriptors,
+                )
+            )
+        if kr_abs >= thr and knr_abs < thr:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "radiative-decay-favored excited state",
+                    min(1.0, 0.55 + 0.16 * kr_abs),
+                    "orca_descriptor_tagger",
+                    descriptors,
+                )
+            )
+        if knr_abs >= thr and kr_abs < thr:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "nonradiative-decay-favored excited state",
+                    min(1.0, 0.55 + 0.16 * knr_abs),
+                    "orca_descriptor_tagger",
+                    descriptors,
+                )
+            )
+        return tags
+
     def _openbabel_tags(self, *, concept_id: str, descriptors: Mapping[str, Any]) -> list[TagAssignment]:
         ob = descriptors.get("openbabel_descriptor_summary", {})
         if not isinstance(ob, Mapping):
@@ -1541,6 +2300,9 @@ class SemanticTagger:
         gms = descriptors.get("geom_summary", {})
         if not isinstance(gms, Mapping):
             gms = {}
+        orca = descriptors.get("orca_summary", {})
+        if not isinstance(orca, Mapping):
+            orca = {}
 
         qfam = qms.get("family_stats", {})
         if not isinstance(qfam, Mapping):
@@ -1548,6 +2310,9 @@ class SemanticTagger:
         gfam = gms.get("family_stats", {})
         if not isinstance(gfam, Mapping):
             gfam = {}
+        ofam = orca.get("family_stats", {})
+        if not isinstance(ofam, Mapping):
+            ofam = {}
 
         def qfam_stat(name: str) -> Mapping[str, Any]:
             item = qfam.get(name, {})
@@ -1557,6 +2322,12 @@ class SemanticTagger:
 
         def gfam_stat(name: str) -> Mapping[str, Any]:
             item = gfam.get(name, {})
+            if isinstance(item, Mapping):
+                return item
+            return {}
+
+        def ofam_stat(name: str) -> Mapping[str, Any]:
+            item = ofam.get(name, {})
             if isinstance(item, Mapping):
                 return item
             return {}
@@ -1669,6 +2440,54 @@ class SemanticTagger:
                     "blue-shifted transparency proxy",
                     min(1.0, 0.55 + 0.10 * (gap_mean + gap_abs)),
                     "photophysics_proxy_tagger",
+                    descriptors,
+                )
+            )
+
+        # Cross-link explicit excited-state ORCA semantics with structure/geometry.
+        fosc_abs = float(ofam_stat("oscillator_strength").get("abs_z_mean", 0.0))
+        ex_abs = float(ofam_stat("excitation_energy").get("abs_z_mean", 0.0))
+        ex_mean = float(ofam_stat("excitation_energy").get("z_mean", 0.0))
+        ctex_abs = float(ofam_stat("charge_transfer_excited").get("abs_z_mean", 0.0))
+        st_abs = float(ofam_stat("singlet_triplet_gap").get("abs_z_mean", 0.0))
+        soc_abs = float(ofam_stat("spin_orbit").get("abs_z_mean", 0.0))
+        if aromatic >= float(self.config.aromatic_fraction_threshold) and planar >= thr_g and fosc_abs >= float(self.config.orca_z_threshold):
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "planar aromatic bright-state motif",
+                    min(1.0, 0.55 + 0.12 * (aromatic + planar + fosc_abs)),
+                    "cross_modal_orca_tagger",
+                    descriptors,
+                )
+            )
+        if ctex_abs >= float(self.config.orca_z_threshold) and dip_abs >= thr_q:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "charge-transfer dipolar excited-state motif",
+                    min(1.0, 0.55 + 0.12 * (ctex_abs + dip_abs)),
+                    "cross_modal_orca_tagger",
+                    descriptors,
+                )
+            )
+        if ex_abs >= float(self.config.orca_z_threshold) and ex_mean <= -float(self.config.orca_z_threshold) and bo_conj_abs >= thr_q:
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "conjugation-driven low-energy excitation motif",
+                    min(1.0, 0.55 + 0.10 * (ex_abs + bo_conj_abs)),
+                    "cross_modal_orca_tagger",
+                    descriptors,
+                )
+            )
+        if st_abs >= float(self.config.orca_z_threshold) and soc_abs >= float(self.config.orca_z_threshold):
+            tags.append(
+                self._mk_tag(
+                    concept_id,
+                    "spin-mixed singlet-triplet manifold",
+                    min(1.0, 0.55 + 0.10 * (st_abs + soc_abs)),
+                    "cross_modal_orca_tagger",
                     descriptors,
                 )
             )
@@ -1799,6 +2618,29 @@ class SemanticTagger:
         return geom_out, qm_out
 
     @staticmethod
+    def _build_local_patch_adjacency(
+        *,
+        atom_indices: Sequence[int],
+        patch_bonds: Sequence[Any],
+    ) -> dict[int, list[int]]:
+        """
+        Build local 0..(n-1) adjacency for a patch from molecule-level atom indices.
+        """
+        local_map = {int(g): int(i) for i, g in enumerate(atom_indices)}
+        out: dict[int, set[int]] = {int(i): set() for i in range(len(atom_indices))}
+        for b in patch_bonds:
+            try:
+                u = int(local_map[int(b.GetBeginAtomIdx())])
+                v = int(local_map[int(b.GetEndAtomIdx())])
+            except Exception:
+                continue
+            if u == v:
+                continue
+            out[u].add(v)
+            out[v].add(u)
+        return {int(k): sorted(int(x) for x in vals) for k, vals in out.items()}
+
+    @staticmethod
     def _largest_component_size(graph: Mapping[int, set[int]]) -> int:
         seen: set[int] = set()
         best = 0
@@ -1917,6 +2759,35 @@ class SemanticTagger:
                     reverse=True,
                 )
                 out.extend([name for name, score in ordered_gfam[:2] if score >= float(self.config.geom_z_threshold)])
+
+        ag = descriptors.get("advanced_geometry_topology", {})
+        if isinstance(ag, Mapping):
+            metrics = ag.get("metrics", {})
+            if isinstance(metrics, Mapping):
+                anis = metrics.get("shape_anisotropy", {})
+                if isinstance(anis, Mapping) and float(anis.get("mean", 0.0)) >= 0.55:
+                    out.append("anisotropic_3d_shape")
+                cavity = metrics.get("cavity_void_fraction", {})
+                if isinstance(cavity, Mapping) and float(cavity.get("mean", 0.0)) >= 0.15:
+                    out.append("cavity_prone")
+                topo = metrics.get("h1_persistence_sum", {})
+                if isinstance(topo, Mapping) and float(topo.get("mean", 0.0)) >= 0.8:
+                    out.append("loop_rich_topology")
+
+        osum = descriptors.get("orca_summary", {})
+        if isinstance(osum, Mapping):
+            ofam = osum.get("family_stats", {})
+            if isinstance(ofam, Mapping):
+                ordered_ofam = sorted(
+                    (
+                        (str(k), float(v.get("abs_z_mean", 0.0)))
+                        for k, v in ofam.items()
+                        if isinstance(v, Mapping)
+                    ),
+                    key=lambda x: x[1],
+                    reverse=True,
+                )
+                out.extend([name for name, score in ordered_ofam[:2] if score >= float(self.config.orca_z_threshold)])
 
         if not out:
             out.append("mixed")

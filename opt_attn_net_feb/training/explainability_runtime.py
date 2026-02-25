@@ -102,6 +102,22 @@ class FinalExplainabilityConfig:
     activity_calibration_max_confidence: float = 0.99
     activity_calibration_ratio_cap: float = 8.0
     activity_calibration_fallback_top1_if_empty: bool = True
+    # Advanced geometry/topology semantics from conformer coordinates.
+    chem_ace_use_advanced_geom_topology: bool = True
+    chem_ace_advanced_geom_topology_max_patches: int = 3000
+    chem_ace_advanced_geom_topology_min_atoms: int = 4
+    chem_ace_advanced_geom_topology_max_torsion_paths: int = 96
+    chem_ace_advanced_geom_use_convex_hull: bool = True
+    chem_ace_advanced_geom_use_persistent_homology: bool = True
+    chem_ace_advanced_geom_persistence_max_atoms: int = 48
+    # Optional external ORCA descriptor table integration.
+    chem_ace_use_orca_descriptors: bool = False
+    chem_ace_orca_descriptors_path: Optional[str] = None
+    chem_ace_orca_conf_id_col: str = "conf_id"
+    chem_ace_orca_mol_id_col: str = "ID"
+    chem_ace_orca_descriptor_cols: tuple[str, ...] = ()
+    chem_ace_orca_min_vectors_for_tagging: int = 8
+    chem_ace_orca_z_threshold: float = 0.50
 
     lambda_vol_output_dir: Optional[str] = None
     lambda_vol_db_uri: Optional[str] = None
@@ -998,6 +1014,28 @@ def prepare_chem_ace_bundle(
         keep_threshold=float(config.activity_calibration_keep_threshold),
         ratio_cap=float(config.activity_calibration_ratio_cap),
     )
+    log_event(
+        "INFO",
+        "explainability.chem_ace.advanced_geom_topology.config",
+        enabled=bool(config.chem_ace_use_advanced_geom_topology),
+        max_patches=int(config.chem_ace_advanced_geom_topology_max_patches),
+        min_atoms=int(config.chem_ace_advanced_geom_topology_min_atoms),
+        max_torsion_paths=int(config.chem_ace_advanced_geom_topology_max_torsion_paths),
+        use_convex_hull=bool(config.chem_ace_advanced_geom_use_convex_hull),
+        use_persistent_homology=bool(config.chem_ace_advanced_geom_use_persistent_homology),
+        persistence_max_atoms=int(config.chem_ace_advanced_geom_persistence_max_atoms),
+    )
+    log_event(
+        "INFO",
+        "explainability.chem_ace.orca.config",
+        enabled=bool(config.chem_ace_use_orca_descriptors),
+        path=(None if config.chem_ace_orca_descriptors_path is None else str(config.chem_ace_orca_descriptors_path)),
+        conf_id_col=str(config.chem_ace_orca_conf_id_col),
+        mol_id_col=str(config.chem_ace_orca_mol_id_col),
+        n_descriptor_cols=int(len(config.chem_ace_orca_descriptor_cols)),
+        min_vectors=int(config.chem_ace_orca_min_vectors_for_tagging),
+        z_threshold=float(config.chem_ace_orca_z_threshold),
+    )
 
     ace_cfg = ChemACEConfig(
         run_name="chem_ace_final_pipeline",
@@ -1016,6 +1054,24 @@ def prepare_chem_ace_bundle(
             functional_rules_path=(
                 None if functional_rules_path is None else str(functional_rules_path)
             ),
+            use_advanced_geom_topology=bool(config.chem_ace_use_advanced_geom_topology),
+            advanced_geom_topology_max_patches=int(config.chem_ace_advanced_geom_topology_max_patches),
+            advanced_geom_topology_min_atoms=int(config.chem_ace_advanced_geom_topology_min_atoms),
+            advanced_geom_topology_max_torsion_paths=int(config.chem_ace_advanced_geom_topology_max_torsion_paths),
+            advanced_geom_use_convex_hull=bool(config.chem_ace_advanced_geom_use_convex_hull),
+            advanced_geom_use_persistent_homology=bool(config.chem_ace_advanced_geom_use_persistent_homology),
+            advanced_geom_persistence_max_atoms=int(config.chem_ace_advanced_geom_persistence_max_atoms),
+            use_orca_descriptors=bool(config.chem_ace_use_orca_descriptors),
+            orca_descriptors_path=(
+                None
+                if config.chem_ace_orca_descriptors_path is None
+                else str(config.chem_ace_orca_descriptors_path)
+            ),
+            orca_conf_id_col=str(config.chem_ace_orca_conf_id_col),
+            orca_mol_id_col=str(config.chem_ace_orca_mol_id_col),
+            orca_descriptor_cols=tuple(str(x) for x in config.chem_ace_orca_descriptor_cols),
+            orca_min_vectors_for_tagging=int(config.chem_ace_orca_min_vectors_for_tagging),
+            orca_z_threshold=float(config.chem_ace_orca_z_threshold),
         ),
         database=DatabaseConfig(uri=db_uri),
     )
@@ -1417,7 +1473,7 @@ def prepare_chem_ace_bundle(
     def _infer_modality(*, provenance: str, tag: str) -> str:
         p = str(provenance).strip().lower()
         t = str(tag).strip().lower()
-        if ("qm" in p) or ("quantum" in p):
+        if ("qm" in p) or ("quantum" in p) or ("orca" in p):
             return "quantum"
         if ("geom" in p) or ("geometry" in p) or ("3d" in p):
             return "geometry"
@@ -1434,6 +1490,12 @@ def prepare_chem_ace_bundle(
             "charge-transfer",
             "frontier",
             "quantum",
+            "excited-state",
+            "oscillator",
+            "singlet-triplet",
+            "spin-orbit",
+            "radiative",
+            "nonradiative",
         )
         geom_tokens = (
             "planar",

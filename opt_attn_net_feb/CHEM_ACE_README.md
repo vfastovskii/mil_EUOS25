@@ -479,6 +479,32 @@ Activity calibration controls:
 - `--activity_calibration_ratio_cap`
 - `--activity_calibration_fallback_top1_if_empty` / `--no-activity_calibration_fallback_top1_if_empty`
 
+Advanced geometry/topology controls (new):
+
+- `--chem_ace_use_advanced_geom_topology` / `--no-chem_ace_use_advanced_geom_topology`
+- `--chem_ace_advanced_geom_topology_max_patches`
+- `--chem_ace_advanced_geom_topology_min_atoms`
+- `--chem_ace_advanced_geom_topology_max_torsion_paths`
+- `--chem_ace_advanced_geom_use_convex_hull` / `--no-chem_ace_advanced_geom_use_convex_hull`
+- `--chem_ace_advanced_geom_use_persistent_homology` / `--no-chem_ace_advanced_geom_use_persistent_homology`
+- `--chem_ace_advanced_geom_persistence_max_atoms`
+
+Optional ORCA descriptor-table controls (new):
+
+- `--chem_ace_use_orca_descriptors` / `--no-chem_ace_use_orca_descriptors`
+- `--chem_ace_orca_descriptors_path`
+- `--chem_ace_orca_conf_id_col`
+- `--chem_ace_orca_mol_id_col`
+- `--chem_ace_orca_descriptor_cols`
+- `--chem_ace_orca_min_vectors_for_tagging`
+- `--chem_ace_orca_z_threshold`
+
+Optional dependency notes for new controls:
+
+- persistent homology requires `ripser`
+- convex-hull cavity/surface proxies require `scipy`
+- ORCA table ingestion uses standard `pandas` readers (`csv`/`json`/`parquet`)
+
 ## 19) Output Artifacts (Current)
 
 Primary Chem-ACE outputs in `chem_ace_output_dir` (default: `<study_dir>/chem_ace`):
@@ -498,6 +524,15 @@ Final run summary output (`final_best_train_vs_leaderboard/explainability_artifa
 - Chem-ACE core artifacts
 - a priori views
 - activity-calibration artifacts
+
+Advanced semantic evidence now also includes:
+
+- `advanced_geometry_topology` summary block per concept in semantic evidence
+- `orca_summary` block per concept when ORCA descriptors are enabled and loaded
+- new provenance families in concept tags:
+  - `advanced_geometry_topology_tagger`
+  - `orca_descriptor_tagger`
+  - `cross_modal_orca_tagger`
 - Lambda-Vol artifacts
 - Concept-RL policy history
 - prediction explanation CSV
@@ -558,4 +593,3 @@ Runtime integration:
 - `training/explainability_runtime.py`
 - `entrypoints/hpo_pipeline.py`
 - `training/execution.py`
-
