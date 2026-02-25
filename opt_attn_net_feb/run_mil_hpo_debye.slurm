@@ -16,6 +16,38 @@ ulimit -n 4096 || true
 source /sw/target/generic/app/anaconda/anaconda3-2024.10/etc/profile.d/conda.sh
 conda activate vf_conda_env
 
+# -------------------- C++ runtime compatibility --------------------
+# Ensure torch uses libstdc++ from the conda env (fixes GLIBCXX_3.4.26 errors).
+unset LD_PRELOAD || true
+if [[ -n "${CONDA_PREFIX:-}" && -d "${CONDA_PREFIX}/lib" ]]; then
+  export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+fi
+echo "[INFO] CONDA_PREFIX=${CONDA_PREFIX:-<unset>}"
+echo "[INFO] LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<unset>}"
+
+if [[ -f "${CONDA_PREFIX}/lib/libstdc++.so.6" ]]; then
+  if strings "${CONDA_PREFIX}/lib/libstdc++.so.6" | grep -q "GLIBCXX_3.4.26"; then
+    echo "[INFO] libstdc++ check: GLIBCXX_3.4.26 found in conda env."
+  else
+    echo "[ERROR] ${CONDA_PREFIX}/lib/libstdc++.so.6 does not provide GLIBCXX_3.4.26"
+    echo "[HINT] Run: conda install -n vf_conda_env -c conda-forge 'libstdcxx-ng>=12' 'libgcc-ng>=12'"
+    exit 3
+  fi
+else
+  echo "[WARN] ${CONDA_PREFIX}/lib/libstdc++.so.6 not found; continuing to python preflight."
+fi
+
+python3 - <<'PY'
+import sys
+try:
+    import torch
+    print(f"[INFO] torch import OK version={torch.__version__} cuda_available={torch.cuda.is_available()}")
+except Exception as exc:
+    print(f"[ERROR] torch import failed: {exc!r}")
+    print("[HINT] Try: conda install -n vf_conda_env -c conda-forge 'libstdcxx-ng>=12' 'libgcc-ng>=12'")
+    sys.exit(3)
+PY
+
 # -------------------- python hygiene --------------------
 export PYTHONUNBUFFERED=1
 export PYTHONDONTWRITEBYTECODE=1
@@ -63,7 +95,7 @@ PATIENCE="${PATIENCE:-10}"
 SEED="${SEED:-0}"
 PRECISION="${PRECISION:-16-mixed}"
 NUM_WORKERS="${NUM_WORKERS:-23}"
-CPU_WORKERS="${CPU_WORKERS:-18}"
+CPU_WORKERS="${CPU_WORKERS:-23}"
 PIN_MEMORY="${PIN_MEMORY:-0}"
 
 LEADERBOARD_SPLIT="${LEADERBOARD_SPLIT:-leaderboard}"
