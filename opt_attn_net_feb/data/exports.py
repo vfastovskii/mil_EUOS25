@@ -242,6 +242,136 @@ def _compute_ricci_bridge_scores(
     return out
 
 
+def _compute_tcav_last_scores(
+    *,
+    lambda_vol_long_csv: str | None,
+    task_cols: Sequence[str],
+) -> dict[tuple[str, str], float]:
+    """
+    Load last-epoch TCAV scores from Lambda-Vol long CSV and normalize per task.
+
+    Returns mapping:
+      (task_id, concept_id) -> normalized tcav in [0, 1] (positive part only)
+    """
+    if lambda_vol_long_csv is None:
+        return {}
+    path = Path(lambda_vol_long_csv)
+    if not path.exists():
+        return {}
+
+    df = pd.read_csv(path)
+    required = {"epoch", "task_id", "concept_id"}
+    if df.empty or (not required.issubset(df.columns)):
+        return {}
+
+    score_col = "tcav_smoothed" if "tcav_smoothed" in df.columns else ("tcav" if "tcav" in df.columns else None)
+    if score_col is None:
+        return {}
+
+    out: dict[tuple[str, str], float] = {}
+    for task in task_cols:
+        dft = df[df["task_id"].astype(str) == str(task)]
+        if dft.empty:
+            continue
+        last_epoch = int(dft["epoch"].max())
+        dft = dft[dft["epoch"].astype(int) == last_epoch]
+        if dft.empty:
+            continue
+
+        vals: dict[str, float] = {}
+        for row in dft.itertuples(index=False):
+            cid = str(getattr(row, "concept_id"))
+            val = float(getattr(row, score_col, 0.0))
+            vals[cid] = max(0.0, val)
+
+        if not vals:
+            continue
+        mx = max(vals.values())
+        if mx <= 1e-12:
+            continue
+        for cid, val in vals.items():
+            out[(str(task), str(cid))] = float(val / mx)
+    return out
+
+
+def _infer_modality_from_tag_text(tag: str) -> str:
+    t = str(tag).strip().lower()
+    if len(t) == 0:
+        return "2d"
+    qm_tokens = (
+        "homo",
+        "lumo",
+        "gap",
+        "electrophil",
+        "nucleophil",
+        "dipole",
+        "polariz",
+        "electrostatic",
+        "fukui",
+        "hard electronic",
+        "soft electronic",
+        "charge-transfer",
+        "quantum",
+        "frontier",
+    )
+    geom_tokens = (
+        "planar",
+        "non-planar",
+        "twisted",
+        "rigid",
+        "flexible",
+        "geometry",
+        "torsion",
+        "ring-strained",
+        "shape",
+        "surface/volume",
+    )
+    if any(tok in t for tok in qm_tokens):
+        return "quantum"
+    if any(tok in t for tok in geom_tokens):
+        return "geometry"
+    return "2d"
+
+
+def _concept_modality_bundle(metadata: Mapping[str, Any]) -> tuple[dict[str, float], dict[str, list[str]]]:
+    weights_raw = metadata.get("modality_weights", {})
+    tags_by_modality = metadata.get("tags_by_modality", {})
+    out_weights = {"2d": 0.0, "geometry": 0.0, "quantum": 0.0}
+    out_tags = {"2d": [], "geometry": [], "quantum": []}
+
+    if isinstance(weights_raw, Mapping):
+        for k in out_weights:
+            try:
+                out_weights[k] = float(weights_raw.get(k, 0.0))
+            except Exception:
+                out_weights[k] = 0.0
+
+    if isinstance(tags_by_modality, Mapping):
+        for k in out_tags:
+            v = tags_by_modality.get(k, [])
+            if isinstance(v, (list, tuple)):
+                out_tags[k] = [str(x) for x in v if str(x).strip()]
+
+    if sum(out_weights.values()) <= 1e-12:
+        # Fallback: infer weak modality weights from plain tags.
+        tags = metadata.get("tags", [])
+        if isinstance(tags, (list, tuple)):
+            for tag in tags:
+                m = _infer_modality_from_tag_text(str(tag))
+                out_weights[m] += 1.0
+                out_tags[m].append(str(tag))
+    if sum(out_weights.values()) <= 1e-12:
+        out_weights["2d"] = 1.0
+
+    total = float(sum(max(0.0, v) for v in out_weights.values()))
+    if total > 0.0:
+        out_weights = {k: float(max(0.0, v) / total) for k, v in out_weights.items()}
+
+    for k in out_tags:
+        out_tags[k] = sorted(set([str(x) for x in out_tags[k] if str(x).strip()]))
+    return out_weights, out_tags
+
+
 def _build_concept_index_maps(
     *,
     concept_ids: Sequence[str],
@@ -275,9 +405,16 @@ def _concept_phrase(
     is_conf_level: bool,
     bridge_score: float,
     bridge_threshold: float,
+    modality: str | None = None,
 ) -> str:
     label = str(metadata.get("label_auto") or concept_id)
-    tags = metadata.get("tags", [])
+    if modality is None:
+        tags = metadata.get("tags", [])
+    else:
+        _w, tags_by_modality = _concept_modality_bundle(metadata)
+        tags = tags_by_modality.get(str(modality), [])
+        if len(tags) == 0:
+            tags = metadata.get("tags", [])
     if isinstance(tags, (list, tuple)):
         tags_txt = ", ".join([str(x) for x in tags[:2]]) if len(tags) > 0 else "no-tags"
     else:
@@ -299,6 +436,8 @@ def export_prediction_text_explanations(
     concept_conf_map: Mapping[str, set[tuple[str, str]]],
     task_cols: Sequence[str] = TASK_COLS,
     ricci_edges_csv: str | None = None,
+    lambda_vol_long_csv: str | None = None,
+    tcav_weight: float = 0.35,
     top_k: int = 3,
     bridge_threshold: float = 0.20,
 ) -> Path:
@@ -306,12 +445,16 @@ def export_prediction_text_explanations(
     Attach concept-aware textual explanations to per-row prediction exports.
 
     The function links prediction rows (ID, conf_id) with Chem-ACE concept
-    semantics and optional Ricci bridge scores from Lambda-Vol artifacts.
+    semantics and optional Lambda-Vol signals (Ricci bridge + last-epoch TCAV).
     It writes a CSV with additional columns:
 
     - `top_concepts_<task>`
     - `top_concept_labels_<task>`
     - `prediction_explanation_<task>`
+    - modality-specific columns per task:
+      - `top_concepts_2d_<task>`, `prediction_explanation_2d_<task>`
+      - `top_concepts_geom_<task>`, `prediction_explanation_geom_<task>`
+      - `top_concepts_qm_<task>`, `prediction_explanation_qm_<task>`
     - `prediction_explanation` (multi-task joined text)
     """
     df = _load_prediction_table(Path(pred_table_path)).copy()
@@ -329,6 +472,7 @@ def export_prediction_text_explanations(
         raise ValueError(f"Prediction table missing required columns: {missing}")
 
     bridge_scores = _compute_ricci_bridge_scores(ricci_edges_csv=ricci_edges_csv, task_cols=task_cols)
+    tcav_scores = _compute_tcav_last_scores(lambda_vol_long_csv=lambda_vol_long_csv, task_cols=task_cols)
     mol_to_concepts, conf_to_concepts = _build_concept_index_maps(
         concept_ids=concept_ids,
         concept_mol_map=concept_mol_map,
@@ -337,10 +481,24 @@ def export_prediction_text_explanations(
 
     concept_set = {str(x) for x in concept_ids}
     kk = max(1, int(top_k))
+    tcav_weight = float(max(0.0, tcav_weight))
 
     per_task_expl_cols: dict[str, list[str]] = {str(t): [] for t in task_cols}
     per_task_top_ids: dict[str, list[str]] = {str(t): [] for t in task_cols}
     per_task_top_labels: dict[str, list[str]] = {str(t): [] for t in task_cols}
+    modality_map = (("2d", "2d"), ("geometry", "geom"), ("quantum", "qm"))
+    per_task_mod_top_ids: dict[str, dict[str, list[str]]] = {
+        str(t): {str(col): [] for _, col in modality_map}
+        for t in task_cols
+    }
+    per_task_mod_top_labels: dict[str, dict[str, list[str]]] = {
+        str(t): {str(col): [] for _, col in modality_map}
+        for t in task_cols
+    }
+    per_task_mod_expl: dict[str, dict[str, list[str]]] = {
+        str(t): {str(col): [] for _, col in modality_map}
+        for t in task_cols
+    }
     joined_explanations: list[str] = []
 
     for row in df.itertuples(index=False):
@@ -358,14 +516,24 @@ def export_prediction_text_explanations(
             label = int(getattr(row, label_col)) if label_col in df.columns else int(pred >= 0.5)
             attn = float(getattr(row, f"attn_{t}"))
 
-            scored: list[tuple[float, str, bool, float]] = []
+            scored: list[tuple[float, str, bool, float, float, dict[str, float], dict[str, list[str]]]] = []
             for cid in active:
                 conf_level = cid in conf_hits
                 bridge = float(bridge_scores.get((t, cid), 0.0))
+                tcav = float(tcav_scores.get((t, cid), 0.0))
                 support = float(concept_metadata.get(cid, {}).get("support", 1.0))
+                modality_weights, modality_tags = _concept_modality_bundle(concept_metadata.get(cid, {}))
                 support_gain = 1.0 + min(0.25, 0.05 * float(np.log1p(max(support, 0.0))))
-                base = attn * (1.15 if conf_level else 0.85) * support_gain * (1.0 + 0.35 * bridge)
-                scored.append((float(base), cid, conf_level, bridge))
+                base = (
+                    attn
+                    * (1.15 if conf_level else 0.85)
+                    * support_gain
+                    * (1.0 + 0.35 * bridge)
+                    * (1.0 + tcav_weight * max(0.0, tcav))
+                )
+                scored.append(
+                    (float(base), cid, conf_level, bridge, tcav, modality_weights, modality_tags)
+                )
 
             scored.sort(key=lambda x: x[0], reverse=True)
             top = scored[:kk]
@@ -390,15 +558,79 @@ def export_prediction_text_explanations(
                         bridge_score=bridge,
                         bridge_threshold=bridge_threshold,
                     )
-                    for _, cid, is_conf_level, bridge in top
+                    for _, cid, is_conf_level, bridge, _, _, _ in top
                 ]
-                has_bridge = any(float(bridge) >= float(bridge_threshold) for _, _, _, bridge in top)
+                has_bridge = any(float(bridge) >= float(bridge_threshold) for _, _, _, bridge, _, _, _ in top)
+                mean_tcav_top = float(np.mean([float(x[4]) for x in top])) if len(top) > 0 else 0.0
                 expl = f"{t}: p={pred:.3f} (label={label}). Key concepts: " + "; ".join(phrases) + "."
                 if has_bridge:
                     expl += " Ricci note: bridge-like concept channel detected."
+                if mean_tcav_top > 0.0:
+                    expl += f" TCAV support={mean_tcav_top:.2f}."
 
             per_task_expl_cols[t].append(expl)
             row_join_parts.append(expl)
+
+            for modality_key, modality_col in modality_map:
+                modal_scored: list[tuple[float, str, bool, float, float]] = []
+                for base, cid, is_conf_level, bridge, tcav, modality_weights, _modality_tags in scored:
+                    w_mod = float(modality_weights.get(modality_key, 0.0))
+                    if w_mod <= 0.0:
+                        continue
+                    modal_scored.append(
+                        (float(base * w_mod), cid, is_conf_level, bridge, tcav)
+                    )
+
+                modal_scored.sort(key=lambda x: x[0], reverse=True)
+                modal_top = modal_scored[:kk]
+                modal_top_ids = [x[1] for x in modal_top]
+                modal_top_labels = [
+                    str(concept_metadata.get(x[1], {}).get("label_auto") or x[1])
+                    for x in modal_top
+                ]
+                per_task_mod_top_ids[t][modality_col].append("|".join(modal_top_ids))
+                per_task_mod_top_labels[t][modality_col].append("|".join(modal_top_labels))
+
+                if len(modal_top) == 0:
+                    if modality_key == "2d":
+                        m_name = "2D SMARTS"
+                    elif modality_key == "geometry":
+                        m_name = "3D geometry"
+                    else:
+                        m_name = "3D quantum"
+                    m_expl = (
+                        f"{t}/{m_name}: no matched concept for this conformer-row."
+                    )
+                else:
+                    m_phrases = [
+                        _concept_phrase(
+                            concept_id=cid,
+                            metadata=concept_metadata.get(cid, {}),
+                            is_conf_level=is_conf_level,
+                            bridge_score=bridge,
+                            bridge_threshold=bridge_threshold,
+                            modality=modality_key,
+                        )
+                        for _, cid, is_conf_level, bridge, _ in modal_top
+                    ]
+                    m_mean_tcav = float(np.mean([float(x[4]) for x in modal_top])) if len(modal_top) > 0 else 0.0
+                    if modality_key == "2d":
+                        m_name = "2D SMARTS"
+                    elif modality_key == "geometry":
+                        m_name = "3D geometry"
+                    else:
+                        m_name = "3D quantum"
+                    m_expl = f"{t}/{m_name}: " + "; ".join(m_phrases) + "."
+                    if m_mean_tcav > 0.0:
+                        m_expl += f" TCAV={m_mean_tcav:.2f}."
+                per_task_mod_expl[t][modality_col].append(m_expl)
+
+            modal_join = [
+                per_task_mod_expl[t]["2d"][-1],
+                per_task_mod_expl[t]["geom"][-1],
+                per_task_mod_expl[t]["qm"][-1],
+            ]
+            row_join_parts.append(" ".join(modal_join))
 
         joined_explanations.append(" | ".join(row_join_parts))
 
@@ -407,6 +639,15 @@ def export_prediction_text_explanations(
         df[f"top_concepts_{t}"] = per_task_top_ids[t]
         df[f"top_concept_labels_{t}"] = per_task_top_labels[t]
         df[f"prediction_explanation_{t}"] = per_task_expl_cols[t]
+        df[f"top_concepts_2d_{t}"] = per_task_mod_top_ids[t]["2d"]
+        df[f"top_concept_labels_2d_{t}"] = per_task_mod_top_labels[t]["2d"]
+        df[f"prediction_explanation_2d_{t}"] = per_task_mod_expl[t]["2d"]
+        df[f"top_concepts_geom_{t}"] = per_task_mod_top_ids[t]["geom"]
+        df[f"top_concept_labels_geom_{t}"] = per_task_mod_top_labels[t]["geom"]
+        df[f"prediction_explanation_geom_{t}"] = per_task_mod_expl[t]["geom"]
+        df[f"top_concepts_qm_{t}"] = per_task_mod_top_ids[t]["qm"]
+        df[f"top_concept_labels_qm_{t}"] = per_task_mod_top_labels[t]["qm"]
+        df[f"prediction_explanation_qm_{t}"] = per_task_mod_expl[t]["qm"]
     df["prediction_explanation"] = joined_explanations
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

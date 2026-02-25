@@ -1280,6 +1280,7 @@ class MILFinalTrainer:
                 concept_conf_map=chem_bundle.concept_conf_map,
                 task_cols=TASK_COLS,
                 ricci_edges_csv=(None if lv_art is None else lv_art.ricci_edges_csv),
+                lambda_vol_long_csv=(None if lv_art is None else lv_art.long_csv),
                 top_k=3,
                 bridge_threshold=0.20,
             )

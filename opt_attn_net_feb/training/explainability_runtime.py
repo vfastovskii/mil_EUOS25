@@ -1413,13 +1413,89 @@ def prepare_chem_ace_bundle(
     )
 
     support_map = {str(c.concept_local_id): int(c.support) for c in concept_set.candidates}
-    tag_map = {
-        str(t.concept_id): {
-            "label_auto": str(t.label_auto),
-            "tags": [str(x.tag) for x in t.tags],
+
+    def _infer_modality(*, provenance: str, tag: str) -> str:
+        p = str(provenance).strip().lower()
+        t = str(tag).strip().lower()
+        if ("qm" in p) or ("quantum" in p):
+            return "quantum"
+        if ("geom" in p) or ("geometry" in p) or ("3d" in p):
+            return "geometry"
+        qm_tokens = (
+            "homo",
+            "lumo",
+            "gap",
+            "electrophil",
+            "nucleophil",
+            "dipole",
+            "polariz",
+            "electrostatic",
+            "fukui",
+            "charge-transfer",
+            "frontier",
+            "quantum",
+        )
+        geom_tokens = (
+            "planar",
+            "non-planar",
+            "twisted",
+            "rigid",
+            "flexible",
+            "geometry",
+            "torsion",
+            "ring-strained",
+            "shape",
+            "surface/volume",
+        )
+        if any(tok in t for tok in qm_tokens):
+            return "quantum"
+        if any(tok in t for tok in geom_tokens):
+            return "geometry"
+        return "2d"
+
+    tag_map: dict[str, dict[str, Any]] = {}
+    for t in tagging:
+        cid = str(t.concept_id)
+        modality_scores = {"2d": 0.0, "geometry": 0.0, "quantum": 0.0}
+        tags_by_modality = {"2d": [], "geometry": [], "quantum": []}
+        tag_details: list[dict[str, Any]] = []
+        for tag_obj in t.tags:
+            tag_name = str(tag_obj.tag)
+            provenance = str(tag_obj.provenance)
+            confidence = float(getattr(tag_obj, "confidence", 0.0))
+            modality = _infer_modality(provenance=provenance, tag=tag_name)
+            modality_scores[modality] += max(0.0, confidence)
+            tags_by_modality[modality].append(tag_name)
+            tag_details.append(
+                {
+                    "tag": tag_name,
+                    "confidence": float(confidence),
+                    "provenance": provenance,
+                    "modality": modality,
+                }
+            )
+
+        total_score = float(sum(modality_scores.values()))
+        if total_score <= 1e-12:
+            modality_scores["2d"] = 1.0
+            total_score = 1.0
+        modality_weights = {
+            k: float(max(0.0, v) / total_score)
+            for k, v in modality_scores.items()
         }
-        for t in tagging
-    }
+        dominant_modality = max(modality_weights, key=lambda k: modality_weights[k])
+        tags_all = [str(x.tag) for x in t.tags]
+        tag_map[cid] = {
+            "label_auto": str(t.label_auto),
+            "tags": sorted(set(tags_all)),
+            "tag_details": tag_details,
+            "tags_by_modality": {
+                k: sorted(set([str(x) for x in vals if str(x).strip()]))
+                for k, vals in tags_by_modality.items()
+            },
+            "modality_weights": modality_weights,
+            "dominant_modality": str(dominant_modality),
+        }
 
     concept_metadata: dict[str, dict[str, Any]] = {}
     for cid, support in support_map.items():
@@ -1431,6 +1507,13 @@ def prepare_chem_ace_bundle(
             "support": int(support),
             "label_auto": tag_map.get(cid, {}).get("label_auto"),
             "tags": tag_map.get(cid, {}).get("tags", []),
+            "tag_details": tag_map.get(cid, {}).get("tag_details", []),
+            "tags_by_modality": tag_map.get(cid, {}).get("tags_by_modality", {}),
+            "modality_weights": tag_map.get(cid, {}).get(
+                "modality_weights",
+                {"2d": 1.0, "geometry": 0.0, "quantum": 0.0},
+            ),
+            "dominant_modality": tag_map.get(cid, {}).get("dominant_modality", "2d"),
             "n_molecules_train": int(len(mols_train)),
             "n_conf_pairs_train": int(len(confs_train)),
             "n_molecules_total": int(len(mols_total)),
