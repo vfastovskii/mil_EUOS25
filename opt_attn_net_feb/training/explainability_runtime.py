@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -83,7 +84,8 @@ class FinalExplainabilityConfig:
     chem_ace_max_3dqm_dim: int = 0
     # If False, keep patch embeddings only in memory for this run (no per-patch npy/json, no DB rows).
     chem_ace_persist_patch_embeddings: bool = False
-    chem_ace_top_concepts: int = 64
+    # <=0 means keep all discovered concepts in Chem-ACE bundle.
+    chem_ace_top_concepts: int = 0
     # <=0 disables distance gating for inference-time nearest-centroid assignment.
     chem_ace_infer_max_distance: float = -1.0
     # Supervised semantic confidence calibration from train-scope activity labels.
@@ -122,7 +124,8 @@ class FinalExplainabilityConfig:
     lambda_vol_output_dir: Optional[str] = None
     lambda_vol_db_uri: Optional[str] = None
     lambda_vol_layer_name: str = "mixer_post_norm"
-    lambda_vol_top_concepts: int = 24
+    # <=0 means evaluate TCAV/pressure over all Chem-ACE concepts.
+    lambda_vol_top_concepts: int = 0
     lambda_vol_monitor_max_samples: int = 512
     lambda_vol_tcav_repeats: int = 2
     lambda_vol_random_counterexamples: int = 96
@@ -138,14 +141,26 @@ class FinalExplainabilityConfig:
 
     # Concept RL guidance (applied during final training).
     run_concept_rl: bool = False
+    # <=0 means uncapped selection: include all passing concepts per task.
     concept_rl_top_k_per_task: int = 8
     concept_rl_min_pos_coverage: float = 0.02
+    concept_rl_min_pos_hits: int = 8
+    concept_rl_min_lift: float = 1.05
+    concept_rl_overlap_weight: float = 0.35
+    concept_rl_global_weight: float = 0.20
+    concept_rl_lift_weight: float = 0.25
+    concept_rl_general_top_k: int = 4
+    concept_rl_min_multi_active_count: int = 32
+    concept_rl_require_conf_support: bool = True
+    concept_rl_min_conf_pos_coverage: float = 0.005
     concept_rl_init_scale: float = 0.02
     concept_rl_max_scale: float = 0.20
     concept_rl_policy_lr: float = 0.05
     concept_rl_policy_sigma: float = 0.02
     concept_rl_reward_alignment_w: float = 0.25
+    concept_rl_reward_min_ap_w: float = 0.15
     concept_rl_baseline_momentum: float = 0.90
+    concept_rl_negative_penalty: float = 0.15
 
 
 @dataclass(frozen=True)
@@ -161,12 +176,281 @@ class ChemACEBundle:
     concept_support: Mapping[str, int]
     concept_mol_map: Mapping[str, set[str]]
     concept_conf_map: Mapping[str, set[tuple[str, str]]]
+    train_membership_source: str = "discover_cluster_memberships"
     a_priori_tags_csv: Optional[str] = None
     a_priori_vs_concepts_csv: Optional[str] = None
     a_priori_tags_infer_csv: Optional[str] = None
     a_priori_vs_concepts_infer_csv: Optional[str] = None
     activity_calibrated_tags_csv: Optional[str] = None
     activity_calibration_summary_json: Optional[str] = None
+
+
+def _bitmask_ids_from_y(y: np.ndarray) -> np.ndarray:
+    yb = (np.asarray(y, dtype=np.float32) > 0.5).astype(np.int64)
+    bits = (1 << np.arange(int(yb.shape[1]), dtype=np.int64)).reshape(1, -1)
+    return np.asarray((yb * bits).sum(axis=1), dtype=np.int64)
+
+
+def build_positive_concept_targets_with_report(
+    *,
+    config: FinalExplainabilityConfig,
+    ids_train: Sequence[str],
+    y_cls_train: np.ndarray,
+    chem_bundle: ChemACEBundle,
+) -> tuple[dict[int, tuple[str, ...]], dict[str, Any]]:
+    """
+    Select Concept-RL targets from train activities with task + bitmask-overlap scoring.
+
+    The scorer combines:
+    - task-positive coverage,
+    - overlap coverage on multi-active bitmask groups,
+    - global-active coverage,
+    - enrichment (lift vs overall prevalence).
+
+    Returns:
+      (task_index -> tuple(concept_id, ...), detailed report payload)
+    """
+    if (not bool(config.run_concept_rl)) or len(ids_train) == 0:
+        return {}, {
+            "enabled": False,
+            "reason": "disabled_or_empty_train_ids",
+            "n_train_ids": int(len(ids_train)),
+        }
+
+    y = np.asarray(y_cls_train, dtype=np.float32)
+    if y.ndim != 2 or y.shape[1] != len(TASK_COLS):
+        raise ValueError(
+            f"y_cls_train must be [N,{len(TASK_COLS)}], got shape={tuple(y.shape)}"
+        )
+    if int(y.shape[0]) != int(len(ids_train)):
+        raise ValueError(
+            "ids_train / y_cls_train length mismatch: "
+            f"{int(len(ids_train))} vs {int(y.shape[0])}"
+        )
+
+    ids = [str(x) for x in ids_train]
+    train_set = set(ids)
+    concept_ids = [str(x) for x in chem_bundle.concept_ids]
+    concept_source = str(
+        getattr(chem_bundle, "train_membership_source", "discover_cluster_memberships")
+    )
+    concept_mol_map = {
+        str(k): {str(x) for x in v if str(x) in train_set}
+        for k, v in chem_bundle.concept_mol_map.items()
+    }
+    concept_conf_mol_map: dict[str, set[str]] = {}
+    for cid, pairs in chem_bundle.concept_conf_map.items():
+        c = str(cid)
+        if c not in concept_conf_mol_map:
+            concept_conf_mol_map[c] = set()
+        for mol_id, _conf_id in pairs:
+            mid = str(mol_id)
+            if mid in train_set:
+                concept_conf_mol_map[c].add(mid)
+
+    out: dict[int, tuple[str, ...]] = {}
+    top_k_raw = int(config.concept_rl_top_k_per_task)
+    top_k_unbounded = bool(top_k_raw <= 0)
+    top_k = max(1, top_k_raw)
+    min_cov = float(max(0.0, config.concept_rl_min_pos_coverage))
+    min_hits = max(1, int(config.concept_rl_min_pos_hits))
+    min_lift = float(max(0.0, config.concept_rl_min_lift))
+    overlap_w = float(max(0.0, config.concept_rl_overlap_weight))
+    global_w = float(max(0.0, config.concept_rl_global_weight))
+    lift_w = float(max(0.0, config.concept_rl_lift_weight))
+    general_top_k = max(0, int(config.concept_rl_general_top_k))
+    min_multi = max(1, int(config.concept_rl_min_multi_active_count))
+    require_conf = bool(config.concept_rl_require_conf_support)
+    min_conf_cov = float(max(0.0, config.concept_rl_min_conf_pos_coverage))
+
+    n_train = max(1, len(ids))
+    yb = (y > 0.5).astype(np.int32)
+    any_active_mask = np.any(yb > 0, axis=1)
+    multi_active_mask = (np.sum(yb, axis=1) >= 2)
+    any_active_ids = {ids[i] for i in range(len(ids)) if bool(any_active_mask[i])}
+    multi_active_ids = {ids[i] for i in range(len(ids)) if bool(multi_active_mask[i])}
+
+    bitmask_ids = _bitmask_ids_from_y(y)
+    bitmask_counts: dict[int, int] = {}
+    for m in bitmask_ids.tolist():
+        mm = int(m)
+        bitmask_counts[mm] = int(bitmask_counts.get(mm, 0) + 1)
+    valid_overlap_masks = {
+        int(m)
+        for m, cnt in bitmask_counts.items()
+        if (int(cnt) >= int(min_multi)) and (int(bin(int(m)).count("1")) >= 2)
+    }
+
+    base_prev: dict[str, float] = {}
+    for cid in concept_ids:
+        base_prev[cid] = float(len(concept_mol_map.get(cid, set()))) / float(n_train)
+
+    general_selected: list[str] = []
+    general_rows: list[dict[str, Any]] = []
+    if len(multi_active_ids) > 0 and general_top_k > 0:
+        n_multi = float(max(1, len(multi_active_ids)))
+        n_any = float(max(1, len(any_active_ids)))
+        scored_general: list[tuple[float, float, str, dict[str, Any]]] = []
+        for cid in concept_ids:
+            mols = concept_mol_map.get(cid, set())
+            if len(mols) == 0:
+                continue
+            conf_mols = concept_conf_mol_map.get(cid, set())
+            hit_multi = int(len(mols.intersection(multi_active_ids)))
+            hit_any = int(len(mols.intersection(any_active_ids)))
+            cov_multi = float(hit_multi) / float(n_multi)
+            cov_any = float(hit_any) / float(n_any)
+            prev = float(max(base_prev.get(cid, 0.0), 1e-8))
+            lift = float(cov_multi / prev)
+            conf_cov_multi = float(len(conf_mols.intersection(multi_active_ids))) / float(n_multi)
+            if cov_multi < max(0.5 * min_cov, 1e-4):
+                continue
+            if lift < max(1.0, min_lift - 0.05):
+                continue
+            if require_conf and conf_cov_multi < min_conf_cov:
+                continue
+            lift_term = float(math.log1p(max(0.0, lift - 1.0)))
+            score = float(cov_multi + global_w * cov_any + lift_w * lift_term + 0.10 * conf_cov_multi)
+            row = {
+                "concept_id": str(cid),
+                "score": float(score),
+                "coverage_multi_active": float(cov_multi),
+                "coverage_any_active": float(cov_any),
+                "lift_multi_vs_overall": float(lift),
+                "conf_coverage_multi_active": float(conf_cov_multi),
+            }
+            scored_general.append((score, cov_multi, str(cid), row))
+        scored_general.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        general_rows = [x[3] for x in scored_general[:general_top_k]]
+        general_selected = [str(x["concept_id"]) for x in general_rows]
+
+    task_reports: dict[str, Any] = {}
+    for ti, task_name in enumerate(TASK_COLS):
+        pos_ids = [ids[i] for i in range(len(ids)) if float(y[i, ti]) > 0.5]
+        pos_set = set(pos_ids)
+        n_pos = float(max(1, len(pos_set)))
+        if len(pos_set) == 0:
+            out[int(ti)] = tuple(general_selected[:general_top_k])
+            task_reports[str(task_name)] = {
+                "n_pos": 0,
+                "n_overlap_pos": 0,
+                "selected_task_specific": [],
+                "selected_with_general": [str(x) for x in out[int(ti)]],
+            }
+            continue
+
+        overlap_pos_ids: set[str] = set()
+        for mask_id in valid_overlap_masks:
+            if (int(mask_id) & (1 << int(ti))) == 0:
+                continue
+            for i in range(len(ids)):
+                if int(bitmask_ids[i]) == int(mask_id):
+                    overlap_pos_ids.add(ids[i])
+        n_overlap_pos = float(max(1, len(overlap_pos_ids)))
+        n_any = float(max(1, len(any_active_ids)))
+
+        scored: list[tuple[float, float, float, str, dict[str, Any]]] = []
+        for cid in concept_ids:
+            mols = concept_mol_map.get(cid, set())
+            if len(mols) == 0:
+                continue
+            conf_mols = concept_conf_mol_map.get(cid, set())
+            hit_pos = int(len(mols.intersection(pos_set)))
+            cov_pos = float(hit_pos) / float(n_pos)
+            if hit_pos < min_hits or cov_pos < min_cov:
+                continue
+            prev = float(max(base_prev.get(cid, 0.0), 1e-8))
+            lift = float(cov_pos / prev)
+            if lift < min_lift:
+                continue
+            hit_overlap = int(len(mols.intersection(overlap_pos_ids)))
+            cov_overlap = float(hit_overlap) / float(n_overlap_pos) if len(overlap_pos_ids) > 0 else 0.0
+            hit_any = int(len(mols.intersection(any_active_ids)))
+            cov_any = float(hit_any) / float(n_any)
+            conf_cov_pos = float(len(conf_mols.intersection(pos_set))) / float(n_pos)
+            if require_conf and conf_cov_pos < min_conf_cov:
+                continue
+
+            lift_term = float(math.log1p(max(0.0, lift - 1.0)))
+            score = float(
+                cov_pos
+                + overlap_w * cov_overlap
+                + global_w * cov_any
+                + lift_w * lift_term
+                + 0.10 * conf_cov_pos
+            )
+            row = {
+                "concept_id": str(cid),
+                "score": float(score),
+                "hits_pos": int(hit_pos),
+                "coverage_pos": float(cov_pos),
+                "coverage_overlap_pos": float(cov_overlap),
+                "coverage_any_active": float(cov_any),
+                "lift_pos_vs_overall": float(lift),
+                "conf_coverage_pos": float(conf_cov_pos),
+            }
+            scored.append((score, cov_pos, conf_cov_pos, str(cid), row))
+
+        scored.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+        task_specific_rows = [x[4] for x in (scored if top_k_unbounded else scored[:top_k])]
+        task_specific_ids = [str(x["concept_id"]) for x in task_specific_rows]
+
+        merged_ids: list[str] = []
+        for cid in task_specific_ids + general_selected:
+            if cid not in merged_ids:
+                merged_ids.append(str(cid))
+        if not top_k_unbounded:
+            max_total = int(top_k + max(0, general_top_k))
+            if len(merged_ids) > max_total:
+                merged_ids = merged_ids[:max_total]
+
+        out[int(ti)] = tuple(merged_ids)
+        task_reports[str(task_name)] = {
+            "n_pos": int(len(pos_set)),
+            "n_overlap_pos": int(len(overlap_pos_ids)),
+            "selected_task_specific": task_specific_rows,
+            "selected_with_general": [str(x) for x in merged_ids],
+        }
+
+    report: dict[str, Any] = {
+        "enabled": True,
+        "concept_source_train": str(concept_source),
+        "n_train_ids": int(len(ids)),
+        "n_concepts": int(len(concept_ids)),
+        "n_any_active": int(len(any_active_ids)),
+        "n_multi_active": int(len(multi_active_ids)),
+        "bitmask_counts": {str(int(k)): int(v) for k, v in sorted(bitmask_counts.items())},
+        "valid_overlap_masks": [int(x) for x in sorted(valid_overlap_masks)],
+        "config": {
+            "top_k_per_task": int(top_k_raw),
+            "top_k_per_task_mode": ("all_passing" if top_k_unbounded else "capped"),
+            "general_top_k": int(general_top_k),
+            "min_pos_coverage": float(min_cov),
+            "min_pos_hits": int(min_hits),
+            "min_lift": float(min_lift),
+            "overlap_weight": float(overlap_w),
+            "global_weight": float(global_w),
+            "lift_weight": float(lift_w),
+            "min_multi_active_count": int(min_multi),
+            "require_conf_support": bool(require_conf),
+            "min_conf_pos_coverage": float(min_conf_cov),
+        },
+        "general_active_concepts": general_rows,
+        "tasks": task_reports,
+        "task_target_sizes": {int(k): int(len(v)) for k, v in out.items()},
+    }
+
+    logger.info(
+        "Built concept RL targets",
+        extra={
+            "task_target_sizes": {int(k): int(len(v)) for k, v in out.items()},
+            "top_k": int(top_k),
+            "min_pos_coverage": float(min_cov),
+            "general_top_k": int(general_top_k),
+            "n_multi_active": int(len(multi_active_ids)),
+        },
+    )
+    return out, report
 
 
 def build_positive_concept_targets(
@@ -176,60 +460,14 @@ def build_positive_concept_targets(
     y_cls_train: np.ndarray,
     chem_bundle: ChemACEBundle,
 ) -> dict[int, tuple[str, ...]]:
-    """
-    Select target concept sets per task from concepts frequent in positive train samples.
-
-    Returns mapping:
-      task_index -> tuple(concept_id, ...)
-    """
-    if (not bool(config.run_concept_rl)) or len(ids_train) == 0:
-        return {}
-
-    y = np.asarray(y_cls_train, dtype=np.float32)
-    if y.ndim != 2 or y.shape[1] != len(TASK_COLS):
-        raise ValueError(
-            f"y_cls_train must be [N,{len(TASK_COLS)}], got shape={tuple(y.shape)}"
-        )
-
-    ids = [str(x) for x in ids_train]
-    concept_ids = [str(x) for x in chem_bundle.concept_ids]
-    concept_mol_map = {
-        str(k): {str(x) for x in v}
-        for k, v in chem_bundle.concept_mol_map.items()
-    }
-
-    out: dict[int, tuple[str, ...]] = {}
-    top_k = max(1, int(config.concept_rl_top_k_per_task))
-    min_cov = float(max(0.0, config.concept_rl_min_pos_coverage))
-
-    for ti in range(len(TASK_COLS)):
-        pos_ids = [ids[i] for i in range(len(ids)) if float(y[i, ti]) > 0.5]
-        pos_set = set(pos_ids)
-        n_pos = max(1, len(pos_set))
-        if len(pos_set) == 0:
-            out[int(ti)] = tuple()
-            continue
-
-        scored: list[tuple[int, float, str]] = []
-        for cid in concept_ids:
-            hits = int(len(pos_set.intersection(concept_mol_map.get(cid, set()))))
-            cov = float(hits) / float(n_pos)
-            if cov >= min_cov:
-                scored.append((hits, cov, str(cid)))
-        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-
-        chosen = [cid for _, _, cid in scored[:top_k]]
-        out[int(ti)] = tuple(chosen)
-
-    logger.info(
-        "Built concept RL targets",
-        extra={
-            "task_target_sizes": {int(k): int(len(v)) for k, v in out.items()},
-            "top_k": int(top_k),
-            "min_pos_coverage": float(min_cov),
-        },
+    """Backward-compatible wrapper returning only target mapping."""
+    targets, _ = build_positive_concept_targets_with_report(
+        config=config,
+        ids_train=ids_train,
+        y_cls_train=y_cls_train,
+        chem_bundle=chem_bundle,
     )
-    return out
+    return targets
 
 
 class _MILTaskAdapter(ModelTaskAdapter):
@@ -1295,10 +1533,49 @@ def prepare_chem_ace_bundle(
 
     activity_calibrated_tags_csv: Optional[str] = None
     activity_calibration_summary_json: Optional[str] = None
-    concept_mol_map_train, concept_conf_map_train = _build_concept_membership_maps(
+    concept_mol_map_train_discover, concept_conf_map_train_discover = _build_concept_membership_maps(
         concept_set=concept_set,
         patches=patches_train,
     )
+    concept_mol_map_train_infer: dict[str, set[str]] = {}
+    concept_conf_map_train_infer: dict[str, set[tuple[str, str]]] = {}
+    n_inferred_memberships_train = 0
+    train_membership_source = "discover_cluster_memberships"
+
+    if len(embeddings_train) > 0 and len(concept_set.candidates) > 0:
+        with log_step("explainability.chem_ace.infer_memberships", phase="discover_train"):
+            inferred_memberships_train = _infer_memberships_to_frozen_centroids(
+                embeddings=embeddings_train,
+                candidates=concept_set.candidates,
+                max_distance=float(config.chem_ace_infer_max_distance),
+            )
+        n_inferred_memberships_train = int(len(inferred_memberships_train))
+        concept_mol_map_train_infer, concept_conf_map_train_infer = _build_membership_maps_from_memberships(
+            memberships=inferred_memberships_train,
+            patches=patches_train,
+        )
+        if n_inferred_memberships_train > 0:
+            train_membership_source = "frozen_centroid_inference"
+            concept_mol_map_train = concept_mol_map_train_infer
+            concept_conf_map_train = concept_conf_map_train_infer
+        else:
+            concept_mol_map_train = concept_mol_map_train_discover
+            concept_conf_map_train = concept_conf_map_train_discover
+    else:
+        concept_mol_map_train = concept_mol_map_train_discover
+        concept_conf_map_train = concept_conf_map_train_discover
+
+    log_event(
+        "INFO",
+        "explainability.chem_ace.train_memberships_ready",
+        source=str(train_membership_source),
+        n_memberships_inferred=int(n_inferred_memberships_train),
+        n_concepts_hit_discover=int(len(concept_mol_map_train_discover)),
+        n_concepts_hit_inferred=int(len(concept_mol_map_train_infer)),
+        n_concepts_hit_selected=int(len(concept_mol_map_train)),
+        max_distance=float(config.chem_ace_infer_max_distance),
+    )
+
     if bool(config.run_activity_calibration):
         calibration_rows: list[Any] = []
         calibration_summary: dict[str, Any] = {}
@@ -1368,7 +1645,7 @@ def prepare_chem_ace_bundle(
     concept_conf_map_infer: dict[str, set[tuple[str, str]]] = {}
     n_patches_infer = 0
     n_embeddings_infer = 0
-    n_inferred_memberships = 0
+    n_inferred_memberships_infer = 0
 
     if len(ids_infer) > 0 and len(concept_set.candidates) > 0:
         progress_extras_infer = {
@@ -1433,11 +1710,11 @@ def prepare_chem_ace_bundle(
                     candidates=concept_set.candidates,
                     max_distance=float(config.chem_ace_infer_max_distance),
                 )
-            n_inferred_memberships = int(len(inferred_memberships))
-            if n_inferred_memberships > 0 and hasattr(pipeline.repository, "upsert_memberships"):
+            n_inferred_memberships_infer = int(len(inferred_memberships))
+            if n_inferred_memberships_infer > 0 and hasattr(pipeline.repository, "upsert_memberships"):
                 with log_step(
                     "explainability.chem_ace.persist_inferred_memberships",
-                    n_memberships=int(n_inferred_memberships),
+                    n_memberships=int(n_inferred_memberships_infer),
                 ):
                     pipeline.repository.upsert_memberships(inferred_memberships)
 
@@ -1448,7 +1725,7 @@ def prepare_chem_ace_bundle(
             log_event(
                 "INFO",
                 "explainability.chem_ace.infer_memberships_ready",
-                n_memberships=int(n_inferred_memberships),
+                n_memberships=int(n_inferred_memberships_infer),
                 n_concepts_hit=int(len(concept_mol_map_infer)),
                 max_distance=float(config.chem_ace_infer_max_distance),
             )
@@ -1537,6 +1814,75 @@ def prepare_chem_ace_bundle(
                 }
             )
 
+        # Fallback modality signal from descriptor blocks.
+        # This avoids losing geometry/QM channels when strict semantic thresholds
+        # do not emit explicit geometry/qm tags despite non-empty vectors.
+        evidence = t.evidence_json if isinstance(t.evidence_json, Mapping) else {}
+
+        def _summary_signal(summary: Any) -> float:
+            if not isinstance(summary, Mapping):
+                return 0.0
+            try:
+                n_vectors = float(summary.get("n_vectors", 0.0))
+            except Exception:
+                n_vectors = 0.0
+            try:
+                n_features = float(summary.get("n_features", 0.0))
+            except Exception:
+                n_features = 0.0
+            try:
+                family_cov = float(summary.get("family_coverage", 0.0))
+            except Exception:
+                family_cov = 0.0
+            top_abs = 0.0
+            try:
+                top = summary.get("top_features", [])
+                if isinstance(top, Sequence) and len(top) > 0 and isinstance(top[0], Mapping):
+                    top_abs = float(top[0].get("abs_z_mean", 0.0))
+            except Exception:
+                top_abs = 0.0
+
+            score = 0.0
+            if n_vectors > 0.0:
+                score += min(0.30, 0.05 * float(np.log1p(n_vectors)))
+            if n_features > 0.0:
+                score += min(0.20, 0.02 * float(np.log1p(n_features)))
+            score += 0.35 * float(np.clip(family_cov, 0.0, 1.0))
+            score += min(0.35, 0.10 * max(0.0, top_abs))
+            return float(max(0.0, score))
+
+        geom_signal = _summary_signal(evidence.get("geom_summary", {}))
+        qm_signal = max(
+            _summary_signal(evidence.get("qm_summary", {})),
+            _summary_signal(evidence.get("orca_summary", {})),
+        )
+
+        if modality_scores["geometry"] <= 0.0 and geom_signal > 0.0:
+            fallback_conf = float(min(0.30, 0.08 + 0.22 * geom_signal))
+            modality_scores["geometry"] += fallback_conf
+            tags_by_modality["geometry"].append("geometry_signal_present")
+            tag_details.append(
+                {
+                    "tag": "geometry_signal_present",
+                    "confidence": float(fallback_conf),
+                    "provenance": "modality_signal_fallback",
+                    "modality": "geometry",
+                }
+            )
+
+        if modality_scores["quantum"] <= 0.0 and qm_signal > 0.0:
+            fallback_conf = float(min(0.30, 0.08 + 0.22 * qm_signal))
+            modality_scores["quantum"] += fallback_conf
+            tags_by_modality["quantum"].append("quantum_signal_present")
+            tag_details.append(
+                {
+                    "tag": "quantum_signal_present",
+                    "confidence": float(fallback_conf),
+                    "provenance": "modality_signal_fallback",
+                    "modality": "quantum",
+                }
+            )
+
         total_score = float(sum(modality_scores.values()))
         if total_score <= 1e-12:
             modality_scores["2d"] = 1.0
@@ -1605,13 +1951,18 @@ def prepare_chem_ace_bundle(
     summary = {
         "run_id": str(run_id),
         "concept_set_id": str(concept_set_id),
+        "train_membership_source": str(train_membership_source),
         "n_molecules_discover": int(len(molecules_train)),
         "n_molecules_infer": int(len(molecules_infer)),
         "n_patches_discover": int(len(patches_train)),
         "n_patches_infer": int(n_patches_infer),
         "n_embeddings_discover": int(len(embeddings_train)),
         "n_embeddings_infer": int(n_embeddings_infer),
-        "n_inferred_memberships": int(n_inferred_memberships),
+        "n_inferred_memberships_train": int(n_inferred_memberships_train),
+        "n_inferred_memberships_infer": int(n_inferred_memberships_infer),
+        "n_concepts_hit_train_discover": int(len(concept_mol_map_train_discover)),
+        "n_concepts_hit_train_inferred": int(len(concept_mol_map_train_infer)),
+        "n_concepts_hit_infer_scope": int(len(concept_mol_map_infer)),
         "n_concepts": int(len(concept_set.candidates)),
         "selected_concepts": ordered_concepts,
         "a_priori_tags_csv": a_priori_paths.get("a_priori_tags_csv"),
@@ -1650,6 +2001,7 @@ def prepare_chem_ace_bundle(
         concept_support=support_map,
         concept_mol_map=concept_mol_map,
         concept_conf_map=concept_conf_map,
+        train_membership_source=str(train_membership_source),
         a_priori_tags_csv=(
             None
             if a_priori_paths.get("a_priori_tags_csv") is None
@@ -2490,6 +2842,7 @@ __all__ = [
     "FinalExplainabilityConfig",
     "MILLambdaVolFrameProvider",
     "build_positive_concept_targets",
+    "build_positive_concept_targets_with_report",
     "build_lambda_vol_callback",
     "make_monitor_loader",
     "prepare_chem_ace_bundle",

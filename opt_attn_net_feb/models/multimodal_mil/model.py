@@ -302,6 +302,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self.rl_enabled: bool = False
         self.rl_guidance_scale: float = 0.0
         self.rl_guidance_scale_max: float = 0.2
+        self.rl_negative_penalty: float = 0.15
         self.rl_task_target_concepts: list[tuple[str, ...]] = [tuple() for _ in range(NUM_TASKS)]
         self.rl_target_conf_pairs_by_task: list[set[tuple[str, str]]] = [set() for _ in range(NUM_TASKS)]
         self.rl_target_mols_by_task: list[set[str]] = [set() for _ in range(NUM_TASKS)]
@@ -314,6 +315,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         concept_mol_map: Dict[str, Set[str]],
         init_scale: float = 0.02,
         max_scale: float = 0.20,
+        negative_penalty: float = 0.15,
     ) -> None:
         """Attach concept-target guidance maps used by the RL controller callback."""
         self.rl_task_target_concepts = [tuple() for _ in range(NUM_TASKS)]
@@ -334,8 +336,10 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 for mol_id in concept_mol_map.get(str(cid), set()):
                     mols.add(str(mol_id))
 
-        self.rl_enabled = bool(any_target)
+        has_conf_target = bool(any(len(x) > 0 for x in self.rl_target_conf_pairs_by_task))
+        self.rl_enabled = bool(any_target and has_conf_target)
         self.rl_guidance_scale_max = float(max(0.0, max_scale))
+        self.rl_negative_penalty = float(max(0.0, negative_penalty))
         self.set_rl_guidance_scale(float(init_scale))
 
     def set_rl_guidance_scale(self, value: float) -> None:
@@ -372,22 +376,26 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
 
             for t in range(NUM_TASKS):
                 if float(y_cls[b, t].detach().item()) <= 0.5:
-                    continue
-                denom += 1
+                    y_pos = False
+                else:
+                    y_pos = True
                 w = attn[b, t, :L]
                 w = w / (w.sum() + 1e-8)
 
                 target_pairs = self.rl_target_conf_pairs_by_task[t]
-                target_mols = self.rl_target_mols_by_task[t]
                 idx = [i for i, cid in enumerate(confs) if (mol_id, str(cid)) in target_pairs]
-                if idx:
-                    idx_t = torch.tensor(idx, dtype=torch.long, device=attn.device)
-                    score = w.index_select(0, idx_t).sum()
-                elif mol_id in target_mols:
-                    score = torch.ones((), dtype=attn.dtype, device=attn.device)
+                if not idx:
+                    continue
+                idx_t = torch.tensor(idx, dtype=torch.long, device=attn.device)
+                score = w.index_select(0, idx_t).sum()
+                if y_pos:
+                    total = total + score
+                    denom += 1
                 else:
-                    score = torch.zeros((), dtype=attn.dtype, device=attn.device)
-                total = total + score
+                    neg_w = float(max(0.0, self.rl_negative_penalty))
+                    if neg_w > 0.0:
+                        total = total - (neg_w * score)
+                        denom += neg_w
 
         if denom <= 0:
             return torch.zeros((), dtype=attn.dtype, device=attn.device)

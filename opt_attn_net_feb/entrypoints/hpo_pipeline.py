@@ -251,12 +251,23 @@ class CLIExplainabilityConfig:
     lambda_vol_ricci_coupling_strength: float
     concept_rl_top_k_per_task: int
     concept_rl_min_pos_coverage: float
+    concept_rl_min_pos_hits: int
+    concept_rl_min_lift: float
+    concept_rl_overlap_weight: float
+    concept_rl_global_weight: float
+    concept_rl_lift_weight: float
+    concept_rl_general_top_k: int
+    concept_rl_min_multi_active_count: int
+    concept_rl_require_conf_support: bool
+    concept_rl_min_conf_pos_coverage: float
     concept_rl_init_scale: float
     concept_rl_max_scale: float
     concept_rl_policy_lr: float
     concept_rl_policy_sigma: float
     concept_rl_reward_alignment_w: float
+    concept_rl_reward_min_ap_w: float
     concept_rl_baseline_momentum: float
+    concept_rl_negative_penalty: float
 
 
 @dataclass(frozen=True)
@@ -490,12 +501,23 @@ class PipelineConfigFactory:
                 lambda_vol_ricci_coupling_strength=float(args.lambda_vol_ricci_coupling_strength),
                 concept_rl_top_k_per_task=int(args.concept_rl_top_k_per_task),
                 concept_rl_min_pos_coverage=float(args.concept_rl_min_pos_coverage),
+                concept_rl_min_pos_hits=int(args.concept_rl_min_pos_hits),
+                concept_rl_min_lift=float(args.concept_rl_min_lift),
+                concept_rl_overlap_weight=float(args.concept_rl_overlap_weight),
+                concept_rl_global_weight=float(args.concept_rl_global_weight),
+                concept_rl_lift_weight=float(args.concept_rl_lift_weight),
+                concept_rl_general_top_k=int(args.concept_rl_general_top_k),
+                concept_rl_min_multi_active_count=int(args.concept_rl_min_multi_active_count),
+                concept_rl_require_conf_support=bool(args.concept_rl_require_conf_support),
+                concept_rl_min_conf_pos_coverage=float(args.concept_rl_min_conf_pos_coverage),
                 concept_rl_init_scale=float(args.concept_rl_init_scale),
                 concept_rl_max_scale=float(args.concept_rl_max_scale),
                 concept_rl_policy_lr=float(args.concept_rl_policy_lr),
                 concept_rl_policy_sigma=float(args.concept_rl_policy_sigma),
                 concept_rl_reward_alignment_w=float(args.concept_rl_reward_alignment_w),
+                concept_rl_reward_min_ap_w=float(args.concept_rl_reward_min_ap_w),
                 concept_rl_baseline_momentum=float(args.concept_rl_baseline_momentum),
+                concept_rl_negative_penalty=float(args.concept_rl_negative_penalty),
             ),
         )
 
@@ -1099,6 +1121,21 @@ class MILPipelineOrchestrator:
                         concept_rl_min_pos_coverage=float(
                             self.config.explainability.concept_rl_min_pos_coverage
                         ),
+                        concept_rl_min_pos_hits=int(self.config.explainability.concept_rl_min_pos_hits),
+                        concept_rl_min_lift=float(self.config.explainability.concept_rl_min_lift),
+                        concept_rl_overlap_weight=float(self.config.explainability.concept_rl_overlap_weight),
+                        concept_rl_global_weight=float(self.config.explainability.concept_rl_global_weight),
+                        concept_rl_lift_weight=float(self.config.explainability.concept_rl_lift_weight),
+                        concept_rl_general_top_k=int(self.config.explainability.concept_rl_general_top_k),
+                        concept_rl_min_multi_active_count=int(
+                            self.config.explainability.concept_rl_min_multi_active_count
+                        ),
+                        concept_rl_require_conf_support=bool(
+                            self.config.explainability.concept_rl_require_conf_support
+                        ),
+                        concept_rl_min_conf_pos_coverage=float(
+                            self.config.explainability.concept_rl_min_conf_pos_coverage
+                        ),
                         concept_rl_init_scale=float(self.config.explainability.concept_rl_init_scale),
                         concept_rl_max_scale=float(self.config.explainability.concept_rl_max_scale),
                         concept_rl_policy_lr=float(self.config.explainability.concept_rl_policy_lr),
@@ -1106,8 +1143,14 @@ class MILPipelineOrchestrator:
                         concept_rl_reward_alignment_w=float(
                             self.config.explainability.concept_rl_reward_alignment_w
                         ),
+                        concept_rl_reward_min_ap_w=float(
+                            self.config.explainability.concept_rl_reward_min_ap_w
+                        ),
                         concept_rl_baseline_momentum=float(
                             self.config.explainability.concept_rl_baseline_momentum
+                        ),
+                        concept_rl_negative_penalty=float(
+                            self.config.explainability.concept_rl_negative_penalty
                         ),
                     )
 
@@ -1567,7 +1610,12 @@ def _parse_args(argv: Any | None = None):
             "Disabled by default to avoid massive disk usage."
         ),
     )
-    ap.add_argument("--chem_ace_top_concepts", type=int, default=64)
+    ap.add_argument(
+        "--chem_ace_top_concepts",
+        type=int,
+        default=0,
+        help="Top concepts kept from Chem-ACE by support (<=0 keeps all discovered concepts).",
+    )
     ap.add_argument(
         "--chem_ace_infer_max_distance",
         type=float,
@@ -1650,7 +1698,12 @@ def _parse_args(argv: Any | None = None):
     ap.add_argument("--lambda_vol_output_dir", default=None)
     ap.add_argument("--lambda_vol_db_uri", default=None)
     ap.add_argument("--lambda_vol_layer_name", default="mixer_post_norm")
-    ap.add_argument("--lambda_vol_top_concepts", type=int, default=24)
+    ap.add_argument(
+        "--lambda_vol_top_concepts",
+        type=int,
+        default=0,
+        help="Top concepts used by Lambda-Vol TCAV/pressure (<=0 uses all concepts from Chem-ACE).",
+    )
     ap.add_argument("--lambda_vol_monitor_max_samples", type=int, default=512)
     ap.add_argument("--lambda_vol_tcav_repeats", type=int, default=2)
     ap.add_argument("--lambda_vol_random_counterexamples", type=int, default=96)
@@ -1673,14 +1726,34 @@ def _parse_args(argv: Any | None = None):
     ap.add_argument("--lambda_vol_ricci_coupling_strength", type=float, default=0.05)
 
     # Concept-RL guidance (final train only; relies on Chem-ACE concepts)
-    ap.add_argument("--concept_rl_top_k_per_task", type=int, default=8)
+    ap.add_argument(
+        "--concept_rl_top_k_per_task",
+        type=int,
+        default=8,
+        help="Per-task cap of RL target concepts; <=0 means all passing concepts (no cap).",
+    )
     ap.add_argument("--concept_rl_min_pos_coverage", type=float, default=0.02)
+    ap.add_argument("--concept_rl_min_pos_hits", type=int, default=8)
+    ap.add_argument("--concept_rl_min_lift", type=float, default=1.05)
+    ap.add_argument("--concept_rl_overlap_weight", type=float, default=0.35)
+    ap.add_argument("--concept_rl_global_weight", type=float, default=0.20)
+    ap.add_argument("--concept_rl_lift_weight", type=float, default=0.25)
+    ap.add_argument("--concept_rl_general_top_k", type=int, default=4)
+    ap.add_argument("--concept_rl_min_multi_active_count", type=int, default=32)
+    ap.add_argument(
+        "--concept_rl_require_conf_support",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    ap.add_argument("--concept_rl_min_conf_pos_coverage", type=float, default=0.005)
     ap.add_argument("--concept_rl_init_scale", type=float, default=0.02)
     ap.add_argument("--concept_rl_max_scale", type=float, default=0.20)
     ap.add_argument("--concept_rl_policy_lr", type=float, default=0.05)
     ap.add_argument("--concept_rl_policy_sigma", type=float, default=0.02)
     ap.add_argument("--concept_rl_reward_alignment_w", type=float, default=0.25)
+    ap.add_argument("--concept_rl_reward_min_ap_w", type=float, default=0.15)
     ap.add_argument("--concept_rl_baseline_momentum", type=float, default=0.90)
+    ap.add_argument("--concept_rl_negative_penalty", type=float, default=0.15)
 
     return ap.parse_args(argv)
 

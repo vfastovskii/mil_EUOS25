@@ -28,8 +28,10 @@ class ConceptRLPolicyConfig:
     learning_rate: float = 0.05
     max_scale: float = 0.20
     reward_alignment_w: float = 0.25
+    reward_min_ap_w: float = 0.15
     baseline_momentum: float = 0.90
     reward_key: str = "val_macro_ap"
+    reward_min_key: str = "val_min_ap"
     alignment_key: str = "train_concept_alignment"
 
 
@@ -40,6 +42,7 @@ class ConceptRLEpochRecord:
     policy_mean_before: float
     policy_mean_after: float
     reward_model: float
+    reward_min_ap: float
     reward_alignment: float
     reward_total: float
     baseline: float
@@ -82,8 +85,13 @@ class ConceptRLControllerCallback(Callback):
             return
         metrics = getattr(trainer, "callback_metrics", {})
         reward_model = self._metric_float(metrics.get(self.config.reward_key, 0.0))
+        reward_min_ap = self._metric_float(metrics.get(self.config.reward_min_key, 0.0))
         reward_align = self._metric_float(metrics.get(self.config.alignment_key, 0.0))
-        reward_total = float(reward_model + float(self.config.reward_alignment_w) * reward_align)
+        reward_total = float(
+            reward_model
+            + float(self.config.reward_min_ap_w) * reward_min_ap
+            + float(self.config.reward_alignment_w) * reward_align
+        )
 
         if self.baseline is None:
             self.baseline = reward_total
@@ -110,6 +118,7 @@ class ConceptRLControllerCallback(Callback):
             policy_mean_before=mu_before,
             policy_mean_after=float(self.policy_mean),
             reward_model=float(reward_model),
+            reward_min_ap=float(reward_min_ap),
             reward_alignment=float(reward_align),
             reward_total=float(reward_total),
             baseline=float(self.baseline),
@@ -121,6 +130,7 @@ class ConceptRLControllerCallback(Callback):
             pl_module.log("rl_action_scale", float(self.last_action), on_step=False, on_epoch=True)
             pl_module.log("rl_policy_mean", float(self.policy_mean), on_step=False, on_epoch=True)
             pl_module.log("rl_reward_total", float(reward_total), on_step=False, on_epoch=True)
+            pl_module.log("rl_reward_min_ap", float(reward_min_ap), on_step=False, on_epoch=True)
             pl_module.log("rl_advantage", float(advantage), on_step=False, on_epoch=True)
 
         logger.info(
@@ -158,4 +168,3 @@ class ConceptRLControllerCallback(Callback):
 
 
 __all__ = ["ConceptRLPolicyConfig", "ConceptRLEpochRecord", "ConceptRLControllerCallback"]
-

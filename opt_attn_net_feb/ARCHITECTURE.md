@@ -1411,11 +1411,11 @@ This section lists defaults exactly as defined in typed configs and CLI parser, 
 - `chem_ace_max_2d_dim = 0` (`<=0` means auto-use full 2D raw dimension)
 - `chem_ace_max_3dqm_dim = 0` (`<=0` means auto-use full merged 3D+QM raw dimension)
 - `chem_ace_persist_patch_embeddings = False` (avoid writing millions of per-patch embedding files by default)
-- `chem_ace_top_concepts = 64`
+- `chem_ace_top_concepts = 0` (`<=0` means keep all discovered concepts)
 - `lambda_vol_output_dir = None`
 - `lambda_vol_db_uri = None`
 - `lambda_vol_layer_name = \"mixer_post_norm\"`
-- `lambda_vol_top_concepts = 24`
+- `lambda_vol_top_concepts = 0` (`<=0` means evaluate all concepts from Chem-ACE)
 - `lambda_vol_monitor_max_samples = 512`
 - `lambda_vol_tcav_repeats = 2`
 - `lambda_vol_random_counterexamples = 96`
@@ -1460,11 +1460,11 @@ Explainability:
 - `--chem_ace_max_2d_dim 0` (`<=0` means auto-use full 2D raw dimension)
 - `--chem_ace_max_3dqm_dim 0` (`<=0` means auto-use full merged 3D+QM raw dimension)
 - `--chem_ace_persist_patch_embeddings false` (enable only if you explicitly need patch-embedding files/rows)
-- `--chem_ace_top_concepts 64`
+- `--chem_ace_top_concepts 0` (`<=0` means keep all discovered concepts)
 - `--lambda_vol_output_dir None`
 - `--lambda_vol_db_uri None`
 - `--lambda_vol_layer_name mixer_post_norm`
-- `--lambda_vol_top_concepts 24`
+- `--lambda_vol_top_concepts 0` (`<=0` means evaluate all concepts from Chem-ACE)
 - `--lambda_vol_monitor_max_samples 512`
 - `--lambda_vol_tcav_repeats 2`
 - `--lambda_vol_random_counterexamples 96`

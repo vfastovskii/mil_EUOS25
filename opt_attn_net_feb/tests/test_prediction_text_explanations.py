@@ -31,6 +31,7 @@ class PredictionTextExplanationsTest(unittest.TestCase):
             for mol_id, conf_id, p0, a0 in [
                 ("m1", "c1", 0.83, 0.72),
                 ("m2", "d1", 0.21, 0.18),
+                ("m3", "e1", 0.61, 0.16),
             ]:
                 row = {"ID": mol_id, "conf_id": conf_id}
                 for ti, task in enumerate(TASK_COLS):
@@ -63,6 +64,15 @@ class PredictionTextExplanationsTest(unittest.TestCase):
                     },
                 ]
             ).to_csv(ricci_path, index=False)
+            priors_path = root / "a_priori_tags.csv"
+            pd.DataFrame(
+                [
+                    {
+                        "ID": "m3",
+                        "a_priori_tags": "carboxylate;anionic;rx_role_electrophile",
+                    }
+                ]
+            ).to_csv(priors_path, index=False)
 
             concept_ids = ["c_arom", "c_cat", "c_other"]
             concept_metadata = {
@@ -99,6 +109,7 @@ class PredictionTextExplanationsTest(unittest.TestCase):
                 concept_conf_map=concept_conf_map,
                 task_cols=TASK_COLS,
                 ricci_edges_csv=str(ricci_path),
+                a_priori_tags_csv=str(priors_path),
                 top_k=2,
                 bridge_threshold=0.15,
             )
@@ -108,9 +119,11 @@ class PredictionTextExplanationsTest(unittest.TestCase):
 
             df = pd.read_csv(out_path)
             self.assertIn("prediction_explanation", df.columns)
+            self.assertIn("assigned_semantic_tags", df.columns)
             for task in TASK_COLS:
                 self.assertIn(f"top_concepts_{task}", df.columns)
                 self.assertIn(f"top_concept_labels_{task}", df.columns)
+                self.assertIn(f"assigned_semantic_tags_{task}", df.columns)
                 self.assertIn(f"prediction_explanation_{task}", df.columns)
 
             row_m1 = df[(df["ID"] == "m1") & (df["conf_id"] == "c1")].iloc[0]
@@ -123,7 +136,11 @@ class PredictionTextExplanationsTest(unittest.TestCase):
             expl_m2 = str(row_m2[f"prediction_explanation_{TASK_COLS[0]}"])
             self.assertIn("aliphatic neutral motif", expl_m2)
 
+            row_m3 = df[(df["ID"] == "m3") & (df["conf_id"] == "e1")].iloc[0]
+            expl_m3 = str(row_m3[f"prediction_explanation_{TASK_COLS[0]}"])
+            self.assertIn("A-priori tags", expl_m3)
+            self.assertIn("carboxylate", str(row_m3["assigned_semantic_tags"]))
+
 
 if __name__ == "__main__":
     unittest.main()
-

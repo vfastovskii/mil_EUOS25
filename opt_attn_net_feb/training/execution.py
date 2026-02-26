@@ -38,7 +38,7 @@ from .builders import DataLoaderBuilder, LoaderConfig, MILModelBuilder
 from .configs import HPOConfig
 from .explainability_runtime import (
     FinalExplainabilityConfig,
-    build_positive_concept_targets,
+    build_positive_concept_targets_with_report,
     build_lambda_vol_callback,
     make_monitor_loader,
     prepare_chem_ace_bundle,
@@ -46,6 +46,92 @@ from .explainability_runtime import (
 from .loss_config import compute_gamma, compute_lam, compute_posw_clips
 from .search_space import search_space
 from .trainer import LightningTrainerConfig, LightningTrainerFactory, ModelEvaluator
+
+
+def _export_concept_rl_active_assignments(
+    *,
+    out_csv_path: Path,
+    out_summary_path: Path,
+    ids_train: Sequence[str],
+    y_cls_train: np.ndarray,
+    concept_targets: dict[int, tuple[str, ...]],
+    concept_mol_map: Dict[str, set[str]],
+    concept_conf_map: Dict[str, set[tuple[str, str]]],
+) -> tuple[str, str]:
+    """Export per-active train sample target-concept assignments used by Concept-RL."""
+    ids = [str(x) for x in ids_train]
+    y = np.asarray(y_cls_train, dtype=np.float32)
+    if y.ndim != 2 or y.shape[0] != len(ids):
+        raise ValueError(
+            f"Invalid y_cls_train shape for assignment export: shape={tuple(y.shape)} n_ids={len(ids)}"
+        )
+
+    conf_hits: Dict[tuple[str, str], int] = {}
+    for cid, pairs in concept_conf_map.items():
+        c = str(cid)
+        for mol_id, _conf_id in pairs:
+            key = (c, str(mol_id))
+            conf_hits[key] = int(conf_hits.get(key, 0) + 1)
+
+    rows: List[Dict[str, Any]] = []
+    summary_tasks: Dict[str, Any] = {}
+
+    for ti, task_name in enumerate(TASK_COLS):
+        pos_idx = np.where(y[:, ti] > 0.5)[0]
+        target_ids = [str(x) for x in concept_targets.get(int(ti), tuple())]
+        hit_pos = 0
+        total_target_hits = 0
+        total_conf_hits = 0
+
+        for i in pos_idx.tolist():
+            mol_id = ids[int(i)]
+            hit_concepts: List[str] = []
+            conf_hits_for_mol = 0
+
+            for cid in target_ids:
+                if mol_id in concept_mol_map.get(cid, set()):
+                    hit_concepts.append(str(cid))
+                    conf_hits_for_mol += int(conf_hits.get((str(cid), mol_id), 0))
+
+            has_hit = len(hit_concepts) > 0
+            if has_hit:
+                hit_pos += 1
+            total_target_hits += int(len(hit_concepts))
+            total_conf_hits += int(conf_hits_for_mol)
+
+            rows.append(
+                {
+                    "task_idx": int(ti),
+                    "task_name": str(task_name),
+                    "mol_id": str(mol_id),
+                    "is_active": 1,
+                    "target_concepts": "|".join(hit_concepts),
+                    "n_target_concepts_hit": int(len(hit_concepts)),
+                    "n_target_conf_hits": int(conf_hits_for_mol),
+                    "has_target_hit": int(1 if has_hit else 0),
+                }
+            )
+
+        n_pos = int(len(pos_idx))
+        summary_tasks[str(task_name)] = {
+            "n_active": int(n_pos),
+            "n_active_with_target_hit": int(hit_pos),
+            "active_hit_coverage": float(hit_pos / float(max(1, n_pos))),
+            "n_target_concepts": int(len(target_ids)),
+            "avg_target_concepts_hit_per_active": float(total_target_hits / float(max(1, n_pos))),
+            "avg_target_conf_hits_per_active": float(total_conf_hits / float(max(1, n_pos))),
+            "target_concepts": [str(x) for x in target_ids],
+        }
+
+    df = pd.DataFrame(rows)
+    df.to_csv(out_csv_path, index=False)
+    summary_payload = {
+        "n_train_ids": int(len(ids)),
+        "n_rows": int(len(df)),
+        "tasks": summary_tasks,
+    }
+    out_summary_path.write_text(json.dumps(summary_payload, indent=2))
+    return str(out_csv_path), str(out_summary_path)
 
 
 def _resolve_device(accelerator: str) -> torch.device:
@@ -977,14 +1063,27 @@ class MILFinalTrainer:
             )
 
         concept_rl_targets: dict[int, tuple[str, ...]] = {}
+        concept_rl_target_report: dict[str, Any] | None = None
         if explain_cfg is not None and bool(explain_cfg.run_concept_rl) and chem_bundle is not None:
             log_event("INFO", "final.concept_rl.build_targets")
-            concept_rl_targets = build_positive_concept_targets(
+            concept_rl_targets, concept_rl_target_report = build_positive_concept_targets_with_report(
                 config=explain_cfg,
                 ids_train=ids_tr,
                 y_cls_train=y_tr,
                 chem_bundle=chem_bundle,
             )
+            if concept_rl_target_report is not None:
+                log_event(
+                    "INFO",
+                    "final.concept_rl.target_source",
+                    concept_source_train=str(
+                        concept_rl_target_report.get(
+                            "concept_source_train",
+                            getattr(chem_bundle, "train_membership_source", "unknown"),
+                        )
+                    ),
+                    n_concepts=int(concept_rl_target_report.get("n_concepts", len(chem_bundle.concept_ids))),
+                )
 
         rl_active = bool(
             explain_cfg is not None
@@ -995,6 +1094,17 @@ class MILFinalTrainer:
         if bool(explain_cfg is not None and bool(explain_cfg.run_concept_rl) and not rl_active):
             print("[FINAL][CONCEPT-RL] requested but disabled (no target concepts available).")
         log_event("INFO", "final.concept_rl.status", rl_active=bool(rl_active))
+
+        final_dir = outdir / "final_best_train_vs_leaderboard"
+        final_dir.mkdir(parents=True, exist_ok=True)
+        log_event("INFO", "final.output_dir_ready", final_dir=str(final_dir))
+        target_report_path: Path | None = None
+        target_assignment_csv_path: Path | None = None
+        target_assignment_summary_path: Path | None = None
+        if concept_rl_target_report is not None:
+            target_report_path = final_dir / "concept_rl_target_selection.json"
+            target_report_path.write_text(json.dumps(concept_rl_target_report, indent=2))
+            log_event("INFO", "final.concept_rl.target_report", path=str(target_report_path))
 
         log_event("INFO", "final.build_datasets")
         ds_tr = MILTrainDataset(
@@ -1121,12 +1231,57 @@ class MILFinalTrainer:
         )
 
         if rl_active and explain_cfg is not None and chem_bundle is not None:
+            train_set = {str(x) for x in ids_tr}
+            target_concepts = {
+                str(cid)
+                for vals in concept_rl_targets.values()
+                for cid in vals
+            }
+            rl_concept_mol_map: Dict[str, set[str]] = {}
+            rl_concept_conf_map: Dict[str, set[tuple[str, str]]] = {}
+            for cid in sorted(target_concepts):
+                mols = {
+                    str(mid) for mid in chem_bundle.concept_mol_map.get(str(cid), set())
+                    if str(mid) in train_set
+                }
+                confs = {
+                    (str(mid), str(conf))
+                    for (mid, conf) in chem_bundle.concept_conf_map.get(str(cid), set())
+                    if str(mid) in train_set
+                }
+                if len(mols) > 0:
+                    rl_concept_mol_map[str(cid)] = mols
+                if len(confs) > 0:
+                    rl_concept_conf_map[str(cid)] = confs
+
+            target_assignment_csv_path = final_dir / "concept_rl_active_assignments.csv"
+            target_assignment_summary_path = final_dir / "concept_rl_active_assignments_summary.json"
+            _export_concept_rl_active_assignments(
+                out_csv_path=target_assignment_csv_path,
+                out_summary_path=target_assignment_summary_path,
+                ids_train=ids_tr,
+                y_cls_train=y_tr,
+                concept_targets=concept_rl_targets,
+                concept_mol_map=rl_concept_mol_map,
+                concept_conf_map=rl_concept_conf_map,
+            )
+            log_event(
+                "INFO",
+                "final.concept_rl.active_assignments",
+                csv_path=str(target_assignment_csv_path),
+                summary_path=str(target_assignment_summary_path),
+                n_target_concepts=int(len(target_concepts)),
+                n_target_concepts_with_mols=int(len(rl_concept_mol_map)),
+                n_target_concepts_with_confs=int(len(rl_concept_conf_map)),
+            )
+
             model.configure_rl_concept_guidance(
                 task_target_concepts=concept_rl_targets,
-                concept_conf_map=dict(chem_bundle.concept_conf_map),
-                concept_mol_map=dict(chem_bundle.concept_mol_map),
+                concept_conf_map=rl_concept_conf_map,
+                concept_mol_map=rl_concept_mol_map,
                 init_scale=float(explain_cfg.concept_rl_init_scale),
                 max_scale=float(explain_cfg.concept_rl_max_scale),
+                negative_penalty=float(explain_cfg.concept_rl_negative_penalty),
             )
             print(
                 "[FINAL][CONCEPT-RL] enabled "
@@ -1137,10 +1292,6 @@ class MILFinalTrainer:
                 "final.concept_rl.enabled",
                 targets_per_task=[len(v) for _, v in sorted(concept_rl_targets.items())],
             )
-
-        final_dir = outdir / "final_best_train_vs_leaderboard"
-        final_dir.mkdir(parents=True, exist_ok=True)
-        log_event("INFO", "final.output_dir_ready", final_dir=str(final_dir))
 
         rl_cb = None
         rl_policy_path = None
@@ -1153,8 +1304,10 @@ class MILFinalTrainer:
                     learning_rate=float(explain_cfg.concept_rl_policy_lr),
                     max_scale=float(explain_cfg.concept_rl_max_scale),
                     reward_alignment_w=float(explain_cfg.concept_rl_reward_alignment_w),
+                    reward_min_ap_w=float(explain_cfg.concept_rl_reward_min_ap_w),
                     baseline_momentum=float(explain_cfg.concept_rl_baseline_momentum),
                     reward_key="val_macro_ap",
+                    reward_min_key="val_min_ap",
                     alignment_key="train_concept_alignment",
                 ),
                 out_json_path=str(rl_policy_path),
@@ -1281,6 +1434,11 @@ class MILFinalTrainer:
                 task_cols=TASK_COLS,
                 ricci_edges_csv=(None if lv_art is None else lv_art.ricci_edges_csv),
                 lambda_vol_long_csv=(None if lv_art is None else lv_art.long_csv),
+                a_priori_tags_csv=(
+                    chem_bundle.a_priori_tags_infer_csv
+                    if chem_bundle.a_priori_tags_infer_csv is not None
+                    else chem_bundle.a_priori_tags_csv
+                ),
                 top_k=3,
                 bridge_threshold=0.20,
             )
@@ -1293,6 +1451,7 @@ class MILFinalTrainer:
                 "db_uri": str(chem_bundle.db_uri),
                 "run_id": str(chem_bundle.run_id),
                 "concept_set_id": str(chem_bundle.concept_set_id),
+                "train_membership_source": str(chem_bundle.train_membership_source),
                 "n_concepts": int(len(chem_bundle.concept_ids)),
                 "concept_ids": [str(x) for x in chem_bundle.concept_ids],
                 "a_priori_tags_csv": (
@@ -1341,13 +1500,30 @@ class MILFinalTrainer:
                     "ricci_summary_csv": lv_art.ricci_summary_csv,
                     "ricci_flow_npz": lv_art.ricci_flow_npz,
                 }
-        if rl_cb is not None and rl_policy_path is not None and rl_policy_path.exists():
+        if concept_rl_target_report is not None:
             explainability_payload["concept_rl"] = {
-                "policy_history_json": str(rl_policy_path),
+                "target_selection_report_json": (
+                    None if target_report_path is None else str(target_report_path)
+                ),
+                "active_assignments_csv": (
+                    None if target_assignment_csv_path is None else str(target_assignment_csv_path)
+                ),
+                "active_assignments_summary_json": (
+                    None
+                    if target_assignment_summary_path is None
+                    else str(target_assignment_summary_path)
+                ),
                 "target_concepts_by_task": {
                     str(int(k)): [str(x) for x in v] for k, v in concept_rl_targets.items()
                 },
             }
+        if (
+            rl_cb is not None
+            and rl_policy_path is not None
+            and rl_policy_path.exists()
+            and ("concept_rl" in explainability_payload)
+        ):
+            explainability_payload["concept_rl"]["policy_history_json"] = str(rl_policy_path)
 
         if explainability_payload:
             (final_dir / "explainability_artifacts.json").write_text(

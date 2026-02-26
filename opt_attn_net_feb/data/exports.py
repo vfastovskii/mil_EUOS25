@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 from pathlib import Path
 
@@ -313,6 +314,13 @@ def _infer_modality_from_tag_text(tag: str) -> str:
         "charge-transfer",
         "quantum",
         "frontier",
+        "excited-state",
+        "oscillator",
+        "singlet-triplet",
+        "spin-orbit",
+        "radiative",
+        "nonradiative",
+        "orca",
     )
     geom_tokens = (
         "planar",
@@ -325,6 +333,11 @@ def _infer_modality_from_tag_text(tag: str) -> str:
         "ring-strained",
         "shape",
         "surface/volume",
+        "topology",
+        "cavity",
+        "inertia",
+        "conformer",
+        "3d",
     )
     if any(tok in t for tok in qm_tokens):
         return "quantum"
@@ -408,22 +421,153 @@ def _concept_phrase(
     modality: str | None = None,
 ) -> str:
     label = str(metadata.get("label_auto") or concept_id)
-    if modality is None:
-        tags = metadata.get("tags", [])
-    else:
-        _w, tags_by_modality = _concept_modality_bundle(metadata)
-        tags = tags_by_modality.get(str(modality), [])
-        if len(tags) == 0:
-            tags = metadata.get("tags", [])
-    if isinstance(tags, (list, tuple)):
-        tags_txt = ", ".join([str(x) for x in tags[:2]]) if len(tags) > 0 else "no-tags"
-    else:
-        tags_txt = "no-tags"
+    tags = _select_display_tags(metadata=metadata, modality=modality, max_tags=3)
+    tags_txt = ", ".join([str(x) for x in tags]) if len(tags) > 0 else "no-tags"
     level = "conf" if is_conf_level else "mol"
     phrase = f"{label} [{tags_txt}] ({level})"
     if float(bridge_score) >= float(bridge_threshold):
         phrase += " bridge-like"
     return phrase
+
+
+def _load_a_priori_tags_map(a_priori_tags_csv: str | None) -> dict[str, list[str]]:
+    if a_priori_tags_csv is None:
+        return {}
+    path = Path(a_priori_tags_csv)
+    if not path.exists():
+        return {}
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+
+    id_col = None
+    for c in ("ID", "id", "mol_id"):
+        if c in df.columns:
+            id_col = c
+            break
+    if id_col is None:
+        return {}
+
+    def _split_tags(value: Any) -> list[str]:
+        txt = str(value).strip()
+        if len(txt) == 0 or txt.lower() in {"nan", "none"}:
+            return []
+        return [str(x).strip() for x in txt.split(";") if str(x).strip()]
+
+    out: dict[str, list[str]] = {}
+    for row in df.itertuples(index=False):
+        mid = str(getattr(row, id_col, "")).strip()
+        if len(mid) == 0:
+            continue
+        tags: list[str] = []
+        for col in ("a_priori_tags", "a_priori_functional_tags", "a_priori_smartsrx_tags"):
+            if col not in df.columns:
+                continue
+            tags.extend(_split_tags(getattr(row, col, "")))
+        if len(tags) == 0:
+            continue
+        out[mid] = sorted(set(tags))
+    return out
+
+
+def _is_generic_tag(tag: str) -> bool:
+    t = str(tag).strip().lower()
+    if len(t) == 0:
+        return True
+    generic_exact = {
+        "hbd",
+        "hba",
+        "hbd/hba pair",
+        "aromatic pi-system",
+        "planar",
+        "non-planar",
+        "twisted",
+        "rigid",
+        "flexible",
+        "aliphatic",
+        "neutral polar",
+        "neutral nonpolar",
+        "cationic center",
+        "anionic center",
+        "geometry_signal_present",
+        "quantum_signal_present",
+        "no-tags",
+    }
+    if t in generic_exact:
+        return True
+    if t.startswith("rx_role_"):
+        return True
+    if t.endswith("_signal_present"):
+        return True
+    return False
+
+
+def _select_display_tags(
+    *,
+    metadata: Mapping[str, Any],
+    modality: str | None,
+    max_tags: int,
+) -> list[str]:
+    desired_mod = None if modality is None else str(modality)
+    details = metadata.get("tag_details", [])
+    picked: list[str] = []
+    if isinstance(details, list):
+        rows: list[tuple[float, str]] = []
+        for rec in details:
+            if not isinstance(rec, Mapping):
+                continue
+            tag = str(rec.get("tag", "")).strip()
+            if len(tag) == 0:
+                continue
+            if desired_mod is not None:
+                mod = str(rec.get("modality", "")).strip()
+                if mod != desired_mod:
+                    continue
+            conf = float(rec.get("confidence", 0.0))
+            # Boost specific tags and downweight broad placeholders.
+            if _is_generic_tag(tag):
+                conf *= 0.35
+            else:
+                conf *= 1.25
+            rows.append((conf, tag))
+        rows.sort(key=lambda x: x[0], reverse=True)
+        for _, tag in rows:
+            if tag not in picked:
+                picked.append(tag)
+            if len(picked) >= int(max_tags):
+                break
+
+    if len(picked) < int(max_tags):
+        fallback_tags: list[str] = []
+        if desired_mod is None:
+            raw = metadata.get("tags", [])
+            if isinstance(raw, (list, tuple)):
+                fallback_tags = [str(x) for x in raw if str(x).strip()]
+        else:
+            _w, tags_by_modality = _concept_modality_bundle(metadata)
+            raw = tags_by_modality.get(desired_mod, [])
+            if isinstance(raw, (list, tuple)):
+                fallback_tags = [str(x) for x in raw if str(x).strip()]
+            if len(fallback_tags) == 0:
+                raw_all = metadata.get("tags", [])
+                if isinstance(raw_all, (list, tuple)):
+                    fallback_tags = [str(x) for x in raw_all if str(x).strip()]
+
+        # Prefer specific fallback tags first.
+        fallback_tags = sorted(
+            set(fallback_tags),
+            key=lambda x: (int(_is_generic_tag(str(x))), -len(str(x))),
+        )
+        for tag in fallback_tags:
+            if tag not in picked:
+                picked.append(str(tag))
+            if len(picked) >= int(max_tags):
+                break
+
+    return picked[: max(1, int(max_tags))]
 
 
 def export_prediction_text_explanations(
@@ -437,6 +581,7 @@ def export_prediction_text_explanations(
     task_cols: Sequence[str] = TASK_COLS,
     ricci_edges_csv: str | None = None,
     lambda_vol_long_csv: str | None = None,
+    a_priori_tags_csv: str | None = None,
     tcav_weight: float = 0.35,
     top_k: int = 3,
     bridge_threshold: float = 0.20,
@@ -473,6 +618,7 @@ def export_prediction_text_explanations(
 
     bridge_scores = _compute_ricci_bridge_scores(ricci_edges_csv=ricci_edges_csv, task_cols=task_cols)
     tcav_scores = _compute_tcav_last_scores(lambda_vol_long_csv=lambda_vol_long_csv, task_cols=task_cols)
+    a_priori_tags_map = _load_a_priori_tags_map(a_priori_tags_csv)
     mol_to_concepts, conf_to_concepts = _build_concept_index_maps(
         concept_ids=concept_ids,
         concept_mol_map=concept_mol_map,
@@ -482,10 +628,18 @@ def export_prediction_text_explanations(
     concept_set = {str(x) for x in concept_ids}
     kk = max(1, int(top_k))
     tcav_weight = float(max(0.0, tcav_weight))
+    scope_molecules = set([str(x) for x in df["ID"].astype(str).tolist()])
+    scope_molecules.update([str(x) for x in mol_to_concepts.keys()])
+    scope_n = float(max(1, len(scope_molecules)))
+    concept_coverage = {
+        str(cid): float(concept_metadata.get(str(cid), {}).get("n_molecules_total", 0.0))
+        for cid in concept_set
+    }
 
     per_task_expl_cols: dict[str, list[str]] = {str(t): [] for t in task_cols}
     per_task_top_ids: dict[str, list[str]] = {str(t): [] for t in task_cols}
     per_task_top_labels: dict[str, list[str]] = {str(t): [] for t in task_cols}
+    per_task_assigned_tags: dict[str, list[str]] = {str(t): [] for t in task_cols}
     modality_map = (("2d", "2d"), ("geometry", "geom"), ("quantum", "qm"))
     per_task_mod_top_ids: dict[str, dict[str, list[str]]] = {
         str(t): {str(col): [] for _, col in modality_map}
@@ -500,6 +654,7 @@ def export_prediction_text_explanations(
         for t in task_cols
     }
     joined_explanations: list[str] = []
+    assigned_semantic_tags: list[str] = []
 
     for row in df.itertuples(index=False):
         mol_id = str(getattr(row, "ID"))
@@ -522,12 +677,18 @@ def export_prediction_text_explanations(
                 bridge = float(bridge_scores.get((t, cid), 0.0))
                 tcav = float(tcav_scores.get((t, cid), 0.0))
                 support = float(concept_metadata.get(cid, {}).get("support", 1.0))
+                coverage = float(concept_coverage.get(str(cid), 0.0))
+                if coverage <= 0.0:
+                    coverage = max(1.0, support)
                 modality_weights, modality_tags = _concept_modality_bundle(concept_metadata.get(cid, {}))
-                support_gain = 1.0 + min(0.25, 0.05 * float(np.log1p(max(support, 0.0))))
+                support_gain = 1.0 + min(0.10, 0.02 * float(np.log1p(max(support, 0.0))))
+                rarity_idf = float(math.log1p((scope_n + 1.0) / (1.0 + coverage)))
+                rarity_gain = float(np.clip(0.75 + 0.35 * rarity_idf, 0.75, 1.40))
                 base = (
                     attn
                     * (1.15 if conf_level else 0.85)
                     * support_gain
+                    * rarity_gain
                     * (1.0 + 0.35 * bridge)
                     * (1.0 + tcav_weight * max(0.0, tcav))
                 )
@@ -544,10 +705,29 @@ def export_prediction_text_explanations(
             per_task_top_ids[t].append("|".join(top_ids))
             per_task_top_labels[t].append("|".join(top_labels))
 
+            task_tags: list[str] = []
+            if len(top) > 0:
+                for _, cid, _is_conf_level, _bridge, _tcav, _mw, _mt in top:
+                    task_tags.extend(
+                        _select_display_tags(
+                            metadata=concept_metadata.get(cid, {}),
+                            modality=None,
+                            max_tags=2,
+                        )
+                    )
+            if len(task_tags) == 0:
+                task_tags = [str(x) for x in a_priori_tags_map.get(mol_id, [])]
+            task_tags = sorted(set([str(x) for x in task_tags if str(x).strip()]))
+            per_task_assigned_tags[t].append("|".join(task_tags[:8]))
+
             if len(top) == 0:
+                prior_txt = ""
+                if len(task_tags) > 0:
+                    prior_txt = " A-priori tags: " + ", ".join(task_tags[:4]) + "."
                 expl = (
                     f"{t}: p={pred:.3f} (label={label}). "
                     "No matched Chem-ACE concept on this conformer; prediction uses global representation."
+                    + prior_txt
                 )
             else:
                 phrases = [
@@ -633,11 +813,20 @@ def export_prediction_text_explanations(
             row_join_parts.append(" ".join(modal_join))
 
         joined_explanations.append(" | ".join(row_join_parts))
+        row_tags: list[str] = []
+        for t in task_cols:
+            row_tags.extend(
+                [str(x) for x in str(per_task_assigned_tags[str(t)][-1]).split("|") if str(x).strip()]
+            )
+        if len(row_tags) == 0:
+            row_tags = [str(x) for x in a_priori_tags_map.get(mol_id, [])]
+        assigned_semantic_tags.append("|".join(sorted(set(row_tags))[:16]))
 
     for task in task_cols:
         t = str(task)
         df[f"top_concepts_{t}"] = per_task_top_ids[t]
         df[f"top_concept_labels_{t}"] = per_task_top_labels[t]
+        df[f"assigned_semantic_tags_{t}"] = per_task_assigned_tags[t]
         df[f"prediction_explanation_{t}"] = per_task_expl_cols[t]
         df[f"top_concepts_2d_{t}"] = per_task_mod_top_ids[t]["2d"]
         df[f"top_concept_labels_2d_{t}"] = per_task_mod_top_labels[t]["2d"]
@@ -648,6 +837,7 @@ def export_prediction_text_explanations(
         df[f"top_concepts_qm_{t}"] = per_task_mod_top_ids[t]["qm"]
         df[f"top_concept_labels_qm_{t}"] = per_task_mod_top_labels[t]["qm"]
         df[f"prediction_explanation_qm_{t}"] = per_task_mod_expl[t]["qm"]
+    df["assigned_semantic_tags"] = assigned_semantic_tags
     df["prediction_explanation"] = joined_explanations
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
