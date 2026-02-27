@@ -4,6 +4,7 @@ This guide shows how to run the MIL HPO/training pipeline as a Slurm job
 using the project entrypoint script:
 
 - `opt_net_fast.py`
+- Canonical maintained Slurm wrapper in this repo: `run_mil_hpo_debye.slurm`
 
 ## 1) Expected inputs
 
@@ -13,6 +14,13 @@ The pipeline requires these CSV files:
 - 2D features: `--feat2d_scaled`
 - 3D geometry features: `--feat3d_scaled`
 - 3D QM features: `--feat3d_qm_scaled`
+
+Optional semantic-only raw tables (recommended for physically meaningful Chem-ACE tags):
+
+- raw 3D geometry: `--feat3d_raw`
+- raw 3D QM: `--feat3d_qm_raw`
+
+If raw tables are provided, both must be provided.
 
 Output folder is set by `--study_dir`.
 
@@ -54,6 +62,8 @@ python "${PROJECT_DIR}/opt_net_fast.py" \
   --feat2d_scaled "${DATA_DIR}/feat2d_scaled.csv" \
   --feat3d_scaled "${DATA_DIR}/feat3d_scaled.csv" \
   --feat3d_qm_scaled "${DATA_DIR}/feat3d_qm_scaled.csv" \
+  --feat3d_raw "${DATA_DIR}/feat3d_raw.csv" \
+  --feat3d_qm_raw "${DATA_DIR}/feat3d_qm_raw.csv" \
   --study_dir "${OUT_DIR}" \
   --id_col ID \
   --conf_col conf_id \
@@ -96,6 +106,9 @@ tail -f /path/to/mil_explainability_2026/opt_attn_net_feb/logs/mil_hpo_<jobid>.o
 
 ## 4) Notes
 
+- On Debye, prefer using the repository script:
+  - `sbatch /Users/vfastovskii/Desktop/mil_explainability_2026/opt_attn_net_feb/run_mil_hpo_debye.slurm`
+  - it already handles node-local copy, explainability toggles, RL ablation, and optional raw semantic tables.
 - Keep `--num_workers -1` to auto-tune workers from `SLURM_CPUS_PER_TASK`.
 - Keep `--cpu_workers -1` to auto-allocate CPU worker budget for CPU-bound stages (Chem-ACE patch generation/tagging/feature embedding and torch CPU thread pools).
 - If your cluster uses different GPU resource syntax, adapt `#SBATCH --gres=gpu:1`.
@@ -103,3 +116,5 @@ tail -f /path/to/mil_explainability_2026/opt_attn_net_feb/logs/mil_hpo_<jobid>.o
   - train on `split == train`
   - validate on `split == leaderboard_split`
 - Attention export path can be overridden with `--attn_out ...`.
+- If your conformer SDF stores conformer id in SDF record name, pass:
+  - `--chem_ace_sdf_conf_id_prop _Name`

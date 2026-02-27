@@ -1154,6 +1154,15 @@ def prepare_chem_ace_bundle(
     inst_qm_dim: int = -1,
     inst_geom_cols: Sequence[str] = (),
     inst_qm_cols: Sequence[str] = (),
+    starts_raw: Optional[np.ndarray] = None,
+    counts_raw: Optional[np.ndarray] = None,
+    id2pos_raw: Optional[Mapping[str, int]] = None,
+    conf_sorted_raw: Optional[np.ndarray] = None,
+    Xinst_sorted_raw: Optional[np.ndarray] = None,
+    inst_geom_dim_raw: int = -1,
+    inst_qm_dim_raw: int = -1,
+    inst_geom_cols_raw: Sequence[str] = (),
+    inst_qm_cols_raw: Sequence[str] = (),
 ) -> Optional[ChemACEBundle]:
     """
     Build Chem-ACE concepts and mappings with leakage-safe two-phase logic.
@@ -1360,6 +1369,64 @@ def prepare_chem_ace_bundle(
         max_confs_per_id=int(config.chem_ace_max_confs_per_id),
     )
 
+    # Use raw (unscaled) 3D/QM vectors for semantic descriptor summaries when provided.
+    inst_map_sem = inst_map
+    inst_mean_map_sem = inst_mean_map
+    inst_geom_dim_sem = int(inst_geom_dim)
+    inst_qm_dim_sem = int(inst_qm_dim)
+    inst_geom_cols_sem = tuple(str(x) for x in inst_geom_cols)
+    inst_qm_cols_sem = tuple(str(x) for x in inst_qm_cols)
+    semantics_instance_source = "scaled"
+
+    has_raw = (
+        (starts_raw is not None)
+        and (counts_raw is not None)
+        and (id2pos_raw is not None)
+        and (conf_sorted_raw is not None)
+        and (Xinst_sorted_raw is not None)
+    )
+    if bool(has_raw):
+        conf_map_raw, inst_map_raw, inst_mean_map_raw = _build_instance_feature_maps(
+            ids=ids_for_features,
+            starts=np.asarray(starts_raw, dtype=np.int64),
+            counts=np.asarray(counts_raw, dtype=np.int64),
+            id2pos={str(k): int(v) for k, v in dict(id2pos_raw).items()},
+            conf_sorted=np.asarray(conf_sorted_raw),
+            Xinst_sorted=np.asarray(Xinst_sorted_raw, dtype=np.float32),
+            max_confs_per_id=int(config.chem_ace_max_confs_per_id),
+        )
+        if (len(inst_map_raw) > 0) or (len(inst_mean_map_raw) > 0):
+            inst_map_sem = inst_map_raw
+            inst_mean_map_sem = inst_mean_map_raw
+            inst_geom_dim_sem = int(inst_geom_dim_raw)
+            inst_qm_dim_sem = int(inst_qm_dim_raw)
+            inst_geom_cols_sem = tuple(str(x) for x in inst_geom_cols_raw)
+            inst_qm_cols_sem = tuple(str(x) for x in inst_qm_cols_raw)
+            semantics_instance_source = "raw"
+            log_event(
+                "INFO",
+                "explainability.chem_ace.semantics_instances",
+                source="raw",
+                n_conf_pairs=int(len(inst_map_raw)),
+                n_ids_mean=int(len(inst_mean_map_raw)),
+                inst_geom_dim=int(inst_geom_dim_sem),
+                inst_qm_dim=int(inst_qm_dim_sem),
+            )
+        else:
+            log_event(
+                "WARN",
+                "explainability.chem_ace.semantics_instances",
+                source="scaled",
+                reason="raw_maps_empty_fallback_to_scaled",
+            )
+    else:
+        log_event(
+            "INFO",
+            "explainability.chem_ace.semantics_instances",
+            source="scaled",
+            reason="raw_tables_not_provided",
+        )
+
     sdf_conformers_by_conf_id: dict[str, Any] = {}
     if config.chem_ace_conformer_sdf is not None:
         sdf_path = Path(str(config.chem_ace_conformer_sdf))
@@ -1523,12 +1590,12 @@ def prepare_chem_ace_bundle(
             concept_set=concept_set,
             patches=patches_train,
             molecules_by_id=molecules_by_id_train,
-            inst_by_pair=inst_map,
-            inst_mean_by_id=inst_mean_map,
-            inst_geom_dim=int(inst_geom_dim),
-            inst_qm_dim=int(inst_qm_dim),
-            geom_feature_names=tuple(str(x) for x in inst_geom_cols),
-            qm_feature_names=tuple(str(x) for x in inst_qm_cols),
+            inst_by_pair=inst_map_sem,
+            inst_mean_by_id=inst_mean_map_sem,
+            inst_geom_dim=int(inst_geom_dim_sem),
+            inst_qm_dim=int(inst_qm_dim_sem),
+            geom_feature_names=tuple(str(x) for x in inst_geom_cols_sem),
+            qm_feature_names=tuple(str(x) for x in inst_qm_cols_sem),
         )
 
     activity_calibrated_tags_csv: Optional[str] = None
@@ -1951,6 +2018,7 @@ def prepare_chem_ace_bundle(
     summary = {
         "run_id": str(run_id),
         "concept_set_id": str(concept_set_id),
+        "semantics_instance_source": str(semantics_instance_source),
         "train_membership_source": str(train_membership_source),
         "n_molecules_discover": int(len(molecules_train)),
         "n_molecules_infer": int(len(molecules_infer)),

@@ -26,6 +26,7 @@ Chem-ACE is automatically enabled if either of these is requested:
 
 - `--run_lambda_vol`
 - `--run_concept_rl`
+- `--run_concept_rl_ablation`
 
 This is normalized in `entrypoints/hpo_pipeline.py`.
 
@@ -54,6 +55,12 @@ Chem-ACE uses all three feature modalities already prepared for MIL training:
 - 2D molecular vector (`x2d` per molecule ID)
 - 3D geometry + QM vector (`xinst` per `(mol_id, conf_id)`)
 - curated molecular graph from `curated_SMILES`
+
+Feature-source contract:
+
+- model/HPO/Chem-ACE embedding-clustering path uses scaled model inputs (`--feat2d_scaled`, `--feat3d_scaled`, `--feat3d_qm_scaled`)
+- semantic descriptor/tag summary can optionally use raw 3D/QM tables (`--feat3d_raw` + `--feat3d_qm_raw`)
+- raw semantic mode is enabled only when both raw tables are provided; otherwise semantic summaries use scaled vectors
 
 For semantic interpretation, task labels are from:
 
@@ -165,7 +172,7 @@ Per patch vector = concat of:
 - else molecule mean over conformers
 - else zeros
 - truncate/pad to effective `max_3dqm_dim`
-- if `--chem_ace_max_3dqm_dim <= 0`, full raw merged 3D+QM dim is used dynamically
+- if `--chem_ace_max_3dqm_dim <= 0`, full merged 3D+QM model-input dim is used dynamically
 
 3. patch descriptor block:
 - 10 structural descriptors:
@@ -185,6 +192,11 @@ Descriptor scaling:
 
 - `RobustScaler` fitted on discover-train descriptor rows (`max_fit_samples=200000`)
 - transform is reused for infer-scope patches
+
+Important:
+
+- this scaling applies only to the 15-dimensional local patch-descriptor block
+- it does not re-scale semantic tag outputs directly
 
 ## 9) Embedding Persistence Policy (Disk Safety)
 
@@ -259,6 +271,19 @@ Naming:
 
 - rule-based naming first
 - fallback descriptor-driven naming
+
+Semantic vector source:
+
+- if raw tables are provided as a pair (`--feat3d_raw`, `--feat3d_qm_raw`), semantic geom/QM summaries are computed from raw vectors
+- otherwise semantic geom/QM summaries are computed from scaled vectors
+- runtime logs this explicitly via:
+  - `explainability.chem_ace.semantics_instances source=raw`
+  - or `source=scaled`
+
+TCAV note:
+
+- TCAV in Lambda-Vol is computed from model activations, not directly from raw descriptor values
+- using raw tables affects semantic label evidence, not the model activation geometry used for TCAV
 
 ## 12) Detailed Tagging Logs (Latest Update)
 
@@ -437,6 +462,7 @@ Core enable flags:
 - `--run_chem_ace`
 - `--run_lambda_vol`
 - `--run_concept_rl`
+- `--run_concept_rl_ablation`
 
 Patch/conformer controls:
 
@@ -453,6 +479,8 @@ Embedding/storage controls:
 
 - `--chem_ace_max_2d_dim`
 - `--chem_ace_max_3dqm_dim`
+- `--feat3d_raw` (optional, semantic summaries only)
+- `--feat3d_qm_raw` (optional, semantic summaries only)
 - `--chem_ace_persist_patch_embeddings` / `--no-chem_ace_persist_patch_embeddings`
 - `--cpu_workers`
 
@@ -514,6 +542,10 @@ Primary Chem-ACE outputs in `chem_ace_output_dir` (default: `<study_dir>/chem_ac
 - rule augmentation artifacts under `rules_autogen/`
 - a priori semantic CSVs
 - calibrated semantic CSV/JSON (if enabled and non-empty)
+
+`chem_ace_pipeline_summary.json` includes:
+
+- `semantics_instance_source` (`raw` or `scaled`)
 
 Potential embedding cache directory (only if embedding persistence enabled):
 

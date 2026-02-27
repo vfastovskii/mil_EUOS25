@@ -52,12 +52,14 @@ Outputs:
 ## Enable Chem-ACE in the real MIL pipeline (optimized final training)
 
 ```bash
-python -m entrypoints.hpo_pipeline ... \
+python /Users/vfastovskii/Desktop/mil_explainability_2026/opt_attn_net_feb/opt_net_fast.py ... \
   --run_hpo \
   --run_chem_ace \
   --curated_smiles_col curated_SMILES \
+  --feat3d_raw /path/to/raw_3d.csv \
+  --feat3d_qm_raw /path/to/raw_3d_quantum.csv \
   --chem_ace_conformer_sdf /path/to/precomputed_conformers.sdf \
-  --chem_ace_sdf_conf_id_prop conf_id
+  --chem_ace_sdf_conf_id_prop _Name
 ```
 
 Useful controls:
@@ -70,7 +72,9 @@ Useful controls:
 - `--chem_ace_top_concepts 64`
 - `--chem_ace_output_dir /path/to/chem_ace_out`
 - `--chem_ace_conformer_sdf /path/to/precomputed_conformers.sdf`
-- `--chem_ace_sdf_conf_id_prop conf_id` (falls back to SDF record name if missing)
+- `--chem_ace_sdf_conf_id_prop conf_id` (falls back to SDF record name if missing; use `_Name` when your SDF stores `conf_id` in record name)
+- `--feat3d_raw /path/to/raw_3d.csv` (optional; must be paired with `--feat3d_qm_raw`)
+- `--feat3d_qm_raw /path/to/raw_3d_quantum.csv` (optional; must be paired with `--feat3d_raw`)
 - `--run_activity_calibration` / `--no-run_activity_calibration` (default: enabled)
 - `--activity_calibration_keep_threshold 0.55`
 - `--activity_calibration_min_concept_support 12`
@@ -82,6 +86,15 @@ Useful controls:
 - `--activity_calibration_bitmask_min_count 20`
 - `--activity_calibration_ratio_cap 8.0`
 - `--cpu_workers -1`
+
+Scaled vs raw behavior:
+
+- Scaled tables (`--feat3d_scaled`, `--feat3d_qm_scaled`) are always used for model/HPO and Chem-ACE embedding+clustering (model-aligned space).
+- Raw tables (`--feat3d_raw`, `--feat3d_qm_raw`) are optional and used only for semantic descriptor summaries/tags (physical-meaning values).
+- Both raw tables must be provided together; otherwise runtime falls back to scaled semantic summaries.
+- Runtime logs source explicitly:
+  - `explainability.chem_ace.semantics_instances source=raw`
+  - or `source=scaled`.
 
 Anti-leakage behavior:
 
@@ -124,7 +137,7 @@ Patch-budget behavior:
 ## Enable Lambda-Vol monitoring during final training (requires Chem-ACE concepts)
 
 ```bash
-python -m entrypoints.hpo_pipeline ... \
+python /Users/vfastovskii/Desktop/mil_explainability_2026/opt_attn_net_feb/opt_net_fast.py ... \
   --run_hpo \
   --run_lambda_vol
 ```
@@ -151,7 +164,7 @@ Useful controls:
 ## Enable concept-guided RL control during final training
 
 ```bash
-python -m entrypoints.hpo_pipeline ... \
+python /Users/vfastovskii/Desktop/mil_explainability_2026/opt_attn_net_feb/opt_net_fast.py ... \
   --run_hpo \
   --run_concept_rl
 ```
@@ -160,7 +173,7 @@ python -m entrypoints.hpo_pipeline ... \
 
 Useful controls:
 
-- `--concept_rl_top_k_per_task 8`
+- `--concept_rl_top_k_per_task 8` (use `0` or any `<=0` value for uncapped all-passing concepts)
 - `--concept_rl_min_pos_coverage 0.02`
 - `--concept_rl_init_scale 0.02`
 - `--concept_rl_max_scale 0.20`
@@ -177,7 +190,7 @@ Runs two final trainings with identical params/seed:
 - `with_rl`: RL enabled
 
 ```bash
-python -m entrypoints.hpo_pipeline ... \
+python /Users/vfastovskii/Desktop/mil_explainability_2026/opt_attn_net_feb/opt_net_fast.py ... \
   --best_params_json /path/to/multimodal_mil_aux_gpu_best_params.json \
   --run_concept_rl_ablation
 ```

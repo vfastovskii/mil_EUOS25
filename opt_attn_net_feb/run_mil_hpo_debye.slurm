@@ -75,6 +75,9 @@ LABELS="${LABELS:-${DATA_DIR}/master_table_labels_final_modelling_ready_1401_wit
 FEAT2D_SCALED="${FEAT2D_SCALED:-${DATA_DIR}/scaled_2d.csv}"
 FEAT3D_SCALED="${FEAT3D_SCALED:-${DATA_DIR}/scaled_3d.csv}"
 FEAT3D_QM="${FEAT3D_QM:-${DATA_DIR}/scaled_3d_quantum.csv}"
+# Optional raw 3D tables for Chem-ACE semantic tagging (physical units).
+FEAT3D_RAW="${FEAT3D_RAW:-}"
+FEAT3D_QM_RAW="${FEAT3D_QM_RAW:-}"
 
 # Best params JSON used when RUN_HPO=0.
 BEST_PARAMS_JSON="${BEST_PARAMS_JSON:-${REPO_DIR}/best_params_279756.json}"
@@ -105,6 +108,7 @@ CURATED_SMILES_COL="${CURATED_SMILES_COL:-curated_SMILES}"
 RUN_CHEM_ACE="${RUN_CHEM_ACE:-1}"
 RUN_LAMBDA_VOL="${RUN_LAMBDA_VOL:-1}"
 RUN_CONCEPT_RL="${RUN_CONCEPT_RL:-1}"
+RUN_CONCEPT_RL_ABLATION="${RUN_CONCEPT_RL_ABLATION:-1}"
 LAMBDA_VOL_RUN_RICCI="${LAMBDA_VOL_RUN_RICCI:-1}"
 LAMBDA_VOL_RICCI_USE_FLOW_AS_COUPLING="${LAMBDA_VOL_RICCI_USE_FLOW_AS_COUPLING:-1}"
 
@@ -141,17 +145,28 @@ LAMBDA_VOL_RICCI_FLOW_STEP_SIZE="${LAMBDA_VOL_RICCI_FLOW_STEP_SIZE:-0.12}"
 LAMBDA_VOL_RICCI_COUPLING_STRENGTH="${LAMBDA_VOL_RICCI_COUPLING_STRENGTH:-0.05}"
 
 # Concept-RL controls
-CONCEPT_RL_TOP_K_PER_TASK="${CONCEPT_RL_TOP_K_PER_TASK:-8}"
+CONCEPT_RL_TOP_K_PER_TASK="${CONCEPT_RL_TOP_K_PER_TASK:-0}"   # <=0: all passing concepts
 CONCEPT_RL_MIN_POS_COVERAGE="${CONCEPT_RL_MIN_POS_COVERAGE:-0.02}"
+CONCEPT_RL_MIN_POS_HITS="${CONCEPT_RL_MIN_POS_HITS:-8}"
+CONCEPT_RL_MIN_LIFT="${CONCEPT_RL_MIN_LIFT:-1.05}"
+CONCEPT_RL_OVERLAP_WEIGHT="${CONCEPT_RL_OVERLAP_WEIGHT:-0.35}"
+CONCEPT_RL_GLOBAL_WEIGHT="${CONCEPT_RL_GLOBAL_WEIGHT:-0.20}"
+CONCEPT_RL_LIFT_WEIGHT="${CONCEPT_RL_LIFT_WEIGHT:-0.25}"
+CONCEPT_RL_GENERAL_TOP_K="${CONCEPT_RL_GENERAL_TOP_K:-4}"
+CONCEPT_RL_MIN_MULTI_ACTIVE_COUNT="${CONCEPT_RL_MIN_MULTI_ACTIVE_COUNT:-32}"
+CONCEPT_RL_REQUIRE_CONF_SUPPORT="${CONCEPT_RL_REQUIRE_CONF_SUPPORT:-1}"
+CONCEPT_RL_MIN_CONF_POS_COVERAGE="${CONCEPT_RL_MIN_CONF_POS_COVERAGE:-0.005}"
 CONCEPT_RL_INIT_SCALE="${CONCEPT_RL_INIT_SCALE:-0.02}"
 CONCEPT_RL_MAX_SCALE="${CONCEPT_RL_MAX_SCALE:-0.20}"
 CONCEPT_RL_POLICY_LR="${CONCEPT_RL_POLICY_LR:-0.05}"
 CONCEPT_RL_POLICY_SIGMA="${CONCEPT_RL_POLICY_SIGMA:-0.02}"
 CONCEPT_RL_REWARD_ALIGNMENT_W="${CONCEPT_RL_REWARD_ALIGNMENT_W:-0.25}"
+CONCEPT_RL_REWARD_MIN_AP_W="${CONCEPT_RL_REWARD_MIN_AP_W:-0.15}"
 CONCEPT_RL_BASELINE_MOMENTUM="${CONCEPT_RL_BASELINE_MOMENTUM:-0.90}"
+CONCEPT_RL_NEGATIVE_PENALTY="${CONCEPT_RL_NEGATIVE_PENALTY:-0.15}"
 
 # Lambda-Vol and Concept-RL depend on Chem-ACE concepts.
-if [[ "$RUN_LAMBDA_VOL" == "1" || "$RUN_CONCEPT_RL" == "1" ]]; then
+if [[ "$RUN_LAMBDA_VOL" == "1" || "$RUN_CONCEPT_RL" == "1" || "$RUN_CONCEPT_RL_ABLATION" == "1" ]]; then
   RUN_CHEM_ACE=1
 fi
 
@@ -168,7 +183,7 @@ echo "[INFO] Workdir: $WORKDIR"
 echo "[INFO] Study dir (node-local): $STUDY_DIR"
 echo "[INFO] Output dir: $OUTDIR"
 echo "[INFO] CPUs=${SLURM_CPUS_PER_TASK} | CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
-echo "[INFO] RUN_HPO=$RUN_HPO | RUN_CHEM_ACE=$RUN_CHEM_ACE | RUN_LAMBDA_VOL=$RUN_LAMBDA_VOL | RUN_CONCEPT_RL=$RUN_CONCEPT_RL"
+echo "[INFO] RUN_HPO=$RUN_HPO | RUN_CHEM_ACE=$RUN_CHEM_ACE | RUN_LAMBDA_VOL=$RUN_LAMBDA_VOL | RUN_CONCEPT_RL=$RUN_CONCEPT_RL | RUN_CONCEPT_RL_ABLATION=$RUN_CONCEPT_RL_ABLATION"
 echo "[INFO] Conformer SDF: $CONF_SDF | conf_id source: $CONF_ID_PROP"
 
 command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || true
@@ -180,6 +195,13 @@ command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || true
 [[ -f "$FEAT2D_SCALED" ]] || { echo "[ERROR] Missing 2D features: $FEAT2D_SCALED"; exit 2; }
 [[ -f "$FEAT3D_SCALED" ]] || { echo "[ERROR] Missing 3D features: $FEAT3D_SCALED"; exit 2; }
 [[ -f "$FEAT3D_QM" ]] || { echo "[ERROR] Missing 3D QM features: $FEAT3D_QM"; exit 2; }
+if [[ -n "$FEAT3D_RAW" || -n "$FEAT3D_QM_RAW" ]]; then
+  [[ -n "$FEAT3D_RAW" && -n "$FEAT3D_QM_RAW" ]] || {
+    echo "[ERROR] Provide both FEAT3D_RAW and FEAT3D_QM_RAW or neither."; exit 2;
+  }
+  [[ -f "$FEAT3D_RAW" ]] || { echo "[ERROR] Missing raw 3D features: $FEAT3D_RAW"; exit 2; }
+  [[ -f "$FEAT3D_QM_RAW" ]] || { echo "[ERROR] Missing raw 3D QM features: $FEAT3D_QM_RAW"; exit 2; }
+fi
 if [[ "$RUN_HPO" != "1" ]]; then
   [[ -f "$BEST_PARAMS_JSON" ]] || { echo "[ERROR] Missing best params JSON: $BEST_PARAMS_JSON"; exit 2; }
 fi
@@ -200,6 +222,10 @@ cp -v "$LABELS" "$WORKDIR/"
 cp -v "$FEAT2D_SCALED" "$WORKDIR/"
 cp -v "$FEAT3D_SCALED" "$WORKDIR/"
 cp -v "$FEAT3D_QM" "$WORKDIR/"
+if [[ -n "$FEAT3D_RAW" && -n "$FEAT3D_QM_RAW" ]]; then
+  cp -v "$FEAT3D_RAW" "$WORKDIR/"
+  cp -v "$FEAT3D_QM_RAW" "$WORKDIR/"
+fi
 if [[ "$RUN_HPO" != "1" ]]; then
   cp -v "$BEST_PARAMS_JSON" "$WORKDIR/"
 fi
@@ -240,6 +266,13 @@ CMD=(
   --num_workers "$NUM_WORKERS"
   --cpu_workers "$CPU_WORKERS"
 )
+
+if [[ -n "$FEAT3D_RAW" && -n "$FEAT3D_QM_RAW" ]]; then
+  CMD+=(
+    --feat3d_raw "$WORKDIR/$(basename "$FEAT3D_RAW")"
+    --feat3d_qm_raw "$WORKDIR/$(basename "$FEAT3D_QM_RAW")"
+  )
+fi
 
 if [[ "$PIN_MEMORY" == "1" ]]; then
   CMD+=(--pin_memory)
@@ -314,18 +347,39 @@ if [[ "$RUN_LAMBDA_VOL" == "1" ]]; then
   fi
 fi
 
-if [[ "$RUN_CONCEPT_RL" == "1" ]]; then
+if [[ "$RUN_CONCEPT_RL" == "1" || "$RUN_CONCEPT_RL_ABLATION" == "1" ]]; then
   CMD+=(
-    --run_concept_rl
     --concept_rl_top_k_per_task "$CONCEPT_RL_TOP_K_PER_TASK"
     --concept_rl_min_pos_coverage "$CONCEPT_RL_MIN_POS_COVERAGE"
+    --concept_rl_min_pos_hits "$CONCEPT_RL_MIN_POS_HITS"
+    --concept_rl_min_lift "$CONCEPT_RL_MIN_LIFT"
+    --concept_rl_overlap_weight "$CONCEPT_RL_OVERLAP_WEIGHT"
+    --concept_rl_global_weight "$CONCEPT_RL_GLOBAL_WEIGHT"
+    --concept_rl_lift_weight "$CONCEPT_RL_LIFT_WEIGHT"
+    --concept_rl_general_top_k "$CONCEPT_RL_GENERAL_TOP_K"
+    --concept_rl_min_multi_active_count "$CONCEPT_RL_MIN_MULTI_ACTIVE_COUNT"
+    --concept_rl_min_conf_pos_coverage "$CONCEPT_RL_MIN_CONF_POS_COVERAGE"
     --concept_rl_init_scale "$CONCEPT_RL_INIT_SCALE"
     --concept_rl_max_scale "$CONCEPT_RL_MAX_SCALE"
     --concept_rl_policy_lr "$CONCEPT_RL_POLICY_LR"
     --concept_rl_policy_sigma "$CONCEPT_RL_POLICY_SIGMA"
     --concept_rl_reward_alignment_w "$CONCEPT_RL_REWARD_ALIGNMENT_W"
+    --concept_rl_reward_min_ap_w "$CONCEPT_RL_REWARD_MIN_AP_W"
     --concept_rl_baseline_momentum "$CONCEPT_RL_BASELINE_MOMENTUM"
+    --concept_rl_negative_penalty "$CONCEPT_RL_NEGATIVE_PENALTY"
   )
+  if [[ "$CONCEPT_RL_REQUIRE_CONF_SUPPORT" == "1" ]]; then
+    CMD+=(--concept_rl_require_conf_support)
+  else
+    CMD+=(--no-concept_rl_require_conf_support)
+  fi
+fi
+
+if [[ "$RUN_CONCEPT_RL" == "1" ]]; then
+  CMD+=(--run_concept_rl)
+fi
+if [[ "$RUN_CONCEPT_RL_ABLATION" == "1" ]]; then
+  CMD+=(--run_concept_rl_ablation)
 fi
 
 printf '[INFO] CMD: %q ' "${CMD[@]}"; echo

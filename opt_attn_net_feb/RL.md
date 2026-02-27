@@ -68,6 +68,7 @@ Then target concepts are selected per task from positive train IDs:
 
 - top `k` concepts by positive-coverage
 - only concepts with coverage >= `min_pos_coverage`
+- if `concept_rl_top_k_per_task <= 0`, there is no cap and all passing concepts are used
 
 Implemented in:
 
@@ -143,7 +144,7 @@ This auto-enables Chem-ACE preparation in pipeline.
 
 Main knobs:
 
-- `--concept_rl_top_k_per_task`
+- `--concept_rl_top_k_per_task` (`<=0` means uncapped all-passing concepts)
 - `--concept_rl_min_pos_coverage`
 - `--concept_rl_init_scale`
 - `--concept_rl_max_scale`

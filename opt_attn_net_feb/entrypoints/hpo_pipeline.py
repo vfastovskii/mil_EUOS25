@@ -68,6 +68,8 @@ class CLIDataPathsConfig:
     feat2d_scaled: str
     feat3d_scaled: str
     feat3d_qm_scaled: str
+    feat3d_raw: str | None
+    feat3d_qm_raw: str | None
     study_dir: str
 
 
@@ -372,6 +374,8 @@ class PipelineConfigFactory:
                 feat2d_scaled=str(args.feat2d_scaled),
                 feat3d_scaled=str(args.feat3d_scaled),
                 feat3d_qm_scaled=str(args.feat3d_qm_scaled),
+                feat3d_raw=(None if args.feat3d_raw is None else str(args.feat3d_raw)),
+                feat3d_qm_raw=(None if args.feat3d_qm_raw is None else str(args.feat3d_qm_raw)),
                 study_dir=str(args.study_dir),
             ),
             columns=CLIColumnsConfig(
@@ -561,6 +565,8 @@ class PipelineEnvironmentFactory:
                 "cpu_workers": int(self.config.runtime.cpu_workers),
                 "run_hpo": bool(self.config.hpo.run_hpo),
                 "best_params_json": self.config.hpo.best_params_json,
+                "feat3d_raw": self.config.data_paths.feat3d_raw,
+                "feat3d_qm_raw": self.config.data_paths.feat3d_qm_raw,
                 "run_chem_ace": bool(self.config.explainability.run_chem_ace),
                 "run_lambda_vol": bool(self.config.explainability.run_lambda_vol),
                 "run_concept_rl": bool(self.config.explainability.run_concept_rl),
@@ -935,6 +941,61 @@ class MILPipelineOrchestrator:
                     n_qm_cols=int(len(inst_meta_all.get("qm_cols", ()))),
                 )
 
+                Xinst_sorted_raw_all = None
+                conf_sorted_raw_all = None
+                starts_raw_all = None
+                counts_raw_all = None
+                id2pos_raw_all = None
+                inst_meta_raw_all = None
+                raw_geom = self.config.data_paths.feat3d_raw
+                raw_qm = self.config.data_paths.feat3d_qm_raw
+                if (raw_geom is not None) and (raw_qm is not None):
+                    with log_step("pipeline.final.load_instances_raw_for_semantics"):
+                        ids_conf_raw, conf_ids_raw, Xinst_raw, inst_meta_raw = load_and_merge_instances(
+                            str(raw_geom),
+                            str(raw_qm),
+                            allowed_ids=allowed_final,
+                            id_col=c.id_col,
+                            conf_col=c.conf_col,
+                            return_meta=True,
+                        )
+                        _, starts_raw, counts_raw, id2pos_raw, Xinst_sorted_raw, conf_sorted_raw = build_instance_index(
+                            ids_conf_raw,
+                            conf_ids_raw,
+                            Xinst_raw,
+                        )
+                        Xinst_sorted_raw_all = Xinst_sorted_raw
+                        conf_sorted_raw_all = conf_sorted_raw
+                        starts_raw_all = starts_raw
+                        counts_raw_all = counts_raw
+                        id2pos_raw_all = id2pos_raw
+                        inst_meta_raw_all = inst_meta_raw
+                        log_event(
+                            "INFO",
+                            "pipeline.final.instances_raw_ready",
+                            n_ids_with_bags=int(len(id2pos_raw)),
+                            n_conf=int(Xinst_sorted_raw.shape[0]),
+                            inst_dim=int(Xinst_sorted_raw.shape[1]),
+                            inst_geom_dim=int(inst_meta_raw["geom_dim"]),
+                            inst_qm_dim=int(inst_meta_raw["qm_dim"]),
+                            n_geom_cols=int(len(inst_meta_raw.get("geom_cols", ()))),
+                            n_qm_cols=int(len(inst_meta_raw.get("qm_cols", ()))),
+                        )
+                elif (raw_geom is None) ^ (raw_qm is None):
+                    log_event(
+                        "WARN",
+                        "pipeline.final.instances_raw_semantics_skipped",
+                        reason="provide_both_raw_tables",
+                        feat3d_raw=str(raw_geom),
+                        feat3d_qm_raw=str(raw_qm),
+                    )
+                else:
+                    log_event(
+                        "INFO",
+                        "pipeline.final.instances_raw_semantics_skipped",
+                        reason="raw_tables_not_provided",
+                    )
+
             with log_step("pipeline.final.build_config"):
                 final_data = MILFinalData(
                     df_full=df_full,
@@ -952,6 +1013,27 @@ class MILPipelineOrchestrator:
                     inst_qm_dim=int(inst_meta_all["qm_dim"]),
                     inst_geom_cols=tuple(str(x) for x in inst_meta_all.get("geom_cols", ())),
                     inst_qm_cols=tuple(str(x) for x in inst_meta_all.get("qm_cols", ())),
+                    starts_raw=starts_raw_all,
+                    counts_raw=counts_raw_all,
+                    id2pos_raw=id2pos_raw_all,
+                    Xinst_sorted_raw=Xinst_sorted_raw_all,
+                    conf_sorted_raw=conf_sorted_raw_all,
+                    inst_geom_dim_raw=(
+                        -1 if inst_meta_raw_all is None else int(inst_meta_raw_all["geom_dim"])
+                    ),
+                    inst_qm_dim_raw=(
+                        -1 if inst_meta_raw_all is None else int(inst_meta_raw_all["qm_dim"])
+                    ),
+                    inst_geom_cols_raw=(
+                        tuple()
+                        if inst_meta_raw_all is None
+                        else tuple(str(x) for x in inst_meta_raw_all.get("geom_cols", ()))
+                    ),
+                    inst_qm_cols_raw=(
+                        tuple()
+                        if inst_meta_raw_all is None
+                        else tuple(str(x) for x in inst_meta_raw_all.get("qm_cols", ()))
+                    ),
                 )
                 trainer_cfg = TrainerSystemConfig(
                     max_epochs=int(self.config.runtime.max_epochs),
@@ -1481,6 +1563,22 @@ def _parse_args(argv: Any | None = None):
     ap.add_argument("--feat2d_scaled", required=True)
     ap.add_argument("--feat3d_scaled", required=True)
     ap.add_argument("--feat3d_qm_scaled", required=True)
+    ap.add_argument(
+        "--feat3d_raw",
+        default=None,
+        help=(
+            "Optional raw 3D-geometry table. "
+            "If provided together with --feat3d_qm_raw, used for Chem-ACE semantic tagging."
+        ),
+    )
+    ap.add_argument(
+        "--feat3d_qm_raw",
+        default=None,
+        help=(
+            "Optional raw 3D-quantum table. "
+            "If provided together with --feat3d_raw, used for Chem-ACE semantic tagging."
+        ),
+    )
     ap.add_argument("--study_dir", required=True)
 
     ap.add_argument("--id_col", default="ID")

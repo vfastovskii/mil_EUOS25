@@ -47,6 +47,15 @@ Required files:
 - 3D geom features CSV (`--feat3d_scaled`)
 - 3D QM features CSV (`--feat3d_qm_scaled`)
 
+Optional semantic-only raw instance tables:
+
+- raw 3D geometry CSV (`--feat3d_raw`)
+- raw 3D QM CSV (`--feat3d_qm_raw`)
+
+Raw tables are used only for Chem-ACE semantic descriptor/tag summaries.
+They do not replace scaled model inputs used by training/HPO/TCAV.
+Both raw tables must be provided together.
+
 Optional but strongly recommended for 3D patching:
 
 - precomputed conformer SDF (`--chem_ace_conformer_sdf`)
@@ -63,6 +72,8 @@ python /Users/vfastovskii/Desktop/mil_explainability_2026/opt_attn_net_feb/opt_n
   --feat2d_scaled /path/scaled_2d.csv \
   --feat3d_scaled /path/scaled_3d.csv \
   --feat3d_qm_scaled /path/scaled_3d_quantum.csv \
+  --feat3d_raw /path/raw_3d.csv \
+  --feat3d_qm_raw /path/raw_3d_quantum.csv \
   --study_dir /path/study_run \
   --use_splits train \
   --leaderboard_split leaderboard \
@@ -73,7 +84,7 @@ python /Users/vfastovskii/Desktop/mil_explainability_2026/opt_attn_net_feb/opt_n
   --run_concept_rl_ablation \
   --curated_smiles_col curated_SMILES \
   --chem_ace_conformer_sdf /path/confs.sdf \
-  --chem_ace_sdf_conf_id_prop conf_id \
+  --chem_ace_sdf_conf_id_prop _Name \
   --max_epochs 150 \
   --patience 10 \
   --seed 0 \
@@ -140,6 +151,10 @@ Both runs reuse identical best params and seed; only `run_concept_rl` differs.
 - Anti-leakage logic:
   - concept discovery is train-only.
   - leaderboard gets inference-only memberships via nearest frozen centroids.
+- Semantic-source logic:
+  - if both raw tables are provided, Chem-ACE semantic tagger uses raw per-conformer vectors;
+  - otherwise it falls back to scaled vectors.
+  - source is logged as `explainability.chem_ace.semantics_instances source=raw|scaled`.
 
 4. Optional callbacks during training:
 
@@ -215,6 +230,9 @@ Policy mechanics:
 - action sampled each train epoch start (`rl guidance scale`)
 - update each validation epoch end with reward:
   - `reward_total = val_macro_ap + w * train_concept_alignment`
+- target-concept cap:
+  - `concept_rl_top_k_per_task > 0`: capped per task
+  - `concept_rl_top_k_per_task <= 0`: uncapped all-passing concepts
 
 Policy history is exported to:
 

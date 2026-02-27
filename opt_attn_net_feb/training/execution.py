@@ -352,6 +352,15 @@ class MILFinalData:
     inst_qm_dim: int = -1
     inst_geom_cols: tuple[str, ...] = ()
     inst_qm_cols: tuple[str, ...] = ()
+    starts_raw: np.ndarray | None = None
+    counts_raw: np.ndarray | None = None
+    id2pos_raw: Dict[str, int] | None = None
+    Xinst_sorted_raw: np.ndarray | None = None
+    conf_sorted_raw: np.ndarray | None = None
+    inst_geom_dim_raw: int = -1
+    inst_qm_dim_raw: int = -1
+    inst_geom_cols_raw: tuple[str, ...] = ()
+    inst_qm_cols_raw: tuple[str, ...] = ()
 
 
 def drop_ids_without_bags(
@@ -1055,6 +1064,15 @@ class MILFinalTrainer:
                 inst_qm_dim=int(data.inst_qm_dim),
                 inst_geom_cols=tuple(str(x) for x in data.inst_geom_cols),
                 inst_qm_cols=tuple(str(x) for x in data.inst_qm_cols),
+                starts_raw=data.starts_raw,
+                counts_raw=data.counts_raw,
+                id2pos_raw=(None if data.id2pos_raw is None else dict(data.id2pos_raw)),
+                conf_sorted_raw=data.conf_sorted_raw,
+                Xinst_sorted_raw=data.Xinst_sorted_raw,
+                inst_geom_dim_raw=int(data.inst_geom_dim_raw),
+                inst_qm_dim_raw=int(data.inst_qm_dim_raw),
+                inst_geom_cols_raw=tuple(str(x) for x in data.inst_geom_cols_raw),
+                inst_qm_cols_raw=tuple(str(x) for x in data.inst_qm_cols_raw),
             )
             log_event(
                 "INFO",

@@ -114,6 +114,12 @@ CLI required:
 - `--feat3d_qm_scaled`
 - `--study_dir`
 
+Optional (semantic-only raw sources):
+- `--feat3d_raw`
+- `--feat3d_qm_raw`
+
+Raw semantic tables are used only when both are provided.
+
 ### 4.2 Required columns
 
 Label table (`utils/constants.py`):
@@ -821,7 +827,7 @@ For each patch, integrated runtime creates feature-level vector:
   - else `resolved_chem_ace_2d_dim = full 2D raw dimension` from `X2d_file.shape[1]`
 - `v3dqm = take_or_pad(conf-specific instance vector or molecule mean, resolved_chem_ace_3dqm_dim)`
   - where `resolved_chem_ace_3dqm_dim = chem_ace_max_3dqm_dim` if `chem_ace_max_3dqm_dim > 0`
-  - else `resolved_chem_ace_3dqm_dim = full merged 3D+QM raw dimension` from `Xinst_sorted.shape[1]`
+  - else `resolved_chem_ace_3dqm_dim = full merged 3D+QM model-input dimension` from `Xinst_sorted.shape[1]`
 - descriptor vector:
   - 10 scalar patch descriptors (RobustScaler-transformed; scaler fitted on discover-train descriptors)
   - +5 one-hot patch type indicators
@@ -831,6 +837,11 @@ Final patch vector:
 - dimension = `resolved_chem_ace_2d_dim + resolved_chem_ace_3dqm_dim + 15`
 
 Stored with metadata via embedding cache and DB.
+
+Semantic source split:
+- Concept discovery embeddings use scaled model-input tables.
+- Semantic tagger geometry/QM summaries use raw tables only if both `--feat3d_raw` and `--feat3d_qm_raw` are provided.
+- Runtime emits `explainability.chem_ace.semantics_instances source=raw|scaled`.
 
 ### 14.5 Concept discovery
 
@@ -1165,10 +1176,14 @@ Key controls:
   - `--nn_accelerator`, `--nn_devices`, `--precision`
   - `--num_workers`, `--pin_memory`
 - Explainability:
+  - optional raw semantic tables:
+    - `--feat3d_raw`
+    - `--feat3d_qm_raw`
   - Chem-ACE flags and limits
   - Lambda-Vol flags and monitoring limits
   - Concept-RL flags:
     - `--run_concept_rl`
+    - `--run_concept_rl_ablation`
     - `--concept_rl_top_k_per_task`
     - `--concept_rl_min_pos_coverage`
     - `--concept_rl_init_scale`
@@ -1181,6 +1196,7 @@ Key controls:
 Automatic dependency normalization:
 - `--run_lambda_vol` implies `--run_chem_ace`
 - `--run_concept_rl` implies `--run_chem_ace`
+- `--run_concept_rl_ablation` implies `--run_chem_ace`
 
 Compatibility flags still accepted:
 - `--do_mil` (MIL-only pipeline)
@@ -1428,6 +1444,8 @@ Data/columns:
 - `--conf_col conf_id`
 - `--split_col split`
 - `--fold_col cv_fold`
+- `--feat3d_raw None`
+- `--feat3d_qm_raw None`
 - `--use_splits train`
 - `--folds None`
 
@@ -1441,6 +1459,7 @@ Runtime/HPO:
 - `--nn_devices 1`
 - `--precision 16-mixed`
 - `--num_workers -1` (auto-resolve)
+- `--cpu_workers -1` (auto-resolve CPU pool budget)
 - `--pin_memory False`
 
 Final export:
@@ -1452,6 +1471,8 @@ Final export:
 Explainability:
 - `--run_chem_ace False`
 - `--run_lambda_vol False`
+- `--run_concept_rl False`
+- `--run_concept_rl_ablation False`
 - `--curated_smiles_col curated_SMILES`
 - `--chem_ace_output_dir None`
 - `--chem_ace_db_uri None`
@@ -1469,6 +1490,7 @@ Explainability:
 - `--lambda_vol_tcav_repeats 2`
 - `--lambda_vol_random_counterexamples 96`
 - `--lambda_vol_min_concept_samples 8`
+- `--concept_rl_top_k_per_task 8` (`<=0` means all passing concepts, uncapped)
 
 ---
 
@@ -1483,6 +1505,8 @@ python ../opt_net_fast.py \
   --feat2d_scaled <scaled_2d.csv> \
   --feat3d_scaled <scaled_3d.csv> \
   --feat3d_qm_scaled <scaled_3d_quantum.csv> \
+  --feat3d_raw <raw_3d.csv> \
+  --feat3d_qm_raw <raw_3d_quantum.csv> \
   --study_dir <out_dir> \
   --use_splits train \
   --run_hpo \
@@ -1496,9 +1520,13 @@ python ../opt_net_fast.py \
   --feat2d_scaled <scaled_2d.csv> \
   --feat3d_scaled <scaled_3d.csv> \
   --feat3d_qm_scaled <scaled_3d_quantum.csv> \
+  --feat3d_raw <raw_3d.csv> \
+  --feat3d_qm_raw <raw_3d_quantum.csv> \
   --study_dir <out_dir> \
   --best_params_json <multimodal_mil_aux_gpu_best_params.json>
 ```
+
+`--feat3d_raw` and `--feat3d_qm_raw` are optional and should be supplied together.
 
 Enable explainability in final run:
 ```bash
