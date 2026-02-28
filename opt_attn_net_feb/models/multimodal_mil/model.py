@@ -24,9 +24,9 @@ from .training import compute_training_losses
 class MILTaskAttnMixerWithAux(pl.LightningModule):
     """
     - 2D embedder -> e2d (no aggregator)
-    - 3D embedder -> tokens
-    - 3D aggregator -> pooled per task + attn maps
-    - project 2D and pooled-3D to same dim, concat, mixer -> z_task
+    - 3D geometry embedder -> tokens -> geometry aggregator
+    - 3D quantum embedder -> tokens -> quantum aggregator
+    - project 2D/3D-geom/3D-qm to same dim, concat, mixer -> z_task
     - cls logits from task-specific z_task
     - aux heads from mean(z_task)
     """
@@ -70,6 +70,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         return cls(
             mol_dim=int(b.mol_dim),
             inst_dim=int(b.inst_dim),
+            inst_geom_dim=int(b.inst_geom_dim),
+            inst_qm_dim=int(b.inst_qm_dim),
             mol_hidden=int(b.mol_hidden),
             mol_layers=int(b.mol_layers),
             mol_dropout=float(b.mol_dropout),
@@ -113,6 +115,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self,
         mol_dim: int,
         inst_dim: int,
+        inst_geom_dim: int,
+        inst_qm_dim: int,
         mol_hidden: int,
         mol_layers: int,
         mol_dropout: float,
@@ -150,6 +154,16 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=["pos_weight", "gamma", "lam"])
 
+        self.inst_dim = int(inst_dim)
+        self.inst_geom_dim = int(inst_geom_dim)
+        self.inst_qm_dim = int(inst_qm_dim)
+        self.inst_hidden = int(inst_hidden)
+        if self.inst_geom_dim <= 0 and self.inst_qm_dim <= 0:
+            raise ValueError(
+                f"At least one 3D modality dimension must be >0; "
+                f"got inst_geom_dim={self.inst_geom_dim} inst_qm_dim={self.inst_qm_dim}"
+            )
+
         self.mol_enc = build_2d_embedder(
             name=str(mol_embedder_name),
             input_dim=int(mol_dim),
@@ -158,36 +172,71 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             dropout=float(mol_dropout),
             activation=str(activation),
         )
-        self.inst_enc = build_3d_embedder(
-            name=str(inst_embedder_name),
-            input_dim=int(inst_dim),
-            hidden_dim=int(inst_hidden),
-            layers=int(inst_layers),
-            dropout=float(inst_dropout),
-            activation=str(activation),
+        self.inst_geom_enc = (
+            None
+            if self.inst_geom_dim <= 0
+            else build_3d_embedder(
+                name=str(inst_embedder_name),
+                input_dim=int(self.inst_geom_dim),
+                hidden_dim=int(inst_hidden),
+                layers=int(inst_layers),
+                dropout=float(inst_dropout),
+                activation=str(activation),
+            )
+        )
+        self.inst_qm_enc = (
+            None
+            if self.inst_qm_dim <= 0
+            else build_3d_embedder(
+                name=str(inst_embedder_name),
+                input_dim=int(self.inst_qm_dim),
+                hidden_dim=int(inst_hidden),
+                layers=int(inst_layers),
+                dropout=float(inst_dropout),
+                activation=str(activation),
+            )
         )
         self.mol_post_embed_norm = nn.LayerNorm(int(mol_hidden))
-        self.inst_post_embed_norm = nn.LayerNorm(int(inst_hidden))
+        self.inst_geom_post_embed_norm = nn.LayerNorm(int(inst_hidden))
+        self.inst_qm_post_embed_norm = nn.LayerNorm(int(inst_hidden))
 
         agg_kwargs = dict(aggregator_kwargs or {})
         overlap = {"dim", "n_heads", "dropout", "n_tasks"}.intersection(agg_kwargs.keys())
         if overlap:
             raise ValueError(f"aggregator_kwargs cannot override reserved keys: {sorted(overlap)}")
-        self.attn_pool = build_aggregator(
-            name=str(aggregator_name),
-            dim=int(inst_hidden),
-            n_heads=int(attn_heads),
-            dropout=float(attn_dropout),
-            n_tasks=NUM_TASKS,
-            **agg_kwargs,
+        self.attn_pool_geom = (
+            None
+            if self.inst_geom_enc is None
+            else build_aggregator(
+                name=str(aggregator_name),
+                dim=int(inst_hidden),
+                n_heads=int(attn_heads),
+                dropout=float(attn_dropout),
+                n_tasks=NUM_TASKS,
+                **agg_kwargs,
+            )
         )
-        self.agg_post_norm = nn.LayerNorm(int(inst_hidden))
+        self.attn_pool_qm = (
+            None
+            if self.inst_qm_enc is None
+            else build_aggregator(
+                name=str(aggregator_name),
+                dim=int(inst_hidden),
+                n_heads=int(attn_heads),
+                dropout=float(attn_dropout),
+                n_tasks=NUM_TASKS,
+                **agg_kwargs,
+            )
+        )
+        self.agg_geom_post_norm = nn.LayerNorm(int(inst_hidden))
+        self.agg_qm_post_norm = nn.LayerNorm(int(inst_hidden))
 
         self.proj2d = make_projection(int(mol_hidden), int(proj_dim))
-        self.proj3d = make_projection(int(inst_hidden), int(proj_dim))
+        self.proj3d_geom = make_projection(int(inst_hidden), int(proj_dim))
+        self.proj3d_qm = make_projection(int(inst_hidden), int(proj_dim))
 
         self.mixer = build_mlp_v3_embedder(
-            input_dim=int(2 * proj_dim),
+            input_dim=int(3 * proj_dim),
             hidden_dim=int(mixer_hidden),
             layers=int(mixer_layers),
             dropout=float(mixer_dropout),
@@ -410,8 +459,16 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         return_bitmask: bool = False,
     ):
         self._validate_forward_inputs(x2d=x2d, x3d_pad=x3d_pad, key_padding_mask=key_padding_mask)
-        pooled_tasks, attn = self._pool_task_tokens(x3d_pad=x3d_pad, key_padding_mask=key_padding_mask, return_attn=return_attn)
-        z_tasks = self._build_task_representations(x2d=x2d, pooled_tasks=pooled_tasks)
+        pooled_geom, pooled_qm, attn = self._pool_task_tokens(
+            x3d_pad=x3d_pad,
+            key_padding_mask=key_padding_mask,
+            return_attn=return_attn,
+        )
+        z_tasks = self._build_task_representations(
+            x2d=x2d,
+            pooled_geom=pooled_geom,
+            pooled_qm=pooled_qm,
+        )
 
         logits = apply_task_heads(z_tasks, self.cls_heads)  # [B,4]
 
@@ -458,28 +515,102 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 f"Mask mismatch: x3d_pad[:2]={tuple(x3d_pad.shape[:2])} vs key_padding_mask={tuple(key_padding_mask.shape)}"
             )
 
+    def _split_instance_modalities(self, x3d_pad: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        feat_dim = int(x3d_pad.shape[-1])
+        gdim = int(max(0, self.inst_geom_dim))
+        qdim = int(max(0, self.inst_qm_dim))
+        if gdim + qdim > feat_dim:
+            # Prefer configured geometry slice and consume remaining as QM.
+            gdim = min(gdim, feat_dim)
+            qdim = max(0, feat_dim - gdim)
+        if gdim <= 0:
+            geom = x3d_pad[..., :0]
+        else:
+            geom = x3d_pad[..., :gdim]
+        if qdim <= 0:
+            qm = x3d_pad[..., :0]
+        else:
+            qm = x3d_pad[..., gdim : gdim + qdim]
+        return geom, qm
+
+    def _pool_one_branch(
+        self,
+        *,
+        x3d_mod: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+        embedder: nn.Module,
+        post_norm: nn.Module,
+        aggregator: nn.Module,
+        return_attn: bool,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        batch_size, n_instances, feature_dim = x3d_mod.shape
+        tok = embedder(
+            x3d_mod.reshape(batch_size * n_instances, feature_dim)
+        ).reshape(batch_size, n_instances, -1)
+        tok = post_norm(tok)
+        return aggregator(tok, key_padding_mask=key_padding_mask, return_attn=return_attn)
+
     def _pool_task_tokens(
         self,
         *,
         x3d_pad: torch.Tensor,
         key_padding_mask: torch.Tensor,
         return_attn: bool,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        batch_size, n_instances, feature_dim = x3d_pad.shape
-        tok = self.inst_enc(x3d_pad.reshape(batch_size * n_instances, feature_dim)).reshape(batch_size, n_instances, -1)
-        tok = self.inst_post_embed_norm(tok)
-        return self.attn_pool(tok, key_padding_mask=key_padding_mask, return_attn=return_attn)
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        x3d_geom, x3d_qm = self._split_instance_modalities(x3d_pad)
+        batch_size = int(x3d_pad.shape[0])
+        pooled_geom = torch.zeros(
+            (batch_size, NUM_TASKS, int(self.inst_hidden)),
+            dtype=x3d_pad.dtype,
+            device=x3d_pad.device,
+        )
+        pooled_qm = torch.zeros_like(pooled_geom)
+        attn_maps: List[torch.Tensor] = []
+        if self.inst_geom_enc is not None and self.attn_pool_geom is not None and int(x3d_geom.shape[-1]) > 0:
+            pooled_geom, attn_geom = self._pool_one_branch(
+                x3d_mod=x3d_geom,
+                key_padding_mask=key_padding_mask,
+                embedder=self.inst_geom_enc,
+                post_norm=self.inst_geom_post_embed_norm,
+                aggregator=self.attn_pool_geom,
+                return_attn=return_attn,
+            )
+            if attn_geom is not None:
+                attn_maps.append(attn_geom)
+        if self.inst_qm_enc is not None and self.attn_pool_qm is not None and int(x3d_qm.shape[-1]) > 0:
+            pooled_qm, attn_qm = self._pool_one_branch(
+                x3d_mod=x3d_qm,
+                key_padding_mask=key_padding_mask,
+                embedder=self.inst_qm_enc,
+                post_norm=self.inst_qm_post_embed_norm,
+                aggregator=self.attn_pool_qm,
+                return_attn=return_attn,
+            )
+            if attn_qm is not None:
+                attn_maps.append(attn_qm)
+        attn = None
+        if return_attn and len(attn_maps) > 0:
+            attn = torch.stack(attn_maps, dim=0).mean(dim=0)
+        return pooled_geom, pooled_qm, attn
 
-    def _build_task_representations(self, *, x2d: torch.Tensor, pooled_tasks: torch.Tensor) -> torch.Tensor:
+    def _build_task_representations(
+        self,
+        *,
+        x2d: torch.Tensor,
+        pooled_geom: torch.Tensor,
+        pooled_qm: torch.Tensor,
+    ) -> torch.Tensor:
         batch_size = x2d.shape[0]
         mol_emb = self.mol_post_embed_norm(self.mol_enc(x2d))
         e2d = self.proj2d(mol_emb)  # [B,proj]
         e2d_rep = e2d.unsqueeze(1).expand(-1, NUM_TASKS, -1)  # [B,4,proj]
 
-        pooled_tasks = self.agg_post_norm(pooled_tasks)
-        e3d = self.proj3d(pooled_tasks.reshape(batch_size * NUM_TASKS, -1)).reshape(batch_size, NUM_TASKS, -1)  # [B,4,proj]
+        pooled_geom = self.agg_geom_post_norm(pooled_geom)
+        e3d_geom = self.proj3d_geom(pooled_geom.reshape(batch_size * NUM_TASKS, -1)).reshape(batch_size, NUM_TASKS, -1)
+        pooled_qm = self.agg_qm_post_norm(pooled_qm)
+        e3d_qm = self.proj3d_qm(pooled_qm.reshape(batch_size * NUM_TASKS, -1)).reshape(batch_size, NUM_TASKS, -1)
 
-        mix_in = torch.cat([e2d_rep, e3d], dim=2).reshape(batch_size * NUM_TASKS, -1)  # [B*4,2*proj]
+        mix_in = torch.cat([e2d_rep, e3d_geom, e3d_qm], dim=2).reshape(batch_size * NUM_TASKS, -1)  # [B*4,3*proj]
         z_tasks = self.mixer(mix_in).reshape(batch_size, NUM_TASKS, -1)  # [B,4,mixer_hidden]
         return self.mixer_post_norm(z_tasks)
 

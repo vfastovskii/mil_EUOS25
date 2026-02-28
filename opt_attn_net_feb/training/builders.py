@@ -59,6 +59,8 @@ class MILModelBuilder:
         config: HPOConfig,
         mol_dim: int,
         inst_dim: int,
+        inst_geom_dim: int,
+        inst_qm_dim: int,
         pos_weight: torch.Tensor,
         gamma: torch.Tensor,
         lam: np.ndarray,
@@ -73,6 +75,8 @@ class MILModelBuilder:
             backbone=MILBackboneConfig(
                 mol_dim=int(mol_dim),
                 inst_dim=int(inst_dim),
+                inst_geom_dim=int(inst_geom_dim),
+                inst_qm_dim=int(inst_qm_dim),
                 mol_hidden=int(b.mol_hidden),
                 mol_layers=int(b.mol_layers),
                 mol_dropout=float(b.mol_dropout),

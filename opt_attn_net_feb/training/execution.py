@@ -670,6 +670,8 @@ class MILCVData:
     counts: np.ndarray
     id2pos: Dict[str, int]
     Xinst_sorted: np.ndarray
+    inst_geom_dim: int = -1
+    inst_qm_dim: int = -1
 
 
 @dataclass(frozen=True)
@@ -966,6 +968,8 @@ class MILFoldTrainer:
             config=cfg,
             mol_dim=int(self.data.X2d_scaled.shape[1]),
             inst_dim=int(self.data.Xinst_sorted.shape[1]),
+            inst_geom_dim=int(self.data.inst_geom_dim),
+            inst_qm_dim=int(self.data.inst_qm_dim),
             pos_weight=posw,
             gamma=gamma_t,
             lam=lam,
@@ -1609,6 +1613,8 @@ class MILFinalTrainer:
             config=cfg,
             mol_dim=int(X2d_tr.shape[1]),
             inst_dim=int(data.Xinst_sorted.shape[1]),
+            inst_geom_dim=int(data.inst_geom_dim),
+            inst_qm_dim=int(data.inst_qm_dim),
             pos_weight=posw,
             gamma=gamma_t,
             lam=lam,

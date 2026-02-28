@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional
 class MILBackboneConfig:
     mol_dim: int
     inst_dim: int
+    inst_geom_dim: int
+    inst_qm_dim: int
     mol_hidden: int
     mol_layers: int
     mol_dropout: float

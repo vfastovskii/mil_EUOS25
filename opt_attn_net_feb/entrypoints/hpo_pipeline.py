@@ -787,6 +787,8 @@ class HPODataBuilder:
                     counts=counts_hpo,
                     id2pos=id2pos_hpo,
                     Xinst_sorted=Xinst_sorted_hpo,
+                    inst_geom_dim=int(inst_meta_hpo["geom_dim"]),
+                    inst_qm_dim=int(inst_meta_hpo["qm_dim"]),
                 )
                 log_event(
                     "INFO",

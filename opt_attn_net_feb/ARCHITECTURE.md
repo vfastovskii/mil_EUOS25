@@ -298,18 +298,32 @@ Branch A (2D molecule-level):
 3. `proj2d = Linear(mol_hidden->proj_dim) + LayerNorm(proj_dim)` -> `e2d [B, proj_dim]`
 4. Repeat per task: `e2d_rep = e2d.unsqueeze(1).expand(-1,4,-1)` -> `[B,4,proj_dim]`
 
-Branch B (3D instance-level):
-1. Flatten instances: `[B*N, F3]`
-2. `inst_enc` -> `[B*N, inst_hidden]`
+Branch B1 (3D geometry instance-level):
+1. Split `x3d_pad` by configured dims into `x3d_geom [B,N,F3_geom]` and `x3d_qm [B,N,F3_qm]`.
+2. Flatten geometry instances: `[B*N, F3_geom]`
+3. `inst_geom_enc` -> `[B*N, inst_hidden]`
+4. Reshape `[B,N,inst_hidden]`
+5. `inst_geom_post_embed_norm` (`LayerNorm(inst_hidden)`)
+6. `attn_pool_geom(tokens, kpm)` -> `pooled_geom [B,4,inst_hidden]`, optional `attn_geom [B,4,N]`
+7. `agg_geom_post_norm` (`LayerNorm(inst_hidden)`)
+8. `proj3d_geom` (`Linear+LayerNorm`) -> `e3d_geom [B,4,proj_dim]`
+
+Branch B2 (3D quantum instance-level):
+1. Flatten quantum instances: `[B*N, F3_qm]`
+2. `inst_qm_enc` -> `[B*N, inst_hidden]`
 3. Reshape `[B,N,inst_hidden]`
-4. `inst_post_embed_norm` (`LayerNorm(inst_hidden)`)
-5. `attn_pool(tokens, kpm)` -> `pooled_tasks [B,4,inst_hidden]`, optional `attn [B,4,N]`
-6. `agg_post_norm` (`LayerNorm(inst_hidden)`)
-7. `proj3d` (`Linear+LayerNorm`) per task -> `e3d [B,4,proj_dim]`
+4. `inst_qm_post_embed_norm` (`LayerNorm(inst_hidden)`)
+5. `attn_pool_qm(tokens, kpm)` -> `pooled_qm [B,4,inst_hidden]`, optional `attn_qm [B,4,N]`
+6. `agg_qm_post_norm` (`LayerNorm(inst_hidden)`)
+7. `proj3d_qm` (`Linear+LayerNorm`) -> `e3d_qm [B,4,proj_dim]`
+
+Attention compatibility note:
+- If both 3D branches are present and `return_attn=True`, exported attention is `mean(attn_geom, attn_qm)`.
+- If only one 3D branch is present, that branch attention is returned.
 
 Fusion + mixer:
-1. Concat: `concat([e2d_rep,e3d], dim=-1)` -> `[B,4,2*proj_dim]`
-2. Flatten task axis: `[B*4, 2*proj_dim]`
+1. Concat: `concat([e2d_rep,e3d_geom,e3d_qm], dim=-1)` -> `[B,4,3*proj_dim]`
+2. Flatten task axis: `[B*4, 3*proj_dim]`
 3. `mixer` residual MLP -> `[B*4, mixer_hidden]`
 4. Reshape `[B,4,mixer_hidden]`
 5. `mixer_post_norm` (`LayerNorm(mixer_hidden)`) -> `z_tasks`
@@ -323,7 +337,7 @@ Heads:
 ### 6.3 Why 2D embedding is repeated per task
 
 2D branch learns one molecule representation per sample. Repetition does **not** create separate 2D encoders.
-It broadcasts the same molecule context to each task-specific fusion slot, where it is combined with task-specific aggregated 3D context before task-specific heads.
+It broadcasts the same molecule context to each task-specific fusion slot, where it is combined with task-specific aggregated 3D geometry and 3D quantum contexts before task-specific heads.
 
 So training remains end-to-end with one shared 2D encoder; task specificity is injected by:
 - 3D task-query attention pooling
@@ -638,11 +652,11 @@ Given search space:
 - 2D encoder hidden width <= 256
 - 3D encoder hidden width <= 256
 - projection dim <= 512
-- mixer input dim = `2 * proj_dim` <= 1024
+- mixer input dim = `3 * proj_dim` <= 1536
 - mixer hidden width <= 256
 - head input dim = mixer hidden <= 256
 
-So current search space enforces compact architecture with no layer width above 1024.
+So current search space keeps encoder/head widths compact (<=1024) while the fused mixer input is wider due to three modalities.
 
 ---
 
