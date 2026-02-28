@@ -30,11 +30,16 @@ else:  # pragma: no cover - unavailable torch runtime
 
 if _HAS_TORCH:
     class _DummyExportModel(nn.Module):
-        def forward(self, x2d, x3d, kpm, return_attn: bool = True):
+        def forward(self, x2d, x3d, kpm, return_attn: bool = True, return_attn_modalities: bool = False):
             b, _n, _f = x3d.shape
             t = len(TASK_COLS)
             logits = x2d[:, :t]
-            attn = torch.ones((b, t, x3d.shape[1]), dtype=x3d.dtype, device=x3d.device)
+            attn_geom = torch.ones((b, t, x3d.shape[1]), dtype=x3d.dtype, device=x3d.device)
+            attn_qm = torch.ones((b, t, x3d.shape[1]), dtype=x3d.dtype, device=x3d.device)
+            if return_attn_modalities:
+                attn = {"attn_geom": attn_geom, "attn_qm": attn_qm}
+            else:
+                attn = 0.5 * (attn_geom + attn_qm)
             return logits, None, None, attn
 else:  # pragma: no cover - unavailable torch runtime
     class _DummyExportModel:  # type: ignore[no-redef]
@@ -88,7 +93,8 @@ class ExportLeaderboardAttentionTest(unittest.TestCase):
             for task in TASK_COLS:
                 self.assertIn(f"pred_{task}", df.columns)
                 self.assertIn(f"pred_label_{task}", df.columns)
-                self.assertIn(f"attn_{task}", df.columns)
+                self.assertIn(f"attn_geom_{task}", df.columns)
+                self.assertIn(f"attn_qm_{task}", df.columns)
 
             row_m1 = df[(df["ID"] == "m1") & (df["conf_id"] == "c1")].iloc[0]
             row_m2 = df[(df["ID"] == "m2") & (df["conf_id"] == "d1")].iloc[0]

@@ -456,13 +456,15 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         x3d_pad: torch.Tensor,          # [B,N,F3]
         key_padding_mask: torch.Tensor, # [B,N] True=PAD
         return_attn: bool = False,
+        return_attn_modalities: bool = False,
         return_bitmask: bool = False,
     ):
         self._validate_forward_inputs(x2d=x2d, x3d_pad=x3d_pad, key_padding_mask=key_padding_mask)
-        pooled_geom, pooled_qm, attn = self._pool_task_tokens(
+        need_attn = bool(return_attn or return_attn_modalities)
+        pooled_geom, pooled_qm, attn_geom, attn_qm = self._pool_task_tokens(
             x3d_pad=x3d_pad,
             key_padding_mask=key_padding_mask,
-            return_attn=return_attn,
+            return_attn=need_attn,
         )
         z_tasks = self._build_task_representations(
             x2d=x2d,
@@ -477,10 +479,22 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         fluo_out = apply_shared_heads(z_aux, self.fluo_heads)  # [B,4]
         bitmask_logits = self.bitmask_head(z_aux) if self.bitmask_head is not None else None
 
-        if return_attn and return_bitmask:
-            return logits, abs_out, fluo_out, bitmask_logits, attn
-        if return_attn:
-            return logits, abs_out, fluo_out, attn
+        attn_fused = None
+        if return_attn and (not return_attn_modalities):
+            maps = [m for m in (attn_geom, attn_qm) if m is not None]
+            if len(maps) > 0:
+                attn_fused = torch.stack(maps, dim=0).mean(dim=0)
+        attn_payload: Any = attn_fused
+        if return_attn_modalities:
+            attn_payload = {
+                "attn_geom": attn_geom,
+                "attn_qm": attn_qm,
+            }
+
+        if need_attn and return_bitmask:
+            return logits, abs_out, fluo_out, bitmask_logits, attn_payload
+        if need_attn:
+            return logits, abs_out, fluo_out, attn_payload
         if return_bitmask:
             return logits, abs_out, fluo_out, bitmask_logits
         return logits, abs_out, fluo_out
@@ -556,7 +570,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         x3d_pad: torch.Tensor,
         key_padding_mask: torch.Tensor,
         return_attn: bool,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         x3d_geom, x3d_qm = self._split_instance_modalities(x3d_pad)
         batch_size = int(x3d_pad.shape[0])
         pooled_geom = torch.zeros(
@@ -565,7 +579,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             device=x3d_pad.device,
         )
         pooled_qm = torch.zeros_like(pooled_geom)
-        attn_maps: List[torch.Tensor] = []
+        attn_geom: Optional[torch.Tensor] = None
+        attn_qm: Optional[torch.Tensor] = None
         if self.inst_geom_enc is not None and self.attn_pool_geom is not None and int(x3d_geom.shape[-1]) > 0:
             pooled_geom, attn_geom = self._pool_one_branch(
                 x3d_mod=x3d_geom,
@@ -575,8 +590,6 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 aggregator=self.attn_pool_geom,
                 return_attn=return_attn,
             )
-            if attn_geom is not None:
-                attn_maps.append(attn_geom)
         if self.inst_qm_enc is not None and self.attn_pool_qm is not None and int(x3d_qm.shape[-1]) > 0:
             pooled_qm, attn_qm = self._pool_one_branch(
                 x3d_mod=x3d_qm,
@@ -586,12 +599,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 aggregator=self.attn_pool_qm,
                 return_attn=return_attn,
             )
-            if attn_qm is not None:
-                attn_maps.append(attn_qm)
-        attn = None
-        if return_attn and len(attn_maps) > 0:
-            attn = torch.stack(attn_maps, dim=0).mean(dim=0)
-        return pooled_geom, pooled_qm, attn
+        return pooled_geom, pooled_qm, attn_geom, attn_qm
 
     def _build_task_representations(
         self,

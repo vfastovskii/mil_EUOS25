@@ -38,7 +38,9 @@ class PredictionTextExplanationsTest(unittest.TestCase):
                     p = p0 if ti == 0 else (0.40 + 0.05 * ti)
                     row[f"pred_{task}"] = float(p)
                     row[f"pred_label_{task}"] = int(float(p) >= 0.5)
-                    row[f"attn_{task}"] = float(a0 if ti == 0 else 0.10 + 0.02 * ti)
+                    a = float(a0 if ti == 0 else 0.10 + 0.02 * ti)
+                    row[f"attn_geom_{task}"] = a
+                    row[f"attn_qm_{task}"] = 0.5 * a
                 rows.append(row)
             pd.DataFrame(rows).to_csv(pred_path, index=False)
 
@@ -152,7 +154,8 @@ class PredictionTextExplanationsTest(unittest.TestCase):
             for task in TASK_COLS:
                 row[f"pred_{task}"] = 0.75
                 row[f"pred_label_{task}"] = 1
-                row[f"attn_{task}"] = 0.5
+                row[f"attn_geom_{task}"] = 0.5
+                row[f"attn_qm_{task}"] = 0.4
             pd.DataFrame([row]).to_csv(pred_path, index=False)
 
             concept_ids = ["c_a", "c_b"]

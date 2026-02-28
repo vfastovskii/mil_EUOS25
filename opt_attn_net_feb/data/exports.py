@@ -71,13 +71,30 @@ def _add_signature_attention_metrics(
             continue
 
         for task in task_cols:
-            attn_col = f"attn_{str(task)}"
-            if attn_col not in out.columns:
+            geom_col = f"attn_geom_{str(task)}"
+            qm_col = f"attn_qm_{str(task)}"
+            have_geom = geom_col in out.columns
+            have_qm = qm_col in out.columns
+            if (not have_geom) and (not have_qm):
                 continue
 
-            work = out.loc[valid_mask, ["ID", sig_col, attn_col]].copy()
+            cols = ["ID", sig_col]
+            if have_geom:
+                cols.append(geom_col)
+            if have_qm:
+                cols.append(qm_col)
+            work = out.loc[valid_mask, cols].copy()
+            if have_geom and have_qm:
+                work["_attn_eff"] = np.maximum(
+                    work[geom_col].to_numpy(dtype=np.float64),
+                    work[qm_col].to_numpy(dtype=np.float64),
+                )
+            elif have_geom:
+                work["_attn_eff"] = work[geom_col].to_numpy(dtype=np.float64)
+            else:
+                work["_attn_eff"] = work[qm_col].to_numpy(dtype=np.float64)
             work["_sig_mass"] = (
-                work.groupby(["ID", sig_col], sort=False)[attn_col]
+                work.groupby(["ID", sig_col], sort=False)["_attn_eff"]
                 .transform("sum")
                 .astype(np.float64)
             )
@@ -120,7 +137,9 @@ def export_leaderboard_attention(
     - conf_id
     - 4 endpoint predictions (probabilities from logits)
     - 4 endpoint binary labels (thresholded probabilities)
-    - 4 attention weights (one per endpoint)
+    - 8 attention weights (per endpoint and per 3D modality):
+      - `attn_geom_<task>`
+      - `attn_qm_<task>`
 
     Parameters:
         model: Any
@@ -187,17 +206,39 @@ def export_leaderboard_attention(
         x3d = x3d.to(device, non_blocking=True)
         kpm = kpm.to(device, non_blocking=True)
 
-        logits, abs_out, fluo_out, attn = model(x2d, x3d, kpm, return_attn=True)
-        if attn is None:
-            raise RuntimeError("Attention not returned; expected attn when return_attn=True")
+        logits, abs_out, fluo_out, attn = model(
+            x2d,
+            x3d,
+            kpm,
+            return_attn=True,
+            return_attn_modalities=True,
+        )
+        if not isinstance(attn, dict):
+            raise RuntimeError("Expected modality attention dict when return_attn_modalities=True")
+        attn_geom_t = attn.get("attn_geom")
+        attn_qm_t = attn.get("attn_qm")
+        if (attn_geom_t is None) and (attn_qm_t is None):
+            raise RuntimeError("No modality attention returned; expected attn_geom and/or attn_qm")
 
         logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
         probs_np = torch.sigmoid(logits).detach().cpu().numpy()  # [B,4]
-        attn_np = attn.detach().cpu().numpy()          # [B,4,N]
+        attn_geom_np = (
+            None if attn_geom_t is None else attn_geom_t.detach().cpu().numpy()
+        )  # [B,4,N]
+        attn_qm_np = (
+            None if attn_qm_t is None else attn_qm_t.detach().cpu().numpy()
+        )  # [B,4,N]
+        ref = attn_geom_np if attn_geom_np is not None else attn_qm_np
+        if ref is None:
+            raise RuntimeError("Internal error: missing reference attention tensor")
         kpm_np = kpm.detach().cpu().numpy().astype(bool)
-        B, T, N = attn_np.shape
+        B, T, N = ref.shape
         if T != len(TASK_COLS):
             raise RuntimeError(f"Unexpected attention task count: {T}, expected {len(TASK_COLS)}")
+        if (attn_geom_np is not None) and (attn_geom_np.shape != ref.shape):
+            raise RuntimeError("attn_geom shape mismatch")
+        if (attn_qm_np is not None) and (attn_qm_np.shape != ref.shape):
+            raise RuntimeError("attn_qm shape mismatch")
 
         for b in range(B):
             mid = str(mol_ids[b])
@@ -207,16 +248,30 @@ def export_leaderboard_attention(
                 continue
             confs = [str(x) for x in conf_pad[b, :L].tolist()]
 
-            # Normalize attention for each task over valid conformers.
-            attn_norm = np.zeros((T, L), dtype=np.float64)
+            # Normalize modality attention for each task over valid conformers.
+            attn_geom_norm = np.zeros((T, L), dtype=np.float64)
+            attn_qm_norm = np.zeros((T, L), dtype=np.float64)
             for t in range(T):
-                w = attn_np[b, t, :L].astype(np.float64)
-                s = float(w.sum())
-                if not np.isfinite(s) or s <= 0:
-                    w[:] = 1.0 / float(L)
+                if attn_geom_np is not None:
+                    wg = attn_geom_np[b, t, :L].astype(np.float64)
+                    sg = float(wg.sum())
+                    if not np.isfinite(sg) or sg <= 0:
+                        wg[:] = 0.0
+                    else:
+                        wg /= sg
                 else:
-                    w /= s  # enforce sum-to-1 (safety)
-                attn_norm[t, :] = w
+                    wg = np.zeros((L,), dtype=np.float64)
+                if attn_qm_np is not None:
+                    wq = attn_qm_np[b, t, :L].astype(np.float64)
+                    sq = float(wq.sum())
+                    if not np.isfinite(sq) or sq <= 0:
+                        wq[:] = 0.0
+                    else:
+                        wq /= sq
+                else:
+                    wq = np.zeros((L,), dtype=np.float64)
+                attn_geom_norm[t, :] = wg
+                attn_qm_norm[t, :] = wq
 
             pred_cols = {
                 f"pred_{TASK_COLS[t]}": float(probs_np[b, t])
@@ -244,7 +299,8 @@ def export_leaderboard_attention(
                         conf_signature_alt_map.get(key, conf_signature_alt_map.get(str(confs[i]), ""))
                     )
                 for t in range(T):
-                    row[f"attn_{TASK_COLS[t]}"] = float(attn_norm[t, i])
+                    row[f"attn_geom_{TASK_COLS[t]}"] = float(attn_geom_norm[t, i])
+                    row[f"attn_qm_{TASK_COLS[t]}"] = float(attn_qm_norm[t, i])
                 rows.append(row)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -773,7 +829,8 @@ def export_prediction_text_explanations(
     required = {"ID", "conf_id"}
     for task in task_cols:
         required.add(f"pred_{task}")
-        required.add(f"attn_{task}")
+        required.add(f"attn_geom_{task}")
+        required.add(f"attn_qm_{task}")
     missing = sorted([c for c in required if c not in df.columns])
     if missing:
         raise ValueError(f"Prediction table missing required columns: {missing}")
@@ -834,7 +891,9 @@ def export_prediction_text_explanations(
             pred = float(getattr(row, f"pred_{t}"))
             label_col = f"pred_label_{t}"
             label = int(getattr(row, label_col)) if label_col in df.columns else int(pred >= 0.5)
-            attn = float(getattr(row, f"attn_{t}"))
+            attn_geom = float(getattr(row, f"attn_geom_{t}"))
+            attn_qm = float(getattr(row, f"attn_qm_{t}"))
+            attn = float(max(attn_geom, attn_qm))
 
             scored: list[tuple[float, str, bool, float, float, float, dict[str, float], dict[str, list[str]]]] = []
             for cid in active:

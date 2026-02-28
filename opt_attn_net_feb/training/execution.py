@@ -176,7 +176,10 @@ def _run_strict_mixer_rerank(
     df = _read_table_auto(attention_table_path)
     if df.empty:
         return None, None, None
-    need_cols = {"ID", "conf_id"} | {f"attn_{str(t)}" for t in TASK_COLS}
+    need_cols = {"ID", "conf_id"}
+    for t in TASK_COLS:
+        need_cols.add(f"attn_geom_{str(t)}")
+        need_cols.add(f"attn_qm_{str(t)}")
     if not need_cols.issubset(set(df.columns)):
         return None, None, None
 
@@ -184,12 +187,17 @@ def _run_strict_mixer_rerank(
     top_k = int(top_rows_per_task)
     top_rows_by_task: Dict[int, List[tuple[str, str, float]]] = {}
     for ti, task in enumerate(TASK_COLS):
-        attn_col = f"attn_{str(task)}"
-        sub = df.loc[:, ["ID", "conf_id", attn_col]].copy()
+        attn_geom_col = f"attn_geom_{str(task)}"
+        attn_qm_col = f"attn_qm_{str(task)}"
+        sub = df.loc[:, ["ID", "conf_id", attn_geom_col, attn_qm_col]].copy()
         sub = sub.replace([np.inf, -np.inf], np.nan)
-        sub = sub.dropna(subset=[attn_col])
+        sub["_attn_rank"] = np.maximum(
+            sub[attn_geom_col].fillna(0.0).to_numpy(dtype=np.float64),
+            sub[attn_qm_col].fillna(0.0).to_numpy(dtype=np.float64),
+        )
+        sub = sub.dropna(subset=["_attn_rank"])
         if top_k > 0:
-            sub = sub.nlargest(int(top_k), columns=attn_col)
+            sub = sub.nlargest(int(top_k), columns="_attn_rank")
         rows: List[tuple[str, str, float]] = []
         for row in sub.itertuples(index=False):
             mid = str(getattr(row, "ID", "")).strip()
@@ -197,7 +205,7 @@ def _run_strict_mixer_rerank(
             if (not mid) or (not conf):
                 continue
             try:
-                attn_val = float(getattr(row, attn_col))
+                attn_val = float(getattr(row, "_attn_rank"))
             except Exception:
                 attn_val = 0.0
             if not np.isfinite(attn_val):
