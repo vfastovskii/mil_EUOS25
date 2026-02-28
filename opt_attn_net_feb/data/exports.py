@@ -26,6 +26,80 @@ def _identity_no_grad():
 _NO_GRAD = (torch.no_grad if torch is not None else _identity_no_grad)
 
 
+def _normalize_conf_id(value: Any) -> str:
+    """Normalize conf_id string for stable joins across CSV/object dtype conversions."""
+    s = str(value).strip()
+    if (not s) or (s.lower() in {"nan", "none"}):
+        return ""
+    if s.endswith(".0"):
+        try:
+            fv = float(s)
+            iv = int(fv)
+            if abs(fv - float(iv)) <= 1e-12:
+                return str(iv)
+        except Exception:
+            pass
+    return s
+
+
+def _add_signature_attention_metrics(
+    *,
+    df: pd.DataFrame,
+    signature_cols: Sequence[str],
+    task_cols: Sequence[str],
+) -> pd.DataFrame:
+    """
+    Add per-task attention mass/rank diagnostics for conformer signature groups.
+
+    For each signature column and task, computes within-molecule:
+      - signature attention mass (sum over conformers sharing the signature)
+      - rank of that signature by attention mass
+      - top-signature indicator
+    """
+    out = df.copy()
+    if out.empty:
+        return out
+    if "ID" not in out.columns:
+        return out
+
+    for sig_col in signature_cols:
+        if sig_col not in out.columns:
+            continue
+        sig = out[sig_col].astype(str).str.strip()
+        valid_mask = sig.ne("") & sig.ne("nan") & sig.ne("None")
+        if not bool(valid_mask.any()):
+            continue
+
+        for task in task_cols:
+            attn_col = f"attn_{str(task)}"
+            if attn_col not in out.columns:
+                continue
+
+            work = out.loc[valid_mask, ["ID", sig_col, attn_col]].copy()
+            work["_sig_mass"] = (
+                work.groupby(["ID", sig_col], sort=False)[attn_col]
+                .transform("sum")
+                .astype(np.float64)
+            )
+            work["_sig_rank"] = (
+                work.groupby("ID", sort=False)["_sig_mass"]
+                .rank(method="dense", ascending=False)
+                .astype(np.float64)
+            )
+
+            mass_col = f"{sig_col}_mass_{str(task)}"
+            rank_col = f"{sig_col}_rank_{str(task)}"
+            top_col = f"{sig_col}_top_{str(task)}"
+            out[mass_col] = 0.0
+            out[rank_col] = np.nan
+            out[top_col] = 0
+
+            out.loc[valid_mask, mass_col] = work["_sig_mass"].to_numpy(dtype=np.float64)
+            out.loc[valid_mask, rank_col] = work["_sig_rank"].to_numpy(dtype=np.float64)
+            out.loc[valid_mask, top_col] = ((work["_sig_rank"] <= 1.0) & (work["_sig_mass"] > 0.0)).astype(np.int32).to_numpy()
+    return out
+
+
 @_NO_GRAD()
 def export_leaderboard_attention(
     model: Any,
@@ -33,6 +107,8 @@ def export_leaderboard_attention(
     device: torch.device,
     out_path: Path,
     pred_thresholds: List[float] | None = None,
+    conf_signature_map: Mapping[str, str] | None = None,
+    conf_signature_alt_map: Mapping[str, str] | None = None,
 ) -> Path:
     """
     Exports attention weights for leaderboard evaluation to a specified output path.
@@ -65,6 +141,10 @@ def export_leaderboard_attention(
         pred_thresholds: List[float] | None
             Optional probability thresholds per task for binary labels. If not provided,
             0.5 is used for all tasks.
+        conf_signature_map: Mapping[str, str] | None
+            Optional mapping conf_id -> pmapper signature hash.
+        conf_signature_alt_map: Mapping[str, str] | None
+            Optional mapping conf_id -> alternate/coarser pmapper signature hash.
 
     Raises:
         RuntimeError:
@@ -153,12 +233,33 @@ def export_leaderboard_attention(
                     **pred_cols,
                     **pred_label_cols,
                 }
+                if conf_signature_map is not None:
+                    key = _normalize_conf_id(confs[i])
+                    row["pmapper_sig_md5"] = str(
+                        conf_signature_map.get(key, conf_signature_map.get(str(confs[i]), ""))
+                    )
+                if conf_signature_alt_map is not None:
+                    key = _normalize_conf_id(confs[i])
+                    row["pmapper_sig_md5_alt"] = str(
+                        conf_signature_alt_map.get(key, conf_signature_alt_map.get(str(confs[i]), ""))
+                    )
                 for t in range(T):
                     row[f"attn_{TASK_COLS[t]}"] = float(attn_norm[t, i])
                 rows.append(row)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df_out = pd.DataFrame(rows)
+    signature_cols: list[str] = []
+    if "pmapper_sig_md5" in df_out.columns:
+        signature_cols.append("pmapper_sig_md5")
+    if "pmapper_sig_md5_alt" in df_out.columns:
+        signature_cols.append("pmapper_sig_md5_alt")
+    if len(signature_cols) > 0:
+        df_out = _add_signature_attention_metrics(
+            df=df_out,
+            signature_cols=tuple(signature_cols),
+            task_cols=tuple(TASK_COLS),
+        )
     if out_path.suffix.lower() in [".parquet", ".pq"]:
         try:
             df_out.to_parquet(out_path, index=False)
@@ -403,7 +504,7 @@ def _build_concept_index_maps(
             mol_to_concepts[mid].add(concept_id)
 
         for mol_id, conf_id in concept_conf_map.get(concept_id, set()):
-            key = (str(mol_id), str(conf_id))
+            key = (str(mol_id), _normalize_conf_id(conf_id))
             if key not in conf_to_concepts:
                 conf_to_concepts[key] = set()
             conf_to_concepts[key].add(concept_id)
@@ -471,6 +572,65 @@ def _load_a_priori_tags_map(a_priori_tags_csv: str | None) -> dict[str, list[str
             continue
         out[mid] = sorted(set(tags))
     return out
+
+
+def _load_strict_mixer_scores(
+    strict_scores_csv: str | None,
+) -> tuple[dict[tuple[str, str, str, str], float], dict[tuple[str, str], float]]:
+    """
+    Load strict mixer-space concept scores.
+
+    Returns:
+      - row-level map: (task, mol_id, conf_id, concept_id) -> strict score
+      - global map:    (task, concept_id) -> mean strict score
+    """
+    if strict_scores_csv is None:
+        return {}, {}
+    path = Path(str(strict_scores_csv))
+    if not path.exists():
+        return {}, {}
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return {}, {}
+    if df.empty:
+        return {}, {}
+    need = {"ID", "conf_id", "task", "concept_id", "strict_cosine"}
+    if not need.issubset(set(df.columns)):
+        return {}, {}
+
+    row_map: dict[tuple[str, str, str, str], float] = {}
+    for row in df.itertuples(index=False):
+        t = str(getattr(row, "task", "")).strip()
+        mid = str(getattr(row, "ID", "")).strip()
+        conf = _normalize_conf_id(getattr(row, "conf_id", ""))
+        cid = str(getattr(row, "concept_id", "")).strip()
+        if not t or not mid or not cid:
+            continue
+        try:
+            score = float(getattr(row, "strict_cosine", 0.0))
+        except Exception:
+            score = 0.0
+        if not np.isfinite(score):
+            continue
+        key = (t, mid, conf, cid)
+        prev = row_map.get(key)
+        row_map[key] = float(score) if prev is None else float(max(prev, float(score)))
+
+    if len(row_map) == 0:
+        return {}, {}
+
+    agg_sum: dict[tuple[str, str], float] = {}
+    agg_cnt: dict[tuple[str, str], int] = {}
+    for (t, _mid, _conf, cid), val in row_map.items():
+        k = (t, cid)
+        agg_sum[k] = float(agg_sum.get(k, 0.0) + float(val))
+        agg_cnt[k] = int(agg_cnt.get(k, 0) + 1)
+    global_map = {
+        k: float(agg_sum[k] / float(max(1, agg_cnt[k])))
+        for k in agg_sum.keys()
+    }
+    return row_map, global_map
 
 
 def _is_generic_tag(tag: str) -> bool:
@@ -582,7 +742,9 @@ def export_prediction_text_explanations(
     ricci_edges_csv: str | None = None,
     lambda_vol_long_csv: str | None = None,
     a_priori_tags_csv: str | None = None,
+    strict_scores_csv: str | None = None,
     tcav_weight: float = 0.35,
+    strict_weight: float = 0.35,
     top_k: int = 3,
     bridge_threshold: float = 0.20,
 ) -> Path:
@@ -619,6 +781,7 @@ def export_prediction_text_explanations(
     bridge_scores = _compute_ricci_bridge_scores(ricci_edges_csv=ricci_edges_csv, task_cols=task_cols)
     tcav_scores = _compute_tcav_last_scores(lambda_vol_long_csv=lambda_vol_long_csv, task_cols=task_cols)
     a_priori_tags_map = _load_a_priori_tags_map(a_priori_tags_csv)
+    strict_row_scores, strict_global_scores = _load_strict_mixer_scores(strict_scores_csv)
     mol_to_concepts, conf_to_concepts = _build_concept_index_maps(
         concept_ids=concept_ids,
         concept_mol_map=concept_mol_map,
@@ -628,6 +791,7 @@ def export_prediction_text_explanations(
     concept_set = {str(x) for x in concept_ids}
     kk = max(1, int(top_k))
     tcav_weight = float(max(0.0, tcav_weight))
+    strict_weight = float(max(0.0, strict_weight))
     scope_molecules = set([str(x) for x in df["ID"].astype(str).tolist()])
     scope_molecules.update([str(x) for x in mol_to_concepts.keys()])
     scope_n = float(max(1, len(scope_molecules)))
@@ -659,7 +823,8 @@ def export_prediction_text_explanations(
     for row in df.itertuples(index=False):
         mol_id = str(getattr(row, "ID"))
         conf_id = str(getattr(row, "conf_id"))
-        conf_hits = conf_to_concepts.get((mol_id, conf_id), set())
+        conf_id_norm = _normalize_conf_id(conf_id)
+        conf_hits = conf_to_concepts.get((mol_id, conf_id_norm), set())
         mol_hits = mol_to_concepts.get(mol_id, set())
         active = sorted((conf_hits | mol_hits) & concept_set)
 
@@ -671,11 +836,15 @@ def export_prediction_text_explanations(
             label = int(getattr(row, label_col)) if label_col in df.columns else int(pred >= 0.5)
             attn = float(getattr(row, f"attn_{t}"))
 
-            scored: list[tuple[float, str, bool, float, float, dict[str, float], dict[str, list[str]]]] = []
+            scored: list[tuple[float, str, bool, float, float, float, dict[str, float], dict[str, list[str]]]] = []
             for cid in active:
                 conf_level = cid in conf_hits
                 bridge = float(bridge_scores.get((t, cid), 0.0))
                 tcav = float(tcav_scores.get((t, cid), 0.0))
+                strict_val = float(
+                    strict_row_scores.get((t, mol_id, conf_id_norm, cid), strict_global_scores.get((t, cid), 0.0))
+                )
+                strict_val = float(np.clip(strict_val, -1.0, 1.0))
                 support = float(concept_metadata.get(cid, {}).get("support", 1.0))
                 coverage = float(concept_coverage.get(str(cid), 0.0))
                 if coverage <= 0.0:
@@ -684,6 +853,7 @@ def export_prediction_text_explanations(
                 support_gain = 1.0 + min(0.10, 0.02 * float(np.log1p(max(support, 0.0))))
                 rarity_idf = float(math.log1p((scope_n + 1.0) / (1.0 + coverage)))
                 rarity_gain = float(np.clip(0.75 + 0.35 * rarity_idf, 0.75, 1.40))
+                strict_gain = float(np.clip(1.0 + strict_weight * strict_val, 0.25, 2.50))
                 base = (
                     attn
                     * (1.15 if conf_level else 0.85)
@@ -691,9 +861,10 @@ def export_prediction_text_explanations(
                     * rarity_gain
                     * (1.0 + 0.35 * bridge)
                     * (1.0 + tcav_weight * max(0.0, tcav))
+                    * strict_gain
                 )
                 scored.append(
-                    (float(base), cid, conf_level, bridge, tcav, modality_weights, modality_tags)
+                    (float(base), cid, conf_level, bridge, tcav, strict_val, modality_weights, modality_tags)
                 )
 
             scored.sort(key=lambda x: x[0], reverse=True)
@@ -707,7 +878,7 @@ def export_prediction_text_explanations(
 
             task_tags: list[str] = []
             if len(top) > 0:
-                for _, cid, _is_conf_level, _bridge, _tcav, _mw, _mt in top:
+                for _, cid, _is_conf_level, _bridge, _tcav, _strict_val, _mw, _mt in top:
                     task_tags.extend(
                         _select_display_tags(
                             metadata=concept_metadata.get(cid, {}),
@@ -738,22 +909,55 @@ def export_prediction_text_explanations(
                         bridge_score=bridge,
                         bridge_threshold=bridge_threshold,
                     )
-                    for _, cid, is_conf_level, bridge, _, _, _ in top
+                    for _, cid, is_conf_level, bridge, _, _, _, _ in top
                 ]
-                has_bridge = any(float(bridge) >= float(bridge_threshold) for _, _, _, bridge, _, _, _ in top)
+                has_bridge = any(float(bridge) >= float(bridge_threshold) for _, _, _, bridge, _, _, _, _ in top)
                 mean_tcav_top = float(np.mean([float(x[4]) for x in top])) if len(top) > 0 else 0.0
+                mean_strict_top = float(np.mean([float(x[5]) for x in top])) if len(top) > 0 else 0.0
                 expl = f"{t}: p={pred:.3f} (label={label}). Key concepts: " + "; ".join(phrases) + "."
                 if has_bridge:
                     expl += " Ricci note: bridge-like concept channel detected."
                 if mean_tcav_top > 0.0:
                     expl += f" TCAV support={mean_tcav_top:.2f}."
+                if abs(mean_strict_top) > 1e-6:
+                    expl += f" Strict mixer alignment={mean_strict_top:.2f}."
+
+            # Optional conformer pharmacophore-signature diagnostics (from pmapper).
+            sig_main = str(getattr(row, "pmapper_sig_md5", "")).strip()
+            sig_mass_col = f"pmapper_sig_md5_mass_{t}"
+            sig_rank_col = f"pmapper_sig_md5_rank_{t}"
+            if sig_main and (sig_mass_col in df.columns):
+                try:
+                    sig_mass = float(getattr(row, sig_mass_col))
+                except Exception:
+                    sig_mass = 0.0
+                if sig_rank_col in df.columns:
+                    try:
+                        sig_rank_raw = getattr(row, sig_rank_col)
+                        sig_rank = int(round(float(sig_rank_raw))) if np.isfinite(float(sig_rank_raw)) else None
+                    except Exception:
+                        sig_rank = None
+                else:
+                    sig_rank = None
+                sig_short = str(sig_main)[:12]
+                if (sig_rank is not None) and (sig_rank <= 1) and (sig_mass >= 0.35):
+                    expl += (
+                        f" Pharmacophore-signature note: dominant conformer signature "
+                        f"{sig_short} (attention mass={sig_mass:.2f})."
+                    )
+                elif sig_mass > 0.0:
+                    rank_txt = "" if sig_rank is None else f", rank={int(sig_rank)}"
+                    expl += (
+                        f" Pharmacophore-signature mass={sig_mass:.2f}{rank_txt} "
+                        f"(sig={sig_short})."
+                    )
 
             per_task_expl_cols[t].append(expl)
             row_join_parts.append(expl)
 
             for modality_key, modality_col in modality_map:
                 modal_scored: list[tuple[float, str, bool, float, float]] = []
-                for base, cid, is_conf_level, bridge, tcav, modality_weights, _modality_tags in scored:
+                for base, cid, is_conf_level, bridge, tcav, _strict_val, modality_weights, _modality_tags in scored:
                     w_mod = float(modality_weights.get(modality_key, 0.0))
                     if w_mod <= 0.0:
                         continue

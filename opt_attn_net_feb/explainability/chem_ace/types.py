@@ -47,6 +47,7 @@ class ConceptCandidate:
     coherence: float
     centroid: np.ndarray
     medoid_patch_id: str
+    modality: str = "2d"
     metadata: JsonDict = field(default_factory=dict)
 
 
@@ -58,6 +59,7 @@ class ConceptMembership:
     patch_id: str
     membership_score: float
     distance_to_centroid: float
+    modality: Optional[str] = None
 
 
 @dataclass(frozen=True)

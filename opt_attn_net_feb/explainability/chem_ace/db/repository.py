@@ -425,6 +425,8 @@ class ChemACERepository:
         """Persist concept and centroid vector; concept id equals local id."""
         concept_id = str(cand.concept_local_id)
         centroid_uri = self._vector_uri(group="centroids", vector_id=concept_id, vector=cand.centroid)
+        metadata_payload = dict(cand.metadata)
+        metadata_payload.setdefault("modality", str(getattr(cand, "modality", "2d")))
         with self.session() as s:
             existing = s.get(ConceptORM, concept_id)
             if existing is None:
@@ -437,10 +439,14 @@ class ChemACERepository:
                         coherence=float(cand.coherence),
                         centroid_uri=str(centroid_uri),
                         medoid_patch_id=str(cand.medoid_patch_id),
+                        modality=str(getattr(cand, "modality", metadata_payload.get("modality", "2d"))),
                         label_auto=None,
-                        metadata_json=_json_dumps(dict(cand.metadata)),
+                        metadata_json=_json_dumps(metadata_payload),
                     )
                 )
+            else:
+                existing.modality = str(getattr(cand, "modality", metadata_payload.get("modality", "2d")))
+                existing.metadata_json = _json_dumps(metadata_payload)
             s.commit()
         return concept_id
 
@@ -472,11 +478,13 @@ class ChemACERepository:
                         ConceptMembershipORM(
                             concept_id=str(m.concept_local_id),
                             patch_id=str(m.patch_id),
+                            modality=(None if getattr(m, "modality", None) is None else str(getattr(m, "modality"))),
                             membership_score=float(m.membership_score),
                             distance_to_centroid=float(m.distance_to_centroid),
                         )
                     )
                 elif float(m.membership_score) > float(existing.membership_score):
+                    existing.modality = (None if getattr(m, "modality", None) is None else str(getattr(m, "modality")))
                     existing.membership_score = float(m.membership_score)
                     existing.distance_to_centroid = float(m.distance_to_centroid)
             s.commit()
@@ -487,6 +495,11 @@ class ChemACERepository:
                 s.add(
                     ConceptTagORM(
                         concept_id=str(tag.concept_id),
+                        modality=(
+                            None
+                            if not isinstance(tag.evidence_json, Mapping)
+                            else (None if tag.evidence_json.get("modality") is None else str(tag.evidence_json.get("modality")))
+                        ),
                         tag=str(tag.tag),
                         confidence=float(tag.confidence),
                         provenance=str(tag.provenance),
@@ -511,6 +524,11 @@ class ChemACERepository:
                 s.add(
                     CAVORM(
                         concept_id=str(record.concept_id),
+                        concept_modality=(
+                            None
+                            if not isinstance(record.metadata, Mapping)
+                            else (None if record.metadata.get("concept_modality") is None else str(record.metadata.get("concept_modality")))
+                        ),
                         task_id=str(record.task_id),
                         layer_name=str(record.layer_name),
                         seed=int(record.seed),
@@ -522,6 +540,11 @@ class ChemACERepository:
                 )
             else:
                 existing.vector_uri = str(vector_uri)
+                existing.concept_modality = (
+                    None
+                    if not isinstance(record.metadata, Mapping)
+                    else (None if record.metadata.get("concept_modality") is None else str(record.metadata.get("concept_modality")))
+                )
                 existing.intercept = float(record.intercept)
                 existing.train_accuracy = float(record.train_accuracy)
                 existing.metadata_json = _json_dumps(dict(record.metadata))
@@ -545,6 +568,11 @@ class ChemACERepository:
                         run_id=str(record.run_id),
                         epoch=int(record.epoch),
                         concept_id=str(record.concept_id),
+                        concept_modality=(
+                            None
+                            if not isinstance(record.metadata, Mapping)
+                            else (None if record.metadata.get("concept_modality") is None else str(record.metadata.get("concept_modality")))
+                        ),
                         task_id=str(record.task_id),
                         layer_name=str(record.layer_name),
                         seed=int(record.seed),
@@ -560,6 +588,11 @@ class ChemACERepository:
                 existing.tcav_mean_directional_derivative = float(record.tcav_mean_directional_derivative)
                 existing.n_samples = int(record.n_samples)
                 existing.p_value = None if record.p_value is None else float(record.p_value)
+                existing.concept_modality = (
+                    None
+                    if not isinstance(record.metadata, Mapping)
+                    else (None if record.metadata.get("concept_modality") is None else str(record.metadata.get("concept_modality")))
+                )
                 existing.metadata_json = _json_dumps(dict(record.metadata))
             s.commit()
 

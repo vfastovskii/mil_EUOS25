@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import gc
 import json
 import shutil
@@ -17,6 +17,7 @@ from ..callbacks.concept_rl import ConceptRLControllerCallback, ConceptRLPolicyC
 from ..data.collate import collate_export, collate_train
 from ..data.datasets import MILExportDataset, MILTrainDataset
 from ..data.exports import export_leaderboard_attention, export_prediction_text_explanations
+from ..explainability.chem_ace.embedding.hooks import LayerActivationHook
 from ..utils.constants import TASK_COLS
 from ..utils.data_io import align_by_id
 from ..utils.ops import (
@@ -46,6 +47,373 @@ from .explainability_runtime import (
 from .loss_config import compute_gamma, compute_lam, compute_posw_clips
 from .search_space import search_space
 from .trainer import LightningTrainerConfig, LightningTrainerFactory, ModelEvaluator
+
+
+def _normalize_conf_id(value: Any) -> str:
+    s = str(value).strip()
+    if (not s) or (s.lower() in {"nan", "none"}):
+        return ""
+    if s.endswith(".0"):
+        try:
+            fv = float(s)
+            iv = int(fv)
+            if abs(fv - float(iv)) <= 1e-12:
+                return str(iv)
+        except Exception:
+            pass
+    return s
+
+
+def _load_conformer_signature_maps(
+    *,
+    signature_csv: str | None,
+) -> tuple[Dict[str, str], Dict[str, str]]:
+    """
+    Load conformer signature maps from Chem-ACE pmapper export.
+
+    Returns:
+      (conf_id -> primary_signature, conf_id -> alternate_signature)
+    """
+    if signature_csv is None:
+        return {}, {}
+    path = Path(str(signature_csv))
+    if not path.exists():
+        return {}, {}
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return {}, {}
+    if df.empty or ("conf_id" not in df.columns):
+        return {}, {}
+
+    sig_map: Dict[str, str] = {}
+    sig_map_alt: Dict[str, str] = {}
+    has_main = "pmapper_sig_md5" in df.columns
+    has_alt = "pmapper_sig_md5_alt" in df.columns
+    for row in df.itertuples(index=False):
+        conf_id = _normalize_conf_id(getattr(row, "conf_id", ""))
+        if not conf_id:
+            continue
+        if has_main:
+            sig = str(getattr(row, "pmapper_sig_md5", "")).strip()
+            if sig:
+                sig_map[conf_id] = sig
+        if has_alt:
+            sig_alt = str(getattr(row, "pmapper_sig_md5_alt", "")).strip()
+            if sig_alt:
+                sig_map_alt[conf_id] = sig_alt
+    return sig_map, sig_map_alt
+
+
+def _read_table_auto(path: Path) -> pd.DataFrame:
+    suffix = str(path.suffix).lower()
+    if suffix in {".parquet", ".pq"}:
+        try:
+            return pd.read_parquet(path)
+        except Exception:
+            fallback = path.with_suffix(".csv")
+            if fallback.exists():
+                return pd.read_csv(fallback)
+            raise
+    return pd.read_csv(path)
+
+
+def _cosine_similarity(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
+    a = np.asarray(vec_a, dtype=np.float32).reshape(-1)
+    b = np.asarray(vec_b, dtype=np.float32).reshape(-1)
+    na = float(np.linalg.norm(a))
+    nb = float(np.linalg.norm(b))
+    if (na <= 1e-12) or (nb <= 1e-12):
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+def _task_vec(z: np.ndarray, task_idx: int) -> np.ndarray:
+    arr = np.asarray(z, dtype=np.float32)
+    if arr.ndim == 1:
+        return arr
+    if arr.ndim >= 2:
+        ti = int(np.clip(int(task_idx), 0, max(0, int(arr.shape[0]) - 1)))
+        return np.asarray(arr[ti], dtype=np.float32).reshape(-1)
+    return np.asarray(arr, dtype=np.float32).reshape(-1)
+
+
+def _run_strict_mixer_rerank(
+    *,
+    model: torch.nn.Module,
+    device: torch.device,
+    layer_name: str,
+    out_dir: Path,
+    attention_table_path: Path,
+    concept_ids: Sequence[str],
+    concept_metadata: Mapping[str, Mapping[str, Any]],
+    concept_mol_map: Mapping[str, set[str]],
+    concept_conf_map: Mapping[str, set[tuple[str, str]]],
+    ids_2d_file: Sequence[str],
+    X2d_file: np.ndarray,
+    starts: np.ndarray,
+    counts: np.ndarray,
+    id2pos: Mapping[str, int],
+    conf_sorted: np.ndarray,
+    Xinst_sorted: np.ndarray,
+    top_rows_per_task: int,
+    batch_size: int,
+) -> tuple[Optional[Path], Optional[Path], Optional[Path]]:
+    """
+    Strict re-embedding pass in trained mixer space.
+
+    Scope:
+      - concept medoids (from train-discovered concepts)
+      - top-attention leaderboard conformers (per task)
+
+    Output:
+      - row-level strict scores CSV (ID, conf_id, task, concept_id, strict_cosine)
+      - concept-level summary CSV
+      - JSON summary
+    """
+    if not attention_table_path.exists():
+        return None, None, None
+    df = _read_table_auto(attention_table_path)
+    if df.empty:
+        return None, None, None
+    need_cols = {"ID", "conf_id"} | {f"attn_{str(t)}" for t in TASK_COLS}
+    if not need_cols.issubset(set(df.columns)):
+        return None, None, None
+
+    # Build leaderboard top-attention subset per task.
+    top_k = int(top_rows_per_task)
+    top_rows_by_task: Dict[int, List[tuple[str, str, float]]] = {}
+    for ti, task in enumerate(TASK_COLS):
+        attn_col = f"attn_{str(task)}"
+        sub = df.loc[:, ["ID", "conf_id", attn_col]].copy()
+        sub = sub.replace([np.inf, -np.inf], np.nan)
+        sub = sub.dropna(subset=[attn_col])
+        if top_k > 0:
+            sub = sub.nlargest(int(top_k), columns=attn_col)
+        rows: List[tuple[str, str, float]] = []
+        for row in sub.itertuples(index=False):
+            mid = str(getattr(row, "ID", "")).strip()
+            conf = _normalize_conf_id(getattr(row, "conf_id", ""))
+            if (not mid) or (not conf):
+                continue
+            try:
+                attn_val = float(getattr(row, attn_col))
+            except Exception:
+                attn_val = 0.0
+            if not np.isfinite(attn_val):
+                continue
+            rows.append((mid, conf, float(attn_val)))
+        top_rows_by_task[int(ti)] = rows
+
+    concept_set = {str(x) for x in concept_ids}
+    if len(concept_set) == 0:
+        return None, None, None
+
+    # Build concept membership indexes with normalized conformer IDs.
+    mol_to_concepts: Dict[str, set[str]] = {}
+    conf_to_concepts: Dict[tuple[str, str], set[str]] = {}
+    for cid, mols in concept_mol_map.items():
+        c = str(cid)
+        if c not in concept_set:
+            continue
+        for mol_id in mols:
+            mid = str(mol_id)
+            if not mid:
+                continue
+            if mid not in mol_to_concepts:
+                mol_to_concepts[mid] = set()
+            mol_to_concepts[mid].add(c)
+    for cid, pairs in concept_conf_map.items():
+        c = str(cid)
+        if c not in concept_set:
+            continue
+        for mol_id, conf_id in pairs:
+            key = (str(mol_id), _normalize_conf_id(conf_id))
+            if (not key[0]) or (not key[1]):
+                continue
+            if key not in conf_to_concepts:
+                conf_to_concepts[key] = set()
+            conf_to_concepts[key].add(c)
+
+    # Resolve medoid references from concept metadata.
+    medoid_query_by_cid: Dict[str, tuple[str, str]] = {}
+    for cid in sorted(concept_set):
+        md = concept_metadata.get(str(cid), {})
+        mid = str(md.get("medoid_mol_id", "")).strip()
+        conf = _normalize_conf_id(md.get("medoid_conf_id", ""))
+        if not mid:
+            continue
+        medoid_query_by_cid[str(cid)] = (mid, conf)
+    if len(medoid_query_by_cid) == 0:
+        return None, None, None
+
+    query_keys: set[tuple[str, str]] = set()
+    for rows in top_rows_by_task.values():
+        for mid, conf, _attn in rows:
+            query_keys.add((str(mid), str(conf)))
+    query_keys.update(set(medoid_query_by_cid.values()))
+    if len(query_keys) == 0:
+        return None, None, None
+
+    id2d_idx = {str(mid): int(i) for i, mid in enumerate(ids_2d_file)}
+    starts_arr = np.asarray(starts)
+    counts_arr = np.asarray(counts)
+    conf_arr = np.asarray(conf_sorted)
+    x2d_all = np.asarray(X2d_file, dtype=np.float32)
+    xinst_all = np.asarray(Xinst_sorted, dtype=np.float32)
+
+    mol_cache: Dict[str, tuple[np.ndarray, np.ndarray, List[str], Dict[str, int]]] = {}
+    resolved: Dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
+
+    def _load_mol(mid: str) -> Optional[tuple[np.ndarray, np.ndarray, List[str], Dict[str, int]]]:
+        if mid in mol_cache:
+            return mol_cache[mid]
+        if mid not in id2d_idx or mid not in id2pos:
+            return None
+        p = int(id2pos[mid])
+        s = int(starts_arr[p])
+        c = int(counts_arr[p])
+        if c <= 0:
+            return None
+        bag = xinst_all[s : s + c]
+        if bag.ndim != 2 or int(bag.shape[0]) == 0:
+            return None
+        conf_slice = conf_arr[s : s + c]
+        conf_norm = [_normalize_conf_id(x) for x in conf_slice.tolist()]
+        conf_idx: Dict[str, int] = {}
+        for j, cf in enumerate(conf_norm):
+            if cf and cf not in conf_idx:
+                conf_idx[cf] = int(j)
+        x2d_vec = np.asarray(x2d_all[int(id2d_idx[mid])], dtype=np.float32).reshape(-1)
+        cached = (x2d_vec, np.asarray(bag, dtype=np.float32), conf_norm, conf_idx)
+        mol_cache[mid] = cached
+        return cached
+
+    for mid, conf in sorted(query_keys):
+        mol_data = _load_mol(str(mid))
+        if mol_data is None:
+            continue
+        x2d_vec, bag, _conf_norm, conf_idx = mol_data
+        if conf and conf in conf_idx:
+            inst_vec = np.asarray(bag[int(conf_idx[conf])], dtype=np.float32).reshape(-1)
+        else:
+            inst_vec = np.asarray(np.mean(bag, axis=0), dtype=np.float32).reshape(-1)
+        resolved[(str(mid), str(conf))] = (x2d_vec, inst_vec)
+
+    if len(resolved) == 0:
+        return None, None, None
+
+    batch = max(1, int(batch_size))
+    query_list: List[tuple[str, str, np.ndarray, np.ndarray]] = [
+        (mid, conf, x2d, inst) for (mid, conf), (x2d, inst) in resolved.items()
+    ]
+    embeddings: Dict[tuple[str, str], np.ndarray] = {}
+
+    model_mode = bool(model.training)
+    model.eval()
+    with torch.no_grad():
+        with LayerActivationHook(model, str(layer_name)) as hook:
+            for i in range(0, len(query_list), batch):
+                chunk = query_list[i : i + batch]
+                x2d_np = np.stack([x[2] for x in chunk], axis=0).astype(np.float32)
+                x3d_np = np.stack([x[3] for x in chunk], axis=0).astype(np.float32)[:, None, :]
+                kpm_np = np.zeros((x2d_np.shape[0], 1), dtype=bool)
+                x2d_t = torch.from_numpy(x2d_np).to(device=device, non_blocking=True)
+                x3d_t = torch.from_numpy(x3d_np).to(device=device, non_blocking=True)
+                kpm_t = torch.from_numpy(kpm_np).to(device=device, non_blocking=True)
+                _ = model(x2d_t, x3d_t, kpm_t, return_attn=False)
+                act = hook.last_activation
+                if act is None:
+                    continue
+                act_np = np.asarray(act.detach().cpu().numpy(), dtype=np.float32)
+                for j, (mid, conf, _x2d, _inst) in enumerate(chunk):
+                    embeddings[(str(mid), str(conf))] = np.asarray(act_np[j], dtype=np.float32)
+    if model_mode:
+        model.train()
+
+    if len(embeddings) == 0:
+        return None, None, None
+
+    rows_out: List[Dict[str, Any]] = []
+    agg_sum: Dict[tuple[str, str], float] = {}
+    agg_cnt: Dict[tuple[str, str], int] = {}
+    agg_max: Dict[tuple[str, str], float] = {}
+
+    for ti, task in enumerate(TASK_COLS):
+        rows_task = top_rows_by_task.get(int(ti), [])
+        task_name = str(task)
+        for mid, conf, attn_val in rows_task:
+            z_row = embeddings.get((str(mid), str(conf)))
+            if z_row is None:
+                continue
+            active = set(mol_to_concepts.get(str(mid), set()))
+            active.update(conf_to_concepts.get((str(mid), str(conf)), set()))
+            active = active & concept_set
+            if len(active) == 0:
+                continue
+            row_vec = _task_vec(z_row, int(ti))
+            for cid in sorted(active):
+                med_key = medoid_query_by_cid.get(str(cid))
+                if med_key is None:
+                    continue
+                z_med = embeddings.get((str(med_key[0]), str(med_key[1])))
+                if z_med is None:
+                    continue
+                med_vec = _task_vec(z_med, int(ti))
+                strict = _cosine_similarity(row_vec, med_vec)
+                rows_out.append(
+                    {
+                        "ID": str(mid),
+                        "conf_id": str(conf),
+                        "task": task_name,
+                        "task_idx": int(ti),
+                        "concept_id": str(cid),
+                        "strict_cosine": float(strict),
+                        "attn": float(attn_val),
+                    }
+                )
+                k = (task_name, str(cid))
+                agg_sum[k] = float(agg_sum.get(k, 0.0) + float(strict))
+                agg_cnt[k] = int(agg_cnt.get(k, 0) + 1)
+                agg_max[k] = float(max(float(agg_max.get(k, -1.0)), float(strict)))
+
+    if len(rows_out) == 0:
+        return None, None, None
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows_csv = out_dir / "chem_ace_strict_mixer_scores.csv"
+    pd.DataFrame(rows_out).to_csv(rows_csv, index=False)
+
+    summary_rows: List[Dict[str, Any]] = []
+    for (task_name, cid), cnt in sorted(agg_cnt.items()):
+        summary_rows.append(
+            {
+                "task": str(task_name),
+                "concept_id": str(cid),
+                "n_rows": int(cnt),
+                "mean_strict_cosine": float(agg_sum[(task_name, cid)] / float(max(1, cnt))),
+                "max_strict_cosine": float(agg_max[(task_name, cid)]),
+            }
+        )
+    concept_csv = out_dir / "chem_ace_strict_mixer_concepts.csv"
+    pd.DataFrame(summary_rows).to_csv(concept_csv, index=False)
+
+    summary = {
+        "layer_name": str(layer_name),
+        "top_rows_per_task": int(top_k),
+        "batch_size": int(batch),
+        "n_queries_requested": int(len(query_keys)),
+        "n_queries_embedded": int(len(embeddings)),
+        "n_task_rows_scored": int(len(rows_out)),
+        "n_task_concepts_scored": int(len(summary_rows)),
+        "paths": {
+            "strict_scores_csv": str(rows_csv),
+            "strict_concepts_csv": str(concept_csv),
+        },
+    }
+    summary_json = out_dir / "chem_ace_strict_mixer_summary.json"
+    summary_json.write_text(json.dumps(summary, indent=2))
+    return rows_csv, concept_csv, summary_json
 
 
 def _export_concept_rl_active_assignments(
@@ -1428,13 +1796,71 @@ class MILFinalTrainer:
         )
         log_event("INFO", "final.export.attention.start")
         out_path = Path(self.config.attn_out) if self.config.attn_out else (outdir / "leaderboard_attn.csv")
+        conf_sig_map: Dict[str, str] = {}
+        conf_sig_map_alt: Dict[str, str] = {}
+        if chem_bundle is not None:
+            conf_sig_map, conf_sig_map_alt = _load_conformer_signature_maps(
+                signature_csv=getattr(chem_bundle, "conformer_signature_csv", None),
+            )
+            log_event(
+                "INFO",
+                "final.export.attention.pmapper_signatures",
+                n_signatures=int(len(conf_sig_map)),
+                n_signatures_alt=int(len(conf_sig_map_alt)),
+                source_csv=(None if getattr(chem_bundle, "conformer_signature_csv", None) is None else str(chem_bundle.conformer_signature_csv)),
+            )
         written_attn_path = export_leaderboard_attention(
             model,
             export_dl,
             device=self.eval_device,
             out_path=out_path,
+            conf_signature_map=(conf_sig_map if len(conf_sig_map) > 0 else None),
+            conf_signature_alt_map=(conf_sig_map_alt if len(conf_sig_map_alt) > 0 else None),
         )
         log_event("INFO", "final.export.attention.done", path=str(written_attn_path))
+
+        strict_scores_csv: Path | None = None
+        strict_concepts_csv: Path | None = None
+        strict_summary_json: Path | None = None
+        if (
+            chem_bundle is not None
+            and explain_cfg is not None
+            and bool(explain_cfg.chem_ace_strict_rerank)
+        ):
+            log_event(
+                "INFO",
+                "final.export.strict_mixer_rerank.start",
+                layer_name=str(explain_cfg.chem_ace_strict_rerank_layer_name),
+                top_rows_per_task=int(explain_cfg.chem_ace_strict_rerank_top_rows_per_task),
+                batch_size=int(explain_cfg.chem_ace_strict_rerank_batch_size),
+            )
+            strict_scores_csv, strict_concepts_csv, strict_summary_json = _run_strict_mixer_rerank(
+                model=model,
+                device=self.eval_device,
+                layer_name=str(explain_cfg.chem_ace_strict_rerank_layer_name),
+                out_dir=final_dir,
+                attention_table_path=written_attn_path,
+                concept_ids=chem_bundle.concept_ids,
+                concept_metadata=chem_bundle.concept_metadata,
+                concept_mol_map=chem_bundle.concept_mol_map,
+                concept_conf_map=chem_bundle.concept_conf_map,
+                ids_2d_file=data.X2d_file_ids,
+                X2d_file=data.X2d_file,
+                starts=data.starts,
+                counts=data.counts,
+                id2pos=data.id2pos,
+                conf_sorted=data.conf_sorted,
+                Xinst_sorted=data.Xinst_sorted,
+                top_rows_per_task=int(explain_cfg.chem_ace_strict_rerank_top_rows_per_task),
+                batch_size=int(explain_cfg.chem_ace_strict_rerank_batch_size),
+            )
+            log_event(
+                "INFO",
+                "final.export.strict_mixer_rerank.done",
+                strict_scores_csv=(None if strict_scores_csv is None else str(strict_scores_csv)),
+                strict_concepts_csv=(None if strict_concepts_csv is None else str(strict_concepts_csv)),
+                strict_summary_json=(None if strict_summary_json is None else str(strict_summary_json)),
+            )
 
         lv_art = getattr(lambda_vol_cb, "last_artifacts", None) if lambda_vol_cb is not None else None
 
@@ -1456,6 +1882,14 @@ class MILFinalTrainer:
                     chem_bundle.a_priori_tags_infer_csv
                     if chem_bundle.a_priori_tags_infer_csv is not None
                     else chem_bundle.a_priori_tags_csv
+                ),
+                strict_scores_csv=(
+                    None if strict_scores_csv is None else str(strict_scores_csv)
+                ),
+                strict_weight=(
+                    0.0
+                    if explain_cfg is None
+                    else float(explain_cfg.chem_ace_strict_rerank_weight)
                 ),
                 top_k=3,
                 bridge_threshold=0.20,
@@ -1500,8 +1934,27 @@ class MILFinalTrainer:
                     if chem_bundle.activity_calibration_summary_json is None
                     else str(chem_bundle.activity_calibration_summary_json)
                 ),
+                "conformer_signature_csv": (
+                    None
+                    if getattr(chem_bundle, "conformer_signature_csv", None) is None
+                    else str(chem_bundle.conformer_signature_csv)
+                ),
+                "conformer_signature_summary_json": (
+                    None
+                    if getattr(chem_bundle, "conformer_signature_summary_json", None) is None
+                    else str(chem_bundle.conformer_signature_summary_json)
+                ),
                 "prediction_explanations_csv": (
                     None if explained_pred_path is None else str(explained_pred_path)
+                ),
+                "strict_mixer_scores_csv": (
+                    None if strict_scores_csv is None else str(strict_scores_csv)
+                ),
+                "strict_mixer_concepts_csv": (
+                    None if strict_concepts_csv is None else str(strict_concepts_csv)
+                ),
+                "strict_mixer_summary_json": (
+                    None if strict_summary_json is None else str(strict_summary_json)
                 ),
             }
         if lambda_vol_cb is not None:

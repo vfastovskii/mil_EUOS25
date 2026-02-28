@@ -119,7 +119,15 @@ CHEMACE_MAX_IDS="${CHEMACE_MAX_IDS:-0}"
 CHEMACE_MAX_CONFS_PER_ID="${CHEMACE_MAX_CONFS_PER_ID:-0}"
 CHEMACE_LOCAL_RADII="${CHEMACE_LOCAL_RADII:-1}"
 CHEMACE_PATCH_CAP_PER_MOL="${CHEMACE_PATCH_CAP_PER_MOL:-0}"
-CHEMACE_TARGET_TOTAL_PATCHES="${CHEMACE_TARGET_TOTAL_PATCHES:-1200}" #1200000
+CHEMACE_TARGET_TOTAL_PATCHES="${CHEMACE_TARGET_TOTAL_PATCHES:-1200000}"
+# Hybrid embedding controls
+CHEMACE_EMBED_DIM_2D="${CHEMACE_EMBED_DIM_2D:-64}"
+CHEMACE_EMBED_DIM_3D_GEOM="${CHEMACE_EMBED_DIM_3D_GEOM:-64}"
+CHEMACE_EMBED_DIM_3D_QM="${CHEMACE_EMBED_DIM_3D_QM:-64}"
+CHEMACE_CONTEXT_DIM="${CHEMACE_CONTEXT_DIM:-16}"
+CHEMACE_CONTEXT_ALPHA="${CHEMACE_CONTEXT_ALPHA:-0.20}"
+CHEMACE_QM_GATING="${CHEMACE_QM_GATING:-1}"
+# Deprecated compatibility knobs (ignored by hybrid runtime).
 CHEMACE_MAX_2D_DIM="${CHEMACE_MAX_2D_DIM:-0}"
 CHEMACE_MAX_3DQM_DIM="${CHEMACE_MAX_3DQM_DIM:-0}"
 # <=0 means all discovered Chem-ACE concepts.
@@ -295,11 +303,21 @@ if [[ "$RUN_CHEM_ACE" == "1" ]]; then
     --chem_ace_local_radii "${CHEMACE_RADII_ARR[@]}"
     --chem_ace_patch_cap_per_mol "$CHEMACE_PATCH_CAP_PER_MOL"
     --chem_ace_target_total_patches "$CHEMACE_TARGET_TOTAL_PATCHES"
+    --chem_ace_embed_dim_2d "$CHEMACE_EMBED_DIM_2D"
+    --chem_ace_embed_dim_3d_geom "$CHEMACE_EMBED_DIM_3D_GEOM"
+    --chem_ace_embed_dim_3d_qm "$CHEMACE_EMBED_DIM_3D_QM"
+    --chem_ace_context_dim "$CHEMACE_CONTEXT_DIM"
+    --chem_ace_context_alpha "$CHEMACE_CONTEXT_ALPHA"
     --chem_ace_max_2d_dim "$CHEMACE_MAX_2D_DIM"
     --chem_ace_max_3dqm_dim "$CHEMACE_MAX_3DQM_DIM"
     --chem_ace_top_concepts "$CHEMACE_TOP_CONCEPTS"
     --chem_ace_infer_max_distance "$CHEMACE_INFER_MAX_DISTANCE"
   )
+  if [[ "$CHEMACE_QM_GATING" == "1" ]]; then
+    CMD+=(--chem_ace_qm_gating)
+  else
+    CMD+=(--no-chem_ace_qm_gating)
+  fi
   if [[ "$CHEMACE_PERSIST_PATCH_EMBEDDINGS" == "1" ]]; then
     CMD+=(--chem_ace_persist_patch_embeddings)
   else

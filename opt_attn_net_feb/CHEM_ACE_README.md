@@ -18,6 +18,10 @@ Primary implementation entrypoints:
 - `explainability/chem_ace/semantics/taggers.py`
 - `explainability/chem_ace/semantics/calibration.py`
 
+Paper-alignment checklist:
+
+- `docs/ACE_TCAV_ALIGNMENT.md`
+
 ## 1) Runtime Scope and Trigger Conditions
 
 Chem-ACE runs in final pipeline when `--run_chem_ace` is enabled.
@@ -137,6 +141,39 @@ If a requested conformer is missing in SDF:
 
 Per-molecule conformers are merged only when atom counts are compatible.
 
+## 6.1) Optional Conformer Pharmacophore Signatures (pmapper)
+
+To analyze why specific conformers receive high attention, Chem-ACE can compute conformer-level 3D pharmacophore signatures from the same SDF conformers used for 3D patching.
+
+Controls:
+
+- `--chem_ace_use_pmapper_signatures` / `--no-chem_ace_use_pmapper_signatures` (default enabled)
+- `--chem_ace_pmapper_tol` (default `0`)
+- `--chem_ace_pmapper_tol_alt` (default `5`)
+
+Behavior:
+
+- signatures are computed by `conf_id` from SDF entries
+- computation is optional and dependency-safe (skips with logged reason if `pmapper` is unavailable)
+- no concept leakage is introduced (signatures are conformer metadata, not label-derived)
+
+Artifacts:
+
+- `chem_ace/conformer_pmapper_signatures.csv`
+- `chem_ace/conformer_pmapper_signatures_summary.json`
+
+Attention export integration:
+
+- leaderboard attention rows include `pmapper_sig_md5` and `pmapper_sig_md5_alt` (when available)
+- for each task, signature-group diagnostics are added:
+  - `<sig_col>_mass_<task>`: total attention mass for this signature within molecule
+  - `<sig_col>_rank_<task>`: rank of signature by attention mass within molecule
+  - `<sig_col>_top_<task>`: 1 when this signature is top-ranked and has non-zero mass
+
+Prediction explanation integration:
+
+- per-task explanation text adds a pharmacophore-signature note when signature mass/rank indicates dominant conformer-level motif reuse.
+
 ## 7) Patch Volume Controls and Dynamic Auto-Cap
 
 Main controls:
@@ -156,47 +193,55 @@ If molecule exceeds cap:
 
 - deterministic SHA1-based sampling keeps a stable subset
 
-## 8) Patch Embedding in Final Runtime (Feature Projection Path)
+## 8) Patch Embedding in Final Runtime (Hybrid Local+Context by Modality)
 
-Final integration uses feature fusion embedding in `_build_feature_patch_embeddings(...)`.
+Legacy long-vector discovery embedding (`concat(full_2d, full_3dqm, patch_desc)`) is removed from the final runtime path.
 
-Per patch vector = concat of:
+Current runtime uses `_build_hybrid_patch_embeddings(...)` with three separate modality spaces:
 
-1. `v2d`:
-- molecule-level 2D vector
-- truncate/pad to effective `max_2d_dim`
-- if `--chem_ace_max_2d_dim <= 0`, full raw 2D dim is used dynamically
+- `2d`
+- `3d_geom`
+- `3d_qm`
 
-2. `v3dqm`:
-- conformer vector from `(mol_id, conf_id)` if available
-- else molecule mean over conformers
-- else zeros
-- truncate/pad to effective `max_3dqm_dim`
-- if `--chem_ace_max_3dqm_dim <= 0`, full merged 3D+QM model-input dim is used dynamically
+Each patch is routed into exactly one modality:
 
-3. patch descriptor block:
-- 10 structural descriptors:
-  - atom count
-  - aromatic fraction
-  - hetero fraction
-  - formal charge sum
-  - conjugated bond fraction
-  - ring bond fraction
-  - mean atomic number
-  - std atomic number
-  - mean degree
-  - std degree
-- plus 5-way patch-type one-hot
+- `conf_id is None` -> `2d`
+- conformer patch with missing/invalid QM slice -> `3d_geom`
+- conformer patch with QM support -> `3d_qm`
+
+Per modality, embedding logic is:
+
+- `z_local = MLP_local(local_features)`
+- `z_ctx = MLP_ctx(context_features)`
+- `z = LayerNorm(z_local + alpha * z_ctx)`
+- `z = l2_normalize(z)`
+
+Default dimensions:
+
+- `--chem_ace_embed_dim_2d 64`
+- `--chem_ace_embed_dim_3d_geom 64`
+- `--chem_ace_embed_dim_3d_qm 64`
+- `--chem_ace_context_dim 16`
+- `--chem_ace_context_alpha 0.2`
+- `--chem_ace_qm_gating` enabled
+
+Local feature blocks:
+
+- `2d local`: patch subgraph sketch + patch structural descriptors
+- `3d_geom local`: patch geometry summary from conformer coordinates + patch structural descriptors
+- `3d_qm local`: QM signature features (optionally geometry-gated) + compact geometry signal + patch structural descriptors
+
+Context feature blocks:
+
+- `2d context`: molecule-level 2D vector
+- `3d_geom context`: conformer geometry slice from instance vector
+- `3d_qm context`: conformer QM slice from instance vector
 
 Descriptor scaling:
 
-- `RobustScaler` fitted on discover-train descriptor rows (`max_fit_samples=200000`)
-- transform is reused for infer-scope patches
-
-Important:
-
-- this scaling applies only to the 15-dimensional local patch-descriptor block
-- it does not re-scale semantic tag outputs directly
+- `RobustScaler` is fitted on discover-train patch descriptor rows (`max_fit_samples=200000`)
+- scaler is reused for infer-scope descriptor transform
+- scaler affects descriptor block only, not semantic tag post-processing
 
 ## 9) Embedding Persistence Policy (Disk Safety)
 
@@ -216,6 +261,82 @@ When explicitly enabled with `--chem_ace_persist_patch_embeddings`:
 - embedding DB rows are persisted
 
 This default is intentional to avoid disk exhaustion on very large patch counts.
+
+## 9.1) Strict Mixer-Space Re-Embedding and Rerank (New)
+
+Chem-ACE now has a second, strict post-discovery pass in trained model space.
+
+Goal:
+
+- keep full-scale fast discovery for coverage
+- then re-score concept relevance in actual trained MIL representation space
+- improve final explanation ranking fidelity without changing concept definitions
+
+Activation layer:
+
+- default: `mixer_post_norm`
+- configurable by `--chem_ace_strict_rerank_layer_name`
+
+Subset used in strict pass:
+
+1. concept medoids (from train-discovered/frozen concepts)
+2. top-attention leaderboard conformer rows per task
+
+Strict pass does **not** re-cluster concepts and does **not** update concept IDs.
+
+### 9.1.1) How strict scores are computed
+
+For each selected leaderboard row `(ID, conf_id, task)`:
+
+1. run a single-conformer forward through trained MIL model
+2. capture task embedding from `mixer_post_norm`
+3. find row-active concepts using existing Chem-ACE membership maps:
+   - conf-level membership union molecule-level membership
+4. for each active concept, get medoid embedding in same layer space
+5. compute cosine similarity:
+   - `strict_cosine = cos(z_row_task, z_medoid_task)`
+
+Result: strict score table with rows:
+
+- `ID`, `conf_id`, `task`, `task_idx`, `concept_id`, `strict_cosine`, `attn`
+
+### 9.1.2) How strict scores affect explanations
+
+`export_prediction_text_explanations(...)` now supports strict score input.
+
+For each candidate concept in ranking:
+
+- load row-level strict score if available
+- fallback to global `(task, concept)` strict mean
+- apply gain:
+  - `strict_gain = clip(1 + strict_weight * strict_score, 0.25, 2.50)`
+- multiply base concept rank score by `strict_gain`
+
+This changes concept order in explanations while preserving:
+
+- anti-leakage contract
+- concept IDs and semantic tags
+- TCAV/Ricci computations
+
+### 9.1.3) Strict-pass controls
+
+- `--chem_ace_strict_rerank` / `--no-chem_ace_strict_rerank` (default enabled)
+- `--chem_ace_strict_rerank_layer_name` (default `mixer_post_norm`)
+- `--chem_ace_strict_rerank_top_rows_per_task` (default `256`)
+- `--chem_ace_strict_rerank_batch_size` (default `256`)
+- `--chem_ace_strict_rerank_weight` (default `0.35`)
+
+### 9.1.4) Strict-pass artifacts
+
+Written in final run directory (`final_best_train_vs_leaderboard/`):
+
+- `chem_ace_strict_mixer_scores.csv`
+- `chem_ace_strict_mixer_concepts.csv`
+- `chem_ace_strict_mixer_summary.json`
+
+Also referenced in:
+
+- `final_best_train_vs_leaderboard/explainability_artifacts.json`
 
 ## 10) Concept Discovery (Current Defaults)
 
@@ -240,6 +361,22 @@ Optional algorithms still exist but are guarded for memory:
   - `hdbscan_max_samples=300000`
 
 Pipeline logs the effective concept-discovery configuration before clustering.
+
+Modality separation:
+
+- discovery runs independently for `2d`, `3d_geom`, `3d_qm`
+- concept IDs are namespaced by modality:
+  - `2d:<sha1>`
+  - `3d_geom:<sha1>`
+  - `3d_qm:<sha1>`
+- merged concept view is created only after per-modality clustering and deduplication
+- frozen-centroid inference is also executed per modality
+
+Additional artifacts written by runtime:
+
+- `concept_catalog.csv` (explicit modality per concept)
+- `memberships_train_inferred.csv`
+- `memberships_infer_scope.csv`
 
 ## 11) Semantic Tagging Pipeline
 
@@ -477,12 +614,23 @@ Patch/conformer controls:
 
 Embedding/storage controls:
 
-- `--chem_ace_max_2d_dim`
-- `--chem_ace_max_3dqm_dim`
+- `--chem_ace_embed_dim_2d`
+- `--chem_ace_embed_dim_3d_geom`
+- `--chem_ace_embed_dim_3d_qm`
+- `--chem_ace_context_dim`
+- `--chem_ace_context_alpha`
+- `--chem_ace_qm_gating` / `--no-chem_ace_qm_gating`
+- `--chem_ace_max_2d_dim` (deprecated compatibility flag, ignored by hybrid runtime)
+- `--chem_ace_max_3dqm_dim` (deprecated compatibility flag, ignored by hybrid runtime)
 - `--feat3d_raw` (optional, semantic summaries only)
 - `--feat3d_qm_raw` (optional, semantic summaries only)
 - `--chem_ace_persist_patch_embeddings` / `--no-chem_ace_persist_patch_embeddings`
 - `--cpu_workers`
+- `--chem_ace_strict_rerank` / `--no-chem_ace_strict_rerank`
+- `--chem_ace_strict_rerank_layer_name`
+- `--chem_ace_strict_rerank_top_rows_per_task`
+- `--chem_ace_strict_rerank_batch_size`
+- `--chem_ace_strict_rerank_weight`
 
 Concept/infer controls:
 
@@ -550,6 +698,12 @@ Primary Chem-ACE outputs in `chem_ace_output_dir` (default: `<study_dir>/chem_ac
 Potential embedding cache directory (only if embedding persistence enabled):
 
 - `chem_ace_cache/`
+
+Strict rerank outputs in final run directory:
+
+- `final_best_train_vs_leaderboard/chem_ace_strict_mixer_scores.csv`
+- `final_best_train_vs_leaderboard/chem_ace_strict_mixer_concepts.csv`
+- `final_best_train_vs_leaderboard/chem_ace_strict_mixer_summary.json`
 
 Final run summary output (`final_best_train_vs_leaderboard/explainability_artifacts.json`) includes pointers for:
 

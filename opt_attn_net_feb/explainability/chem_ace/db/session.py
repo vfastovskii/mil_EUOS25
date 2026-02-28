@@ -42,6 +42,36 @@ def initialize_database(engine: Engine) -> None:
         None
     """
     Base.metadata.create_all(engine)
+    _apply_compat_migrations(engine)
+
+
+def _apply_compat_migrations(engine: Engine) -> None:
+    """
+    Apply lightweight additive migrations for existing SQLite databases.
+
+    These migrations only add nullable columns and keep legacy DB files usable.
+    """
+    if str(engine.dialect.name).lower() != "sqlite":
+        return
+    planned = {
+        "concepts": {"modality": "TEXT"},
+        "concept_memberships": {"modality": "TEXT"},
+        "concept_tags": {"modality": "TEXT"},
+        "cavs": {"concept_modality": "TEXT"},
+        "tcav_epoch": {"concept_modality": "TEXT"},
+    }
+    with engine.begin() as conn:
+        for table_name, cols in planned.items():
+            existing = {
+                str(row[1])
+                for row in conn.exec_driver_sql(f"PRAGMA table_info({table_name})").fetchall()
+            }
+            for col_name, col_type in cols.items():
+                if str(col_name) in existing:
+                    continue
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"
+                )
 
 
 def make_session_factory(engine: Engine) -> sessionmaker[Session]:

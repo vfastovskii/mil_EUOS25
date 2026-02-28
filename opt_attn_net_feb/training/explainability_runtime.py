@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha1
 import json
 import logging
 import math
@@ -28,6 +29,7 @@ from ..explainability.chem_ace.config import (
     SemanticTaggingConfig,
 )
 from ..explainability.chem_ace.concepts.pipeline import ChemACEPipeline, MoleculeSource
+from ..explainability.chem_ace.concepts.clustering import DiscoveredConceptSet, discover_concepts
 from ..explainability.chem_ace.embedding.hooks import LayerActivationHook
 from ..explainability.chem_ace.optional_deps import OptionalDependencyError, require_rdkit
 from ..explainability.chem_ace.rules.rdkit_fragment_rules import (
@@ -78,6 +80,14 @@ class FinalExplainabilityConfig:
     # <= 0 enables dynamic cap by chem_ace_target_total_patches / n_molecules.
     chem_ace_patch_cap_per_mol: int = 0
     chem_ace_target_total_patches: int = 1200000
+    # Hybrid modality-specific embedding widths.
+    chem_ace_embed_dim_2d: int = 64
+    chem_ace_embed_dim_3d_geom: int = 64
+    chem_ace_embed_dim_3d_qm: int = 64
+    # Context branch settings for all modalities.
+    chem_ace_context_dim: int = 16
+    chem_ace_context_alpha: float = 0.2
+    chem_ace_qm_gating: bool = True
     # <=0 means use full available 2D feature dimension.
     chem_ace_max_2d_dim: int = 0
     # <=0 means use full available merged 3D+QM feature dimension.
@@ -120,6 +130,16 @@ class FinalExplainabilityConfig:
     chem_ace_orca_descriptor_cols: tuple[str, ...] = ()
     chem_ace_orca_min_vectors_for_tagging: int = 8
     chem_ace_orca_z_threshold: float = 0.50
+    # Optional conformer-level 3D pharmacophore signatures (pmapper) for attention analysis.
+    chem_ace_use_pmapper_signatures: bool = True
+    chem_ace_pmapper_tol: int = 0
+    chem_ace_pmapper_tol_alt: int = 5
+    # Strict post-discovery rerank in trained mixer activation space.
+    chem_ace_strict_rerank: bool = True
+    chem_ace_strict_rerank_layer_name: str = "mixer_post_norm"
+    chem_ace_strict_rerank_top_rows_per_task: int = 256
+    chem_ace_strict_rerank_batch_size: int = 256
+    chem_ace_strict_rerank_weight: float = 0.35
 
     lambda_vol_output_dir: Optional[str] = None
     lambda_vol_db_uri: Optional[str] = None
@@ -181,8 +201,13 @@ class ChemACEBundle:
     a_priori_vs_concepts_csv: Optional[str] = None
     a_priori_tags_infer_csv: Optional[str] = None
     a_priori_vs_concepts_infer_csv: Optional[str] = None
+    concept_catalog_csv: Optional[str] = None
+    memberships_train_inferred_csv: Optional[str] = None
+    memberships_infer_scope_csv: Optional[str] = None
     activity_calibrated_tags_csv: Optional[str] = None
     activity_calibration_summary_json: Optional[str] = None
+    conformer_signature_csv: Optional[str] = None
+    conformer_signature_summary_json: Optional[str] = None
 
 
 def _bitmask_ids_from_y(y: np.ndarray) -> np.ndarray:
@@ -690,7 +715,7 @@ class MILLambdaVolFrameProvider:
             layer_name=str(self.layer_name),
             n_tasks=int(len(self.task_ids)),
             n_concepts=int(len(self.concept_ids)),
-            concept_source="chem_ace_memberships_from_feature_fusion_2d3dqm",
+            concept_source="chem_ace_memberships_from_hybrid_modal_spaces",
         )
 
         adapter = _MILTaskAdapter(model=model, task_ids=self.task_ids)
@@ -984,16 +1009,27 @@ def _export_a_priori_and_concept_views(
             str(concept_metadata.get(cid, {}).get("label_auto") or cid)
             for cid in cids
         ]
+        modalities = [str(concept_metadata.get(cid, {}).get("modality", "2d")) for cid in cids]
         ctags: list[str] = []
         for cid in cids:
             tags = concept_metadata.get(cid, {}).get("tags", [])
             if isinstance(tags, (list, tuple)):
                 ctags.extend([str(t) for t in tags if str(t).strip()])
+        cids_2d = [cid for cid, m in zip(cids, modalities) if m == "2d"]
+        cids_3d_geom = [cid for cid, m in zip(cids, modalities) if m == "3d_geom"]
+        cids_3d_qm = [cid for cid, m in zip(cids, modalities) if m == "3d_qm"]
         concept_rows.append(
             {
                 **row,
                 "n_concepts": int(len(cids)),
+                "n_concepts_2d": int(len(cids_2d)),
+                "n_concepts_3d_geom": int(len(cids_3d_geom)),
+                "n_concepts_3d_qm": int(len(cids_3d_qm)),
                 "concept_ids": _semicolon_join(cids),
+                "concept_ids_2d": _semicolon_join(cids_2d),
+                "concept_ids_3d_geom": _semicolon_join(cids_3d_geom),
+                "concept_ids_3d_qm": _semicolon_join(cids_3d_qm),
+                "concept_modalities": _semicolon_join(modalities),
                 "concept_labels": _semicolon_join(labels),
                 "concept_tags": _semicolon_join(ctags),
             }
@@ -1182,14 +1218,11 @@ def prepare_chem_ace_bundle(
     )
     dim_2d_raw = int(X2d_file.shape[1]) if np.asarray(X2d_file).ndim == 2 else -1
     dim_inst_raw = int(Xinst_sorted.shape[1]) if np.asarray(Xinst_sorted).ndim == 2 else -1
-    dim_2d_used = _resolve_effective_feature_dim(
-        requested_dim=int(config.chem_ace_max_2d_dim),
-        raw_dim=int(dim_2d_raw),
-    )
-    dim_3dqm_used = _resolve_effective_feature_dim(
-        requested_dim=int(config.chem_ace_max_3dqm_dim),
-        raw_dim=int(dim_inst_raw),
-    )
+    embed_dim_2d = int(max(8, config.chem_ace_embed_dim_2d))
+    embed_dim_3d_geom = int(max(8, config.chem_ace_embed_dim_3d_geom))
+    embed_dim_3d_qm = int(max(8, config.chem_ace_embed_dim_3d_qm))
+    context_dim = int(max(4, config.chem_ace_context_dim))
+    context_alpha = float(np.clip(float(config.chem_ace_context_alpha), 0.0, 1.0))
     log_event(
         "INFO",
         "explainability.chem_ace.modalities",
@@ -1198,10 +1231,12 @@ def prepare_chem_ace_bundle(
         dim_3d_geom=(int(inst_geom_dim) if int(inst_geom_dim) > 0 else "unknown"),
         dim_3d_qm=(int(inst_qm_dim) if int(inst_qm_dim) > 0 else "unknown"),
         dim_3dqm_merged_raw=int(dim_inst_raw),
-        dim_2d_cfg=int(config.chem_ace_max_2d_dim),
-        dim_3dqm_cfg=int(config.chem_ace_max_3dqm_dim),
-        dim_2d_used=int(dim_2d_used),
-        dim_3dqm_used=int(dim_3dqm_used),
+        embed_dim_2d=int(embed_dim_2d),
+        embed_dim_3d_geom=int(embed_dim_3d_geom),
+        embed_dim_3d_qm=int(embed_dim_3d_qm),
+        context_dim=int(context_dim),
+        context_alpha=float(context_alpha),
+        qm_gating=bool(config.chem_ace_qm_gating),
         n_geom_descriptor_cols=int(len(inst_geom_cols)),
         n_qm_descriptor_cols=int(len(inst_qm_cols)),
     )
@@ -1283,6 +1318,14 @@ def prepare_chem_ace_bundle(
         min_vectors=int(config.chem_ace_orca_min_vectors_for_tagging),
         z_threshold=float(config.chem_ace_orca_z_threshold),
     )
+    log_event(
+        "INFO",
+        "explainability.chem_ace.pmapper.config",
+        enabled=bool(config.chem_ace_use_pmapper_signatures),
+        tol=int(config.chem_ace_pmapper_tol),
+        tol_alt=int(config.chem_ace_pmapper_tol_alt),
+        requires_sdf=bool(config.chem_ace_conformer_sdf is not None),
+    )
 
     ace_cfg = ChemACEConfig(
         run_name="chem_ace_final_pipeline",
@@ -1291,7 +1334,16 @@ def prepare_chem_ace_bundle(
         cpu_workers=max(0, int(config.cpu_workers)),
         max_patches_per_molecule=int(config.chem_ace_patch_cap_per_mol),
         target_total_patches=int(config.chem_ace_target_total_patches),
-        embedding=EmbeddingConfig(layer_name="feature_fusion_2d3dqm", strategy="masked_input"),
+        embedding=EmbeddingConfig(
+            layer_name="feature_hybrid_multimodal",
+            strategy="hybrid_local_context",
+            embed_dim_2d=int(embed_dim_2d),
+            embed_dim_3d_geom=int(embed_dim_3d_geom),
+            embed_dim_3d_qm=int(embed_dim_3d_qm),
+            context_dim=int(context_dim),
+            context_alpha=float(context_alpha),
+            qm_gating=bool(config.chem_ace_qm_gating),
+        ),
         discovery=ConceptDiscoveryConfig(),
         patch_generation=PatchGenerationConfig(
             local_subgraph=LocalSubgraphPatchConfig(radii=tuple(local_radii)),
@@ -1368,6 +1420,45 @@ def prepare_chem_ace_bundle(
         Xinst_sorted=Xinst_sorted,
         max_confs_per_id=int(config.chem_ace_max_confs_per_id),
     )
+    conformer_signature_csv: Optional[str] = None
+    conformer_signature_summary_json: Optional[str] = None
+    if bool(config.chem_ace_use_pmapper_signatures) and len(sdf_conformers_by_conf_id) > 0:
+        used_conf_ids = [
+            str(conf_id)
+            for conf_ids in conf_map.values()
+            for conf_id in conf_ids
+        ]
+        with log_step(
+            "explainability.chem_ace.pmapper_signatures",
+            n_conf_ids_requested=int(len(used_conf_ids)),
+            tol=int(config.chem_ace_pmapper_tol),
+            tol_alt=int(config.chem_ace_pmapper_tol_alt),
+        ):
+            sig_df, sig_summary = _build_pmapper_signature_table(
+                sdf_conformers_by_conf_id=sdf_conformers_by_conf_id,
+                used_conf_ids=used_conf_ids,
+                tol=int(config.chem_ace_pmapper_tol),
+                tol_alt=int(config.chem_ace_pmapper_tol_alt),
+                cpu_workers=max(0, int(config.cpu_workers)),
+            )
+        sig_summary_path = ace_out_dir / "conformer_pmapper_signatures_summary.json"
+        sig_summary_path.write_text(json.dumps(dict(sig_summary), indent=2, sort_keys=False))
+        conformer_signature_summary_json = str(sig_summary_path)
+        if not sig_df.empty:
+            sig_csv_path = ace_out_dir / "conformer_pmapper_signatures.csv"
+            sig_df.to_csv(sig_csv_path, index=False)
+            conformer_signature_csv = str(sig_csv_path)
+        log_event(
+            "INFO",
+            "explainability.chem_ace.pmapper_signatures_ready",
+            csv_path=conformer_signature_csv,
+            summary_path=conformer_signature_summary_json,
+            n_processed=int(sig_summary.get("n_processed", 0)),
+            n_unique_sig=int(sig_summary.get("n_unique_sig", 0)),
+            n_unique_sig_alt=int(sig_summary.get("n_unique_sig_alt", 0)),
+            available=bool(sig_summary.get("available", False)),
+            reason=sig_summary.get("reason", None),
+        )
 
     # Use raw (unscaled) 3D/QM vectors for semantic descriptor summaries when provided.
     inst_map_sem = inst_map
@@ -1528,8 +1619,10 @@ def prepare_chem_ace_bundle(
     progress_extras_discover = {
         "phase": "discover_train",
         "modalities": "2d+3d+3d_qm",
-        "dim_2d_used": int(dim_2d_used),
-        "dim_3dqm_used": int(dim_3dqm_used),
+        "embed_dim_2d": int(embed_dim_2d),
+        "embed_dim_3d_geom": int(embed_dim_3d_geom),
+        "embed_dim_3d_qm": int(embed_dim_3d_qm),
+        "context_dim": int(context_dim),
     }
     if int(inst_geom_dim) > 0:
         progress_extras_discover["dim_3d_geom"] = int(inst_geom_dim)
@@ -1559,31 +1652,48 @@ def prepare_chem_ace_bundle(
     )
 
     with log_step("explainability.chem_ace.embed_patches", phase="discover_train"):
-        embeddings_train, descriptor_scaler = _build_feature_patch_embeddings(
+        embeddings_train_by_modality, descriptor_scaler = _build_hybrid_patch_embeddings(
             pipeline=pipeline,
             patches=patches_train,
             molecules_by_id=molecules_by_id,
             x2d_by_id=x2d_by_id,
             xinst_by_pair=inst_map,
             xinst_mean_by_id=inst_mean_map,
-            max_2d_dim=int(dim_2d_used),
-            max_3dqm_dim=int(dim_3dqm_used),
+            inst_geom_dim=int(inst_geom_dim),
+            inst_qm_dim=int(inst_qm_dim),
+            embed_dim_2d=int(embed_dim_2d),
+            embed_dim_3d_geom=int(embed_dim_3d_geom),
+            embed_dim_3d_qm=int(embed_dim_3d_qm),
+            context_dim=int(context_dim),
+            context_alpha=float(context_alpha),
+            qm_gating=bool(config.chem_ace_qm_gating),
             fit_descriptor_scaler=True,
             descriptor_scaler=None,
             persist_embeddings=bool(config.chem_ace_persist_patch_embeddings),
             n_workers=max(0, int(config.cpu_workers)),
+            seed=int(seed),
         )
+    embeddings_train = [
+        rec
+        for modality in ("2d", "3d_geom", "3d_qm")
+        for rec in embeddings_train_by_modality.get(modality, [])
+    ]
     log_event(
         "INFO",
         "explainability.chem_ace.embeddings_ready",
         phase="discover_train",
         n_embeddings=int(len(embeddings_train)),
+        n_embeddings_2d=int(len(embeddings_train_by_modality.get("2d", ()))),
+        n_embeddings_3d_geom=int(len(embeddings_train_by_modality.get("3d_geom", ()))),
+        n_embeddings_3d_qm=int(len(embeddings_train_by_modality.get("3d_qm", ()))),
     )
 
     with log_step("explainability.chem_ace.discover_concepts", phase="discover_train"):
-        concept_set, concept_set_id = pipeline.discover_and_store_concepts(
+        concept_set, concept_set_id = _discover_and_store_concepts_by_modality(
+            pipeline=pipeline,
             run_id=run_id,
-            embeddings=embeddings_train,
+            embeddings_by_modality=embeddings_train_by_modality,
+            seed=int(seed),
         )
     with log_step("explainability.chem_ace.tag_concepts", phase="discover_train"):
         tagging = pipeline.tag_and_store_concepts(
@@ -1607,15 +1717,26 @@ def prepare_chem_ace_bundle(
     concept_mol_map_train_infer: dict[str, set[str]] = {}
     concept_conf_map_train_infer: dict[str, set[tuple[str, str]]] = {}
     n_inferred_memberships_train = 0
+    inferred_memberships_train_list: list[ConceptMembership] = []
     train_membership_source = "discover_cluster_memberships"
+    candidates_by_modality = _candidates_by_modality(candidates=concept_set.candidates)
 
     if len(embeddings_train) > 0 and len(concept_set.candidates) > 0:
         with log_step("explainability.chem_ace.infer_memberships", phase="discover_train"):
-            inferred_memberships_train = _infer_memberships_to_frozen_centroids(
-                embeddings=embeddings_train,
-                candidates=concept_set.candidates,
-                max_distance=float(config.chem_ace_infer_max_distance),
-            )
+            inferred_memberships_train: list[ConceptMembership] = []
+            for modality in ("2d", "3d_geom", "3d_qm"):
+                embs_mod = list(embeddings_train_by_modality.get(modality, ()))
+                cands_mod = list(candidates_by_modality.get(modality, ()))
+                if len(embs_mod) == 0 or len(cands_mod) == 0:
+                    continue
+                inferred_memberships_train.extend(
+                    _infer_memberships_to_frozen_centroids(
+                        embeddings=embs_mod,
+                        candidates=cands_mod,
+                        max_distance=float(config.chem_ace_infer_max_distance),
+                    )
+                )
+            inferred_memberships_train_list = list(inferred_memberships_train)
         n_inferred_memberships_train = int(len(inferred_memberships_train))
         concept_mol_map_train_infer, concept_conf_map_train_infer = _build_membership_maps_from_memberships(
             memberships=inferred_memberships_train,
@@ -1713,13 +1834,16 @@ def prepare_chem_ace_bundle(
     n_patches_infer = 0
     n_embeddings_infer = 0
     n_inferred_memberships_infer = 0
+    inferred_memberships_infer_list: list[ConceptMembership] = []
 
     if len(ids_infer) > 0 and len(concept_set.candidates) > 0:
         progress_extras_infer = {
             "phase": "infer_scope",
             "modalities": "2d+3d+3d_qm",
-            "dim_2d_used": int(dim_2d_used),
-            "dim_3dqm_used": int(dim_3dqm_used),
+            "embed_dim_2d": int(embed_dim_2d),
+            "embed_dim_3d_geom": int(embed_dim_3d_geom),
+            "embed_dim_3d_qm": int(embed_dim_3d_qm),
+            "context_dim": int(context_dim),
         }
         if int(inst_geom_dim) > 0:
             progress_extras_infer["dim_3d_geom"] = int(inst_geom_dim)
@@ -1749,34 +1873,58 @@ def prepare_chem_ace_bundle(
             )
 
             with log_step("explainability.chem_ace.embed_patches", phase="infer_scope"):
-                embeddings_infer, _ = _build_feature_patch_embeddings(
+                embeddings_infer_by_modality, _ = _build_hybrid_patch_embeddings(
                     pipeline=pipeline,
                     patches=patches_infer,
                     molecules_by_id=molecules_by_id,
                     x2d_by_id=x2d_by_id,
                     xinst_by_pair=inst_map,
                     xinst_mean_by_id=inst_mean_map,
-                    max_2d_dim=int(dim_2d_used),
-                    max_3dqm_dim=int(dim_3dqm_used),
+                    inst_geom_dim=int(inst_geom_dim),
+                    inst_qm_dim=int(inst_qm_dim),
+                    embed_dim_2d=int(embed_dim_2d),
+                    embed_dim_3d_geom=int(embed_dim_3d_geom),
+                    embed_dim_3d_qm=int(embed_dim_3d_qm),
+                    context_dim=int(context_dim),
+                    context_alpha=float(context_alpha),
+                    qm_gating=bool(config.chem_ace_qm_gating),
                     fit_descriptor_scaler=False,
                     descriptor_scaler=descriptor_scaler,
                     persist_embeddings=bool(config.chem_ace_persist_patch_embeddings),
                     n_workers=max(0, int(config.cpu_workers)),
+                    seed=int(seed),
                 )
+            embeddings_infer = [
+                rec
+                for modality in ("2d", "3d_geom", "3d_qm")
+                for rec in embeddings_infer_by_modality.get(modality, [])
+            ]
             n_embeddings_infer = int(len(embeddings_infer))
             log_event(
                 "INFO",
                 "explainability.chem_ace.embeddings_ready",
                 phase="infer_scope",
                 n_embeddings=int(n_embeddings_infer),
+                n_embeddings_2d=int(len(embeddings_infer_by_modality.get("2d", ()))),
+                n_embeddings_3d_geom=int(len(embeddings_infer_by_modality.get("3d_geom", ()))),
+                n_embeddings_3d_qm=int(len(embeddings_infer_by_modality.get("3d_qm", ()))),
             )
 
             with log_step("explainability.chem_ace.infer_memberships", phase="infer_scope"):
-                inferred_memberships = _infer_memberships_to_frozen_centroids(
-                    embeddings=embeddings_infer,
-                    candidates=concept_set.candidates,
-                    max_distance=float(config.chem_ace_infer_max_distance),
-                )
+                inferred_memberships: list[ConceptMembership] = []
+                for modality in ("2d", "3d_geom", "3d_qm"):
+                    embs_mod = list(embeddings_infer_by_modality.get(modality, ()))
+                    cands_mod = list(candidates_by_modality.get(modality, ()))
+                    if len(embs_mod) == 0 or len(cands_mod) == 0:
+                        continue
+                    inferred_memberships.extend(
+                        _infer_memberships_to_frozen_centroids(
+                            embeddings=embs_mod,
+                            candidates=cands_mod,
+                            max_distance=float(config.chem_ace_infer_max_distance),
+                        )
+                    )
+                inferred_memberships_infer_list = list(inferred_memberships)
             n_inferred_memberships_infer = int(len(inferred_memberships))
             if n_inferred_memberships_infer > 0 and hasattr(pipeline.repository, "upsert_memberships"):
                 with log_step(
@@ -1813,6 +1961,16 @@ def prepare_chem_ace_bundle(
     )
 
     support_map = {str(c.concept_local_id): int(c.support) for c in concept_set.candidates}
+    candidate_map: dict[str, ConceptCandidate] = {
+        str(c.concept_local_id): c for c in concept_set.candidates
+    }
+    patch_map_train: dict[str, PatchRecord] = {
+        str(p.patch_id): p for p in patches_train
+    }
+    concept_modality_map = {
+        str(c.concept_local_id): str(c.metadata.get("modality", "2d"))
+        for c in concept_set.candidates
+    }
 
     def _infer_modality(*, provenance: str, tag: str) -> str:
         p = str(provenance).strip().lower()
@@ -1864,6 +2022,13 @@ def prepare_chem_ace_bundle(
         cid = str(t.concept_id)
         modality_scores = {"2d": 0.0, "geometry": 0.0, "quantum": 0.0}
         tags_by_modality = {"2d": [], "geometry": [], "quantum": []}
+        concept_modality = str(concept_modality_map.get(cid, "2d"))
+        if concept_modality == "3d_geom":
+            modality_scores["geometry"] += 0.35
+        elif concept_modality == "3d_qm":
+            modality_scores["quantum"] += 0.35
+        else:
+            modality_scores["2d"] += 0.35
         tag_details: list[dict[str, Any]] = []
         for tag_obj in t.tags:
             tag_name = str(tag_obj.tag)
@@ -1964,6 +2129,7 @@ def prepare_chem_ace_bundle(
             "label_auto": str(t.label_auto),
             "tags": sorted(set(tags_all)),
             "tag_details": tag_details,
+            "concept_modality": concept_modality,
             "tags_by_modality": {
                 k: sorted(set([str(x) for x in vals if str(x).strip()]))
                 for k, vals in tags_by_modality.items()
@@ -1974,12 +2140,22 @@ def prepare_chem_ace_bundle(
 
     concept_metadata: dict[str, dict[str, Any]] = {}
     for cid, support in support_map.items():
+        cand = candidate_map.get(str(cid))
+        medoid_patch_id = "" if cand is None else str(cand.medoid_patch_id)
+        medoid_patch = patch_map_train.get(medoid_patch_id)
+        medoid_mol_id = "" if medoid_patch is None else str(medoid_patch.mol_id)
+        medoid_conf_id = (
+            ""
+            if (medoid_patch is None or medoid_patch.conf_id is None)
+            else str(medoid_patch.conf_id)
+        )
         mols_train = concept_mol_map_train.get(cid, set())
         confs_train = concept_conf_map_train.get(cid, set())
         mols_total = concept_mol_map.get(cid, set())
         confs_total = concept_conf_map.get(cid, set())
         concept_metadata[cid] = {
             "support": int(support),
+            "modality": str(concept_modality_map.get(cid, "2d")),
             "label_auto": tag_map.get(cid, {}).get("label_auto"),
             "tags": tag_map.get(cid, {}).get("tags", []),
             "tag_details": tag_map.get(cid, {}).get("tag_details", []),
@@ -1993,7 +2169,52 @@ def prepare_chem_ace_bundle(
             "n_conf_pairs_train": int(len(confs_train)),
             "n_molecules_total": int(len(mols_total)),
             "n_conf_pairs_total": int(len(confs_total)),
+            "medoid_patch_id": medoid_patch_id,
+            "medoid_mol_id": medoid_mol_id,
+            "medoid_conf_id": medoid_conf_id,
         }
+
+    concept_catalog_rows = []
+    for cid in sorted(concept_metadata.keys()):
+        md = concept_metadata.get(cid, {})
+        concept_catalog_rows.append(
+            {
+                "concept_id": str(cid),
+                "modality": str(md.get("modality", "2d")),
+                "label_auto": str(md.get("label_auto") or ""),
+                "support": int(md.get("support", 0)),
+                "dominant_modality": str(md.get("dominant_modality", "2d")),
+                "n_molecules_train": int(md.get("n_molecules_train", 0)),
+                "n_molecules_total": int(md.get("n_molecules_total", 0)),
+                "medoid_patch_id": str(md.get("medoid_patch_id", "")),
+                "medoid_mol_id": str(md.get("medoid_mol_id", "")),
+                "medoid_conf_id": str(md.get("medoid_conf_id", "")),
+                "tags": _semicolon_join(md.get("tags", [])),
+            }
+        )
+    concept_catalog_csv = ace_out_dir / "concept_catalog.csv"
+    pd.DataFrame(concept_catalog_rows).to_csv(concept_catalog_csv, index=False)
+
+    def _memberships_to_df(rows: Sequence[ConceptMembership], phase: str) -> pd.DataFrame:
+        out_rows: list[dict[str, Any]] = []
+        for m in rows:
+            cid = str(m.concept_local_id)
+            out_rows.append(
+                {
+                    "phase": str(phase),
+                    "concept_id": cid,
+                    "modality": str(concept_modality_map.get(cid, "2d")),
+                    "patch_id": str(m.patch_id),
+                    "membership_score": float(m.membership_score),
+                    "distance_to_centroid": float(m.distance_to_centroid),
+                }
+            )
+        return pd.DataFrame(out_rows)
+
+    memberships_train_csv = ace_out_dir / "memberships_train_inferred.csv"
+    _memberships_to_df(inferred_memberships_train_list, phase="discover_train").to_csv(memberships_train_csv, index=False)
+    memberships_infer_csv = ace_out_dir / "memberships_infer_scope.csv"
+    _memberships_to_df(inferred_memberships_infer_list, phase="infer_scope").to_csv(memberships_infer_csv, index=False)
 
     a_priori_paths = _export_a_priori_and_concept_views(
         out_dir=ace_out_dir,
@@ -2020,6 +2241,7 @@ def prepare_chem_ace_bundle(
         "concept_set_id": str(concept_set_id),
         "semantics_instance_source": str(semantics_instance_source),
         "train_membership_source": str(train_membership_source),
+        "embedding_mode": "hybrid_local_context_by_modality",
         "n_molecules_discover": int(len(molecules_train)),
         "n_molecules_infer": int(len(molecules_infer)),
         "n_patches_discover": int(len(patches_train)),
@@ -2032,13 +2254,21 @@ def prepare_chem_ace_bundle(
         "n_concepts_hit_train_inferred": int(len(concept_mol_map_train_infer)),
         "n_concepts_hit_infer_scope": int(len(concept_mol_map_infer)),
         "n_concepts": int(len(concept_set.candidates)),
+        "n_concepts_2d": int(sum(1 for cid in support_map if concept_modality_map.get(cid) == "2d")),
+        "n_concepts_3d_geom": int(sum(1 for cid in support_map if concept_modality_map.get(cid) == "3d_geom")),
+        "n_concepts_3d_qm": int(sum(1 for cid in support_map if concept_modality_map.get(cid) == "3d_qm")),
         "selected_concepts": ordered_concepts,
+        "concept_catalog_csv": str(concept_catalog_csv),
+        "memberships_train_inferred_csv": str(memberships_train_csv),
+        "memberships_infer_scope_csv": str(memberships_infer_csv),
         "a_priori_tags_csv": a_priori_paths.get("a_priori_tags_csv"),
         "a_priori_vs_concepts_csv": a_priori_paths.get("a_priori_vs_concepts_csv"),
         "a_priori_tags_infer_csv": a_priori_paths.get("a_priori_tags_infer_csv"),
         "a_priori_vs_concepts_infer_csv": a_priori_paths.get("a_priori_vs_concepts_infer_csv"),
         "activity_calibrated_tags_csv": activity_calibrated_tags_csv,
         "activity_calibration_summary_json": activity_calibration_summary_json,
+        "conformer_signature_csv": conformer_signature_csv,
+        "conformer_signature_summary_json": conformer_signature_summary_json,
     }
     (ace_out_dir / "chem_ace_pipeline_summary.json").write_text(json.dumps(summary, indent=2))
 
@@ -2090,8 +2320,13 @@ def prepare_chem_ace_bundle(
             if a_priori_paths.get("a_priori_vs_concepts_infer_csv") is None
             else str(a_priori_paths["a_priori_vs_concepts_infer_csv"])
         ),
+        concept_catalog_csv=str(concept_catalog_csv),
+        memberships_train_inferred_csv=str(memberships_train_csv),
+        memberships_infer_scope_csv=str(memberships_infer_csv),
         activity_calibrated_tags_csv=activity_calibrated_tags_csv,
         activity_calibration_summary_json=activity_calibration_summary_json,
+        conformer_signature_csv=conformer_signature_csv,
+        conformer_signature_summary_json=conformer_signature_summary_json,
     )
 
 
@@ -2313,6 +2548,119 @@ def _load_sdf_conformers_by_conf_id(
     return conf_to_mol, stats
 
 
+def _safe_pmapper_signature_md5(pharm: Any, tol: int) -> str:
+    """
+    Compute pmapper MD5 signature with tolerance handling.
+
+    For tol <= 0 we call the no-argument variant to preserve the default pmapper behavior.
+    """
+    if int(tol) <= 0:
+        return str(pharm.get_signature_md5())
+    return str(pharm.get_signature_md5(tol=int(tol)))
+
+
+def _build_pmapper_signature_table(
+    *,
+    sdf_conformers_by_conf_id: Mapping[str, Any],
+    used_conf_ids: Sequence[str],
+    tol: int,
+    tol_alt: int,
+    cpu_workers: int,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """
+    Build conformer-level pmapper signature table from preloaded SDF conformers.
+
+    Returns:
+      - DataFrame with one row per conformer (conf_id, signatures)
+      - summary dictionary with counts and availability flags
+    """
+    summary: dict[str, Any] = {
+        "enabled": True,
+        "available": False,
+        "tol": int(tol),
+        "tol_alt": int(tol_alt),
+        "n_requested": 0,
+        "n_processed": 0,
+        "n_failed": 0,
+        "n_unique_sig": 0,
+        "n_unique_sig_alt": 0,
+    }
+    try:
+        from pmapper.pharmacophore import Pharmacophore as PMPharmacophore
+    except Exception as exc:
+        summary["reason"] = f"pmapper_not_available: {exc}"
+        return pd.DataFrame(), summary
+
+    conf_ids = sorted({str(c) for c in used_conf_ids if str(c) in sdf_conformers_by_conf_id})
+    summary["n_requested"] = int(len(conf_ids))
+    if len(conf_ids) == 0:
+        summary["reason"] = "no_matching_conformer_ids"
+        summary["available"] = True
+        return pd.DataFrame(), summary
+
+    workers = int(max(1, cpu_workers))
+    progress_every = 10000
+
+    def _build_one(conf_id: str) -> Optional[dict[str, Any]]:
+        mol = sdf_conformers_by_conf_id.get(str(conf_id))
+        if mol is None:
+            return None
+        try:
+            p = PMPharmacophore(cached=True)
+            p.load_from_mol(mol)
+            sig = _safe_pmapper_signature_md5(p, int(tol))
+            sig_alt = _safe_pmapper_signature_md5(p, int(tol_alt))
+            return {
+                "conf_id": str(conf_id),
+                "pmapper_sig_md5": str(sig),
+                "pmapper_sig_md5_alt": str(sig_alt),
+                "pmapper_tol": int(tol),
+                "pmapper_tol_alt": int(tol_alt),
+            }
+        except Exception:
+            return None
+
+    rows: list[dict[str, Any]] = []
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for i, rec in enumerate(ex.map(_build_one, conf_ids), start=1):
+                if rec is not None:
+                    rows.append(rec)
+                else:
+                    summary["n_failed"] = int(summary["n_failed"]) + 1
+                if i == len(conf_ids) or (progress_every > 0 and (i % progress_every == 0)):
+                    log_event(
+                        "PROGRESS",
+                        "explainability.chem_ace.pmapper_signatures.compute",
+                        done=f"{int(i)}/{int(len(conf_ids))}",
+                        pct=f"{(100.0 * i / float(max(1, len(conf_ids)))):.1f}",
+                        cpu_workers=int(workers),
+                    )
+    else:
+        for i, cid in enumerate(conf_ids, start=1):
+            rec = _build_one(cid)
+            if rec is not None:
+                rows.append(rec)
+            else:
+                summary["n_failed"] = int(summary["n_failed"]) + 1
+            if i == len(conf_ids) or (progress_every > 0 and (i % progress_every == 0)):
+                log_event(
+                    "PROGRESS",
+                    "explainability.chem_ace.pmapper_signatures.compute",
+                    done=f"{int(i)}/{int(len(conf_ids))}",
+                    pct=f"{(100.0 * i / float(max(1, len(conf_ids)))):.1f}",
+                    cpu_workers=int(workers),
+                )
+
+    df = pd.DataFrame(rows)
+    summary["available"] = True
+    summary["n_processed"] = int(len(df))
+    if not df.empty:
+        summary["n_unique_sig"] = int(df["pmapper_sig_md5"].astype(str).nunique())
+        summary["n_unique_sig_alt"] = int(df["pmapper_sig_md5_alt"].astype(str).nunique())
+    return df, summary
+
+
 def _merge_sdf_conformers_for_molecule(
     *,
     conf_ids: Sequence[str],
@@ -2355,7 +2703,219 @@ def _merge_sdf_conformers_for_molecule(
     return base_mol, kept_conf_ids, dropped_incompatible
 
 
-def _build_feature_patch_embeddings(
+def _l2_normalize_1d(vec: np.ndarray) -> np.ndarray:
+    v = np.asarray(vec, dtype=np.float32).reshape(-1)
+    nrm = float(np.linalg.norm(v))
+    if not np.isfinite(nrm) or nrm <= 1e-12:
+        return np.zeros_like(v, dtype=np.float32)
+    return (v / nrm).astype(np.float32)
+
+
+def _layer_norm_1d(vec: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    v = np.asarray(vec, dtype=np.float32).reshape(-1)
+    mu = float(np.mean(v))
+    var = float(np.var(v))
+    inv = 1.0 / math.sqrt(max(eps, var + eps))
+    return ((v - mu) * inv).astype(np.float32)
+
+
+def _seed_from_key(*, seed: int, key: str) -> int:
+    digest = sha1(f"{int(seed)}|{str(key)}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="little", signed=False)
+
+
+def _random_mlp_project(
+    *,
+    vec: np.ndarray,
+    out_dim: int,
+    seed: int,
+    key: str,
+    cache: dict[tuple[str, int, int], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+) -> np.ndarray:
+    x = np.asarray(vec, dtype=np.float32).reshape(-1)
+    d_in = int(max(1, x.shape[0]))
+    d_out = int(max(1, out_dim))
+    ckey = (str(key), d_in, d_out)
+    params = cache.get(ckey)
+    if params is None:
+        hidden = int(max(16, min(256, d_out * 2)))
+        rng = np.random.default_rng(_seed_from_key(seed=seed, key=f"{key}:{d_in}->{d_out}"))
+        w1 = rng.normal(0.0, 1.0 / math.sqrt(float(max(1, d_in))), size=(hidden, d_in)).astype(np.float32)
+        b1 = rng.normal(0.0, 0.01, size=(hidden,)).astype(np.float32)
+        w2 = rng.normal(0.0, 1.0 / math.sqrt(float(max(1, hidden))), size=(d_out, hidden)).astype(np.float32)
+        b2 = rng.normal(0.0, 0.01, size=(d_out,)).astype(np.float32)
+        params = (w1, b1, w2, b2)
+        cache[ckey] = params
+    w1, b1, w2, b2 = params
+    h = np.tanh(np.matmul(w1, x) + b1)
+    y = np.matmul(w2, h) + b2
+    return np.asarray(y, dtype=np.float32)
+
+
+def _slice_geom_qm(
+    *,
+    inst_vec: np.ndarray | None,
+    inst_geom_dim: int,
+    inst_qm_dim: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if inst_vec is None:
+        return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+    v = np.asarray(inst_vec, dtype=np.float32).reshape(-1)
+    gdim = int(max(0, inst_geom_dim))
+    qdim = int(max(0, inst_qm_dim))
+    if gdim <= 0 and qdim <= 0:
+        return v, np.zeros((0,), dtype=np.float32)
+    geom = v[:gdim] if gdim > 0 else np.zeros((0,), dtype=np.float32)
+    qm = v[gdim : gdim + qdim] if qdim > 0 else np.zeros((0,), dtype=np.float32)
+    return np.asarray(geom, dtype=np.float32), np.asarray(qm, dtype=np.float32)
+
+
+def _patch_subgraph_sketch(
+    *,
+    mol: Any | None,
+    atom_indices: Sequence[int],
+    n_bins: int = 32,
+) -> np.ndarray:
+    bins = np.zeros((int(max(8, n_bins)),), dtype=np.float32)
+    if mol is None:
+        return bins
+    atom_ids = [int(i) for i in atom_indices if 0 <= int(i) < int(mol.GetNumAtoms())]
+    if len(atom_ids) == 0:
+        return bins
+    atom_set = set(atom_ids)
+    for i in atom_ids:
+        a = mol.GetAtomWithIdx(int(i))
+        key = f"a|{int(a.GetAtomicNum())}|{int(a.GetIsAromatic())}|{int(a.GetDegree())}"
+        idx = _seed_from_key(seed=0, key=key) % bins.shape[0]
+        bins[idx] += 1.0
+    for b in mol.GetBonds():
+        bi = int(b.GetBeginAtomIdx())
+        bj = int(b.GetEndAtomIdx())
+        if bi not in atom_set or bj not in atom_set:
+            continue
+        key = f"b|{int(b.GetBondTypeAsDouble())}|{int(b.GetIsConjugated())}|{int(b.IsInRing())}"
+        idx = _seed_from_key(seed=1, key=key) % bins.shape[0]
+        bins[idx] += 1.0
+    return _l2_normalize_1d(bins)
+
+
+def _resolve_conformer_for_patch(*, mol: Any | None, conf_id: str | None) -> Any | None:
+    if mol is None or conf_id is None:
+        return None
+    if mol.GetNumConformers() <= 0:
+        return None
+    conf_map_raw = str(mol.GetProp("_chemace_conf_id_map")) if mol.HasProp("_chemace_conf_id_map") else ""
+    conf_idx = 0
+    if conf_map_raw:
+        try:
+            conf_map = json.loads(conf_map_raw)
+            conf_idx = int(conf_map.get(str(conf_id), 0))
+        except Exception:
+            conf_idx = 0
+    try:
+        return mol.GetConformer(int(conf_idx))
+    except Exception:
+        return None
+
+
+def _patch_geom_features(
+    *,
+    mol: Any | None,
+    atom_indices: Sequence[int],
+    conf_id: str | None,
+) -> np.ndarray:
+    out = np.zeros((16,), dtype=np.float32)
+    if mol is None:
+        return out
+    atom_ids = [int(i) for i in atom_indices if 0 <= int(i) < int(mol.GetNumAtoms())]
+    if len(atom_ids) == 0:
+        return out
+    conf = _resolve_conformer_for_patch(mol=mol, conf_id=conf_id)
+    if conf is None:
+        out[0] = float(len(atom_ids))
+        out[1] = float(sum(int(mol.GetAtomWithIdx(i).GetIsAromatic()) for i in atom_ids))
+        return out
+
+    xyz = np.asarray(
+        [[float(conf.GetAtomPosition(i).x), float(conf.GetAtomPosition(i).y), float(conf.GetAtomPosition(i).z)] for i in atom_ids],
+        dtype=np.float32,
+    )
+    n = int(xyz.shape[0])
+    ctr = np.mean(xyz, axis=0)
+    centered = xyz - ctr.reshape(1, 3)
+    rad = np.linalg.norm(centered, axis=1)
+
+    out[0] = float(n)
+    out[1] = float(np.mean(rad))
+    out[2] = float(np.std(rad))
+    out[3] = float(np.max(rad))
+    out[4] = float(np.linalg.norm(ctr))
+    if n >= 2:
+        dmat = np.linalg.norm(xyz[:, None, :] - xyz[None, :, :], axis=2)
+        tri = dmat[np.triu_indices(n, k=1)]
+        out[5] = float(np.mean(tri))
+        out[6] = float(np.std(tri))
+        out[7] = float(np.min(tri))
+        out[8] = float(np.max(tri))
+    if n >= 3:
+        try:
+            _u, s, vh = np.linalg.svd(centered, full_matrices=False)
+            normal = vh[-1]
+            planarity = np.abs(np.matmul(centered, normal))
+            out[9] = float(np.sqrt(np.mean(np.square(planarity))))
+            out[10] = float(s[0] / max(1e-6, np.sum(s)))
+            out[11] = float(s[1] / max(1e-6, np.sum(s)))
+            out[12] = float(s[2] / max(1e-6, np.sum(s)))
+        except Exception:
+            pass
+    aromatic = float(sum(1 for i in atom_ids if mol.GetAtomWithIdx(i).GetIsAromatic()))
+    out[13] = float(aromatic / float(max(1, n)))
+    out[14] = float(sum(1 for i in atom_ids if mol.GetAtomWithIdx(i).GetAtomicNum() not in {1, 6}) / float(max(1, n)))
+    out[15] = float(np.linalg.norm(np.mean(centered, axis=0)))
+    return out
+
+
+def _qm_signature_features(*, qm_vec: np.ndarray, out_dim: int = 16) -> np.ndarray:
+    q = np.asarray(qm_vec, dtype=np.float32).reshape(-1)
+    if q.shape[0] == 0:
+        return np.zeros((int(max(8, out_dim)),), dtype=np.float32)
+    stats = np.asarray(
+        [
+            float(np.mean(q)),
+            float(np.std(q)),
+            float(np.min(q)),
+            float(np.max(q)),
+            float(np.mean(np.abs(q))),
+            float(np.linalg.norm(q)),
+            float(np.mean(q > 0.0)),
+            float(np.mean(q < 0.0)),
+        ],
+        dtype=np.float32,
+    )
+    proj = _l2_normalize_1d(_take_or_pad(q, int(max(8, out_dim))))
+    return np.concatenate([stats, proj], axis=0).astype(np.float32)
+
+
+def _choose_patch_modality(
+    *,
+    patch: PatchRecord,
+    qm_vec: np.ndarray,
+    qm_gating: bool,
+) -> str:
+    if patch.conf_id is None:
+        return "2d"
+    q = np.asarray(qm_vec, dtype=np.float32).reshape(-1)
+    if q.shape[0] == 0:
+        return "3d_geom"
+    finite = np.isfinite(q)
+    if not bool(np.any(finite)):
+        return "3d_geom"
+    if bool(qm_gating) and float(np.linalg.norm(q[finite])) <= 1e-10:
+        return "3d_geom"
+    return "3d_qm"
+
+
+def _build_hybrid_patch_embeddings(
     *,
     pipeline: ChemACEPipeline,
     patches: Sequence[PatchRecord],
@@ -2363,19 +2923,37 @@ def _build_feature_patch_embeddings(
     x2d_by_id: Mapping[str, np.ndarray],
     xinst_by_pair: Mapping[tuple[str, str], np.ndarray],
     xinst_mean_by_id: Mapping[str, np.ndarray],
-    max_2d_dim: int,
-    max_3dqm_dim: int,
+    inst_geom_dim: int,
+    inst_qm_dim: int,
+    embed_dim_2d: int,
+    embed_dim_3d_geom: int,
+    embed_dim_3d_qm: int,
+    context_dim: int,
+    context_alpha: float,
+    qm_gating: bool,
     fit_descriptor_scaler: bool = False,
     descriptor_scaler: Any | None = None,
     persist_embeddings: bool = False,
     n_workers: int = 0,
-) -> tuple[list[PatchEmbeddingRecord], Any | None]:
-    emb_recs: list[PatchEmbeddingRecord] = []
+    seed: int = 0,
+) -> tuple[dict[str, list[PatchEmbeddingRecord]], Any | None]:
+    emb_by_modality: dict[str, list[PatchEmbeddingRecord]] = {
+        "2d": [],
+        "3d_geom": [],
+        "3d_qm": [],
+    }
+    all_embeddings: list[PatchEmbeddingRecord] = []
 
     workers = max(0, int(n_workers))
     total_patches = int(len(patches))
     progress_every = 200000
-
+    alpha = float(np.clip(float(context_alpha), 0.0, 1.0))
+    embed_dims = {
+        "2d": int(max(8, embed_dim_2d)),
+        "3d_geom": int(max(8, embed_dim_3d_geom)),
+        "3d_qm": int(max(8, embed_dim_3d_qm)),
+    }
+    ctx_dim = int(max(4, context_dim))
     scaler_obj = descriptor_scaler
     if bool(fit_descriptor_scaler) and scaler_obj is None:
         scaler_obj = _fit_patch_descriptor_robust_scaler(
@@ -2385,38 +2963,125 @@ def _build_feature_patch_embeddings(
             max_fit_samples=200000,
         )
 
-    def _compute_patch_vec(patch: PatchRecord) -> tuple[PatchRecord, np.ndarray, dict[str, int]] | None:
+    mlp_cache: dict[tuple[str, int, int], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+
+    def _compute_patch_vec(patch: PatchRecord) -> tuple[str, PatchRecord, np.ndarray, dict[str, Any]] | None:
         mol_id = str(patch.mol_id)
         x2d = x2d_by_id.get(mol_id)
         if x2d is None:
             return None
-
-        x3d = None
+        xinst = None
         if patch.conf_id is not None:
-            x3d = xinst_by_pair.get((mol_id, str(patch.conf_id)))
-        if x3d is None:
-            x3d = xinst_mean_by_id.get(mol_id)
-        if x3d is None:
-            x3d = np.zeros((max(1, int(max_3dqm_dim)),), dtype=np.float32)
+            xinst = xinst_by_pair.get((mol_id, str(patch.conf_id)))
+        if xinst is None:
+            xinst = xinst_mean_by_id.get(mol_id)
+        geom_ctx, qm_ctx = _slice_geom_qm(
+            inst_vec=(None if xinst is None else np.asarray(xinst, dtype=np.float32)),
+            inst_geom_dim=int(inst_geom_dim),
+            inst_qm_dim=int(inst_qm_dim),
+        )
+        modality = _choose_patch_modality(
+            patch=patch,
+            qm_vec=qm_ctx,
+            qm_gating=bool(qm_gating),
+        )
 
         mol = molecules_by_id.get(mol_id)
         desc_raw = _patch_descriptors(mol=mol, atom_indices=patch.atom_indices, patch_type=patch.patch_type)
         desc = _transform_patch_descriptors(desc_raw=desc_raw, scaler_obj=scaler_obj)
 
-        v2d = _take_or_pad(np.asarray(x2d, dtype=np.float32), int(max_2d_dim))
-        v3d = _take_or_pad(np.asarray(x3d, dtype=np.float32), int(max_3dqm_dim))
-        vec = np.concatenate([v2d, v3d, desc], axis=0).astype(np.float32)
+        if modality == "2d":
+            local = np.concatenate(
+                [
+                    _patch_subgraph_sketch(mol=mol, atom_indices=patch.atom_indices, n_bins=32),
+                    desc,
+                ],
+                axis=0,
+            ).astype(np.float32)
+            ctx_raw = np.asarray(x2d, dtype=np.float32).reshape(-1)
+        elif modality == "3d_geom":
+            geom_local = _patch_geom_features(mol=mol, atom_indices=patch.atom_indices, conf_id=patch.conf_id)
+            local = np.concatenate([geom_local, desc], axis=0).astype(np.float32)
+            ctx_raw = np.asarray(geom_ctx, dtype=np.float32).reshape(-1)
+            if ctx_raw.shape[0] == 0:
+                ctx_raw = np.zeros((1,), dtype=np.float32)
+        else:
+            geom_local = _patch_geom_features(mol=mol, atom_indices=patch.atom_indices, conf_id=patch.conf_id)
+            qm_sig = _qm_signature_features(qm_vec=qm_ctx, out_dim=16)
+            gate = 1.0
+            if bool(qm_gating):
+                patch_scale = float(np.clip(geom_local[0] / 16.0, 0.0, 1.0))
+                spread_scale = float(np.clip(geom_local[1] / 3.0, 0.0, 1.0))
+                gate = float(0.25 + 0.75 * max(patch_scale, spread_scale))
+            local = np.concatenate([qm_sig * gate, geom_local[:8], desc], axis=0).astype(np.float32)
+            ctx_raw = np.asarray(qm_ctx, dtype=np.float32).reshape(-1)
+            if ctx_raw.shape[0] == 0:
+                ctx_raw = np.zeros((1,), dtype=np.float32)
+
+        d_embed = int(embed_dims[modality])
+        z_local = _random_mlp_project(
+            vec=local,
+            out_dim=d_embed,
+            seed=int(seed),
+            key=f"{modality}:local",
+            cache=mlp_cache,
+        )
+        ctx_small = _random_mlp_project(
+            vec=ctx_raw,
+            out_dim=ctx_dim,
+            seed=int(seed),
+            key=f"{modality}:ctx_small",
+            cache=mlp_cache,
+        )
+        z_ctx = _random_mlp_project(
+            vec=ctx_small,
+            out_dim=d_embed,
+            seed=int(seed),
+            key=f"{modality}:ctx",
+            cache=mlp_cache,
+        )
+        vec = _l2_normalize_1d(_layer_norm_1d(z_local + float(alpha) * z_ctx))
         md = {
-            "d2": int(v2d.shape[0]),
-            "d3qm": int(v3d.shape[0]),
-            "ddesc": int(desc.shape[0]),
+            "strategy": "hybrid_local_context",
+            "modality": str(modality),
+            "embed_dim": int(d_embed),
+            "local_dim": int(local.shape[0]),
+            "context_raw_dim": int(ctx_raw.shape[0]),
+            "context_dim": int(ctx_dim),
+            "context_alpha": float(alpha),
+            "qm_gating": bool(qm_gating),
         }
-        return patch, vec, md
+        return str(modality), patch, vec.astype(np.float32), md
+
+    def _consume(item: tuple[str, PatchRecord, np.ndarray, dict[str, Any]] | None) -> None:
+        if item is None:
+            return
+        modality, patch, vec, md = item
+        layer_name = f"feature_{modality}_hybrid"
+        if bool(persist_embeddings):
+            rec = pipeline.embedding_cache.save(
+                patch=patch,
+                layer_name=layer_name,
+                strategy="hybrid_local_context",
+                vector=vec,
+                metadata=md,
+            )
+        else:
+            rec = PatchEmbeddingRecord(
+                patch_id=str(patch.patch_id),
+                layer_name=layer_name,
+                strategy="hybrid_local_context",
+                vector=np.asarray(vec, dtype=np.float32),
+                embedding_uri=None,
+                metadata=dict(md),
+            )
+        emb_by_modality[str(modality)].append(rec)
+        all_embeddings.append(rec)
 
     if workers > 1:
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            computed_iter = ex.map(_compute_patch_vec, patches)
-            for i, item in enumerate(computed_iter, start=1):
+            for i, item in enumerate(ex.map(_compute_patch_vec, patches), start=1):
+                _consume(item)
                 if i == total_patches or (progress_every > 0 and (i % progress_every == 0)):
                     log_event(
                         "PROGRESS",
@@ -2425,36 +3090,9 @@ def _build_feature_patch_embeddings(
                         pct=f"{(100.0 * i / float(max(1, total_patches))):.1f}",
                         cpu_workers=int(workers),
                     )
-                if item is None:
-                    continue
-                patch, vec, md = item
-                rec_md = {
-                    "strategy": "feature_projection",
-                    "d2": int(md["d2"]),
-                    "d3qm": int(md["d3qm"]),
-                    "ddesc": int(md["ddesc"]),
-                }
-                if bool(persist_embeddings):
-                    rec = pipeline.embedding_cache.save(
-                        patch=patch,
-                        layer_name="feature_fusion_2d3dqm",
-                        strategy="feature_projection",
-                        vector=vec,
-                        metadata=rec_md,
-                    )
-                else:
-                    rec = PatchEmbeddingRecord(
-                        patch_id=str(patch.patch_id),
-                        layer_name="feature_fusion_2d3dqm",
-                        strategy="feature_projection",
-                        vector=np.asarray(vec, dtype=np.float32),
-                        embedding_uri=None,
-                        metadata=rec_md,
-                    )
-                emb_recs.append(rec)
     else:
         for i, patch in enumerate(patches, start=1):
-            item = _compute_patch_vec(patch)
+            _consume(_compute_patch_vec(patch))
             if i == total_patches or (progress_every > 0 and (i % progress_every == 0)):
                 log_event(
                     "PROGRESS",
@@ -2463,61 +3101,41 @@ def _build_feature_patch_embeddings(
                     pct=f"{(100.0 * i / float(max(1, total_patches))):.1f}",
                     cpu_workers=int(workers),
                 )
-            if item is None:
-                continue
-            patch_rec, vec, md = item
-            rec_md = {
-                "strategy": "feature_projection",
-                "d2": int(md["d2"]),
-                "d3qm": int(md["d3qm"]),
-                "ddesc": int(md["ddesc"]),
-            }
-            if bool(persist_embeddings):
-                rec = pipeline.embedding_cache.save(
-                    patch=patch_rec,
-                    layer_name="feature_fusion_2d3dqm",
-                    strategy="feature_projection",
-                    vector=vec,
-                    metadata=rec_md,
-                )
-            else:
-                rec = PatchEmbeddingRecord(
-                    patch_id=str(patch_rec.patch_id),
-                    layer_name="feature_fusion_2d3dqm",
-                    strategy="feature_projection",
-                    vector=np.asarray(vec, dtype=np.float32),
-                    embedding_uri=None,
-                    metadata=rec_md,
-                )
-            emb_recs.append(rec)
 
     if bool(persist_embeddings):
         log_event(
             "START",
             "explainability.chem_ace.persist_patch_embeddings",
-            n_embeddings=int(len(emb_recs)),
+            n_embeddings=int(len(all_embeddings)),
         )
         if hasattr(pipeline.repository, "upsert_patch_embeddings"):
-            pipeline.repository.upsert_patch_embeddings(emb_recs)
+            pipeline.repository.upsert_patch_embeddings(all_embeddings)
         else:
-            for rec in emb_recs:
+            for rec in all_embeddings:
                 pipeline.repository.upsert_patch_embedding(rec)
         log_event(
             "DONE",
             "explainability.chem_ace.persist_patch_embeddings",
-            n_embeddings=int(len(emb_recs)),
+            n_embeddings=int(len(all_embeddings)),
         )
     else:
         log_event(
             "INFO",
             "explainability.chem_ace.persist_patch_embeddings.skipped",
             reason="disabled",
-            n_embeddings=int(len(emb_recs)),
+            n_embeddings=int(len(all_embeddings)),
         )
-
-    if not emb_recs:
-        raise RuntimeError("Chem-ACE feature projection produced zero patch embeddings")
-    return emb_recs, scaler_obj
+    log_event(
+        "INFO",
+        "explainability.chem_ace.embed_patches.modalities",
+        n_embeddings=int(len(all_embeddings)),
+        n_2d=int(len(emb_by_modality["2d"])),
+        n_3d_geom=int(len(emb_by_modality["3d_geom"])),
+        n_3d_qm=int(len(emb_by_modality["3d_qm"])),
+    )
+    if not all_embeddings:
+        raise RuntimeError("Chem-ACE hybrid embedding produced zero patch embeddings")
+    return emb_by_modality, scaler_obj
 
 
 
@@ -2686,6 +3304,137 @@ def _resolve_effective_feature_dim(*, requested_dim: int, raw_dim: int) -> int:
     if raw > 0:
         return raw
     return 1
+
+
+def _namespace_concept_id(*, modality: str, concept_local_id: str) -> str:
+    return f"{str(modality)}:{str(concept_local_id)}"
+
+
+def _discover_and_store_concepts_by_modality(
+    *,
+    pipeline: ChemACEPipeline,
+    run_id: str,
+    embeddings_by_modality: Mapping[str, Sequence[PatchEmbeddingRecord]],
+    seed: int,
+) -> tuple[DiscoveredConceptSet, str]:
+    merged_candidates: list[ConceptCandidate] = []
+    merged_memberships: list[ConceptMembership] = []
+    meta: dict[str, Any] = {
+        "modality_stats": {},
+        "discovery_mode": "hybrid_local_context_by_modality",
+    }
+
+    for modality in ("2d", "3d_geom", "3d_qm"):
+        emb = list(embeddings_by_modality.get(modality, ()))
+        if len(emb) == 0:
+            continue
+        algo_keys = tuple(str(x).lower() for x in pipeline.config.discovery.algorithms)
+        payload: dict[str, Any] = {
+            "phase": "discover_train",
+            "modality": str(modality),
+            "n_embeddings": int(len(emb)),
+            "algorithms": ",".join(str(x) for x in pipeline.config.discovery.algorithms),
+            "kmeans_k": int(pipeline.config.discovery.kmeans_k),
+        }
+        if "hierarchical" in algo_keys:
+            payload["hierarchical_max_samples"] = int(pipeline.config.discovery.hierarchical_max_samples)
+            payload["hierarchical_max_pairwise_gb"] = float(pipeline.config.discovery.hierarchical_max_pairwise_gb)
+        if "hdbscan" in algo_keys:
+            payload["hdbscan_max_samples"] = int(pipeline.config.discovery.hdbscan_max_samples)
+        log_event("INFO", "explainability.chem_ace.discover_concepts.config", **payload)
+        result = discover_concepts(
+            embeddings=emb,
+            config=pipeline.config.discovery,
+            seed=int(seed),
+        )
+        id_map: dict[str, str] = {}
+        for cand in result.candidates:
+            old_id = str(cand.concept_local_id)
+            new_id = _namespace_concept_id(modality=modality, concept_local_id=old_id)
+            id_map[old_id] = new_id
+            cand_meta = dict(cand.metadata)
+            cand_meta["modality"] = str(modality)
+            cand_meta["base_concept_local_id"] = old_id
+            merged_candidates.append(
+                ConceptCandidate(
+                    concept_local_id=str(new_id),
+                    layer_name=f"feature_{modality}_hybrid",
+                    algorithm=str(cand.algorithm),
+                    support=int(cand.support),
+                    coherence=float(cand.coherence),
+                    centroid=np.asarray(cand.centroid, dtype=np.float32),
+                    medoid_patch_id=str(cand.medoid_patch_id),
+                    modality=str(modality),
+                    metadata=cand_meta,
+                )
+            )
+        for mem in result.memberships:
+            old_id = str(mem.concept_local_id)
+            new_id = id_map.get(old_id)
+            if new_id is None:
+                continue
+            merged_memberships.append(
+                ConceptMembership(
+                    concept_local_id=str(new_id),
+                    patch_id=str(mem.patch_id),
+                    membership_score=float(mem.membership_score),
+                    distance_to_centroid=float(mem.distance_to_centroid),
+                    modality=str(modality),
+                )
+            )
+        meta["modality_stats"][str(modality)] = {
+            "n_embeddings": int(len(emb)),
+            "n_candidates": int(len(result.candidates)),
+            "n_memberships": int(len(result.memberships)),
+            "n_candidates_after_namespace": int(sum(1 for c in merged_candidates if c.metadata.get("modality") == modality)),
+        }
+
+    if len(merged_candidates) == 0:
+        raise RuntimeError("Chem-ACE concept discovery produced zero concepts across all modalities")
+
+    concept_set = DiscoveredConceptSet(
+        layer_name="feature_hybrid_multimodal",
+        candidates=merged_candidates,
+        memberships=merged_memberships,
+        metadata=meta,
+    )
+    concept_set_id = pipeline.repository.create_concept_set_snapshot(
+        run_id=run_id,
+        layer_name=concept_set.layer_name,
+        config={
+            "discovery": asdict(pipeline.config.discovery),
+            "embedding": asdict(pipeline.config.embedding),
+            "mode": "hybrid_local_context_by_modality",
+        },
+        metadata=dict(concept_set.metadata),
+    )
+    pipeline.repository.upsert_concepts(concept_set_id=concept_set_id, candidates=concept_set.candidates)
+    pipeline.repository.upsert_memberships(concept_set.memberships)
+    pipeline.repository.set_run_concept_set(run_id=run_id, concept_set_id=concept_set_id)
+
+    log_event(
+        "INFO",
+        "explainability.chem_ace.discover_concepts.modalities",
+        n_candidates=int(len(concept_set.candidates)),
+        n_memberships=int(len(concept_set.memberships)),
+        n_2d=int(sum(1 for c in concept_set.candidates if str(c.metadata.get("modality")) == "2d")),
+        n_3d_geom=int(sum(1 for c in concept_set.candidates if str(c.metadata.get("modality")) == "3d_geom")),
+        n_3d_qm=int(sum(1 for c in concept_set.candidates if str(c.metadata.get("modality")) == "3d_qm")),
+    )
+    return concept_set, str(concept_set_id)
+
+
+def _candidates_by_modality(
+    *,
+    candidates: Sequence[ConceptCandidate],
+) -> dict[str, list[ConceptCandidate]]:
+    out: dict[str, list[ConceptCandidate]] = {"2d": [], "3d_geom": [], "3d_qm": []}
+    for cand in candidates:
+        modality = str(cand.metadata.get("modality", "2d"))
+        if modality not in out:
+            out[modality] = []
+        out[modality].append(cand)
+    return out
 
 
 def _infer_memberships_to_frozen_centroids(

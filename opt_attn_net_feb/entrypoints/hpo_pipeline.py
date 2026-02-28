@@ -201,6 +201,12 @@ class CLIExplainabilityConfig:
     chem_ace_local_radii: tuple[int, ...]
     chem_ace_patch_cap_per_mol: int
     chem_ace_target_total_patches: int
+    chem_ace_embed_dim_2d: int
+    chem_ace_embed_dim_3d_geom: int
+    chem_ace_embed_dim_3d_qm: int
+    chem_ace_context_dim: int
+    chem_ace_context_alpha: float
+    chem_ace_qm_gating: bool
     chem_ace_max_2d_dim: int
     chem_ace_max_3dqm_dim: int
     chem_ace_persist_patch_embeddings: bool
@@ -235,6 +241,14 @@ class CLIExplainabilityConfig:
     chem_ace_orca_descriptor_cols: tuple[str, ...]
     chem_ace_orca_min_vectors_for_tagging: int
     chem_ace_orca_z_threshold: float
+    chem_ace_use_pmapper_signatures: bool
+    chem_ace_pmapper_tol: int
+    chem_ace_pmapper_tol_alt: int
+    chem_ace_strict_rerank: bool
+    chem_ace_strict_rerank_layer_name: str
+    chem_ace_strict_rerank_top_rows_per_task: int
+    chem_ace_strict_rerank_batch_size: int
+    chem_ace_strict_rerank_weight: float
     lambda_vol_output_dir: str | None
     lambda_vol_db_uri: str | None
     lambda_vol_layer_name: str
@@ -431,6 +445,12 @@ class PipelineConfigFactory:
                 chem_ace_local_radii=tuple(int(x) for x in args.chem_ace_local_radii),
                 chem_ace_patch_cap_per_mol=int(args.chem_ace_patch_cap_per_mol),
                 chem_ace_target_total_patches=int(args.chem_ace_target_total_patches),
+                chem_ace_embed_dim_2d=int(args.chem_ace_embed_dim_2d),
+                chem_ace_embed_dim_3d_geom=int(args.chem_ace_embed_dim_3d_geom),
+                chem_ace_embed_dim_3d_qm=int(args.chem_ace_embed_dim_3d_qm),
+                chem_ace_context_dim=int(args.chem_ace_context_dim),
+                chem_ace_context_alpha=float(args.chem_ace_context_alpha),
+                chem_ace_qm_gating=bool(args.chem_ace_qm_gating),
                 chem_ace_max_2d_dim=int(args.chem_ace_max_2d_dim),
                 chem_ace_max_3dqm_dim=int(args.chem_ace_max_3dqm_dim),
                 chem_ace_persist_patch_embeddings=bool(args.chem_ace_persist_patch_embeddings),
@@ -483,6 +503,14 @@ class PipelineConfigFactory:
                 chem_ace_orca_descriptor_cols=tuple(str(x) for x in args.chem_ace_orca_descriptor_cols),
                 chem_ace_orca_min_vectors_for_tagging=int(args.chem_ace_orca_min_vectors_for_tagging),
                 chem_ace_orca_z_threshold=float(args.chem_ace_orca_z_threshold),
+                chem_ace_use_pmapper_signatures=bool(args.chem_ace_use_pmapper_signatures),
+                chem_ace_pmapper_tol=int(args.chem_ace_pmapper_tol),
+                chem_ace_pmapper_tol_alt=int(args.chem_ace_pmapper_tol_alt),
+                chem_ace_strict_rerank=bool(args.chem_ace_strict_rerank),
+                chem_ace_strict_rerank_layer_name=str(args.chem_ace_strict_rerank_layer_name),
+                chem_ace_strict_rerank_top_rows_per_task=int(args.chem_ace_strict_rerank_top_rows_per_task),
+                chem_ace_strict_rerank_batch_size=int(args.chem_ace_strict_rerank_batch_size),
+                chem_ace_strict_rerank_weight=float(args.chem_ace_strict_rerank_weight),
                 lambda_vol_output_dir=(
                     None if args.lambda_vol_output_dir is None else str(args.lambda_vol_output_dir)
                 ),
@@ -1072,6 +1100,12 @@ class MILPipelineOrchestrator:
                         chem_ace_local_radii=tuple(self.config.explainability.chem_ace_local_radii),
                         chem_ace_patch_cap_per_mol=int(self.config.explainability.chem_ace_patch_cap_per_mol),
                         chem_ace_target_total_patches=int(self.config.explainability.chem_ace_target_total_patches),
+                        chem_ace_embed_dim_2d=int(self.config.explainability.chem_ace_embed_dim_2d),
+                        chem_ace_embed_dim_3d_geom=int(self.config.explainability.chem_ace_embed_dim_3d_geom),
+                        chem_ace_embed_dim_3d_qm=int(self.config.explainability.chem_ace_embed_dim_3d_qm),
+                        chem_ace_context_dim=int(self.config.explainability.chem_ace_context_dim),
+                        chem_ace_context_alpha=float(self.config.explainability.chem_ace_context_alpha),
+                        chem_ace_qm_gating=bool(self.config.explainability.chem_ace_qm_gating),
                         chem_ace_max_2d_dim=int(self.config.explainability.chem_ace_max_2d_dim),
                         chem_ace_max_3dqm_dim=int(self.config.explainability.chem_ace_max_3dqm_dim),
                         chem_ace_persist_patch_embeddings=bool(
@@ -1161,6 +1195,26 @@ class MILPipelineOrchestrator:
                         ),
                         chem_ace_orca_z_threshold=float(
                             self.config.explainability.chem_ace_orca_z_threshold
+                        ),
+                        chem_ace_use_pmapper_signatures=bool(
+                            self.config.explainability.chem_ace_use_pmapper_signatures
+                        ),
+                        chem_ace_pmapper_tol=int(self.config.explainability.chem_ace_pmapper_tol),
+                        chem_ace_pmapper_tol_alt=int(self.config.explainability.chem_ace_pmapper_tol_alt),
+                        chem_ace_strict_rerank=bool(
+                            self.config.explainability.chem_ace_strict_rerank
+                        ),
+                        chem_ace_strict_rerank_layer_name=str(
+                            self.config.explainability.chem_ace_strict_rerank_layer_name
+                        ),
+                        chem_ace_strict_rerank_top_rows_per_task=int(
+                            self.config.explainability.chem_ace_strict_rerank_top_rows_per_task
+                        ),
+                        chem_ace_strict_rerank_batch_size=int(
+                            self.config.explainability.chem_ace_strict_rerank_batch_size
+                        ),
+                        chem_ace_strict_rerank_weight=float(
+                            self.config.explainability.chem_ace_strict_rerank_weight
                         ),
                         lambda_vol_output_dir=self._suffix_output_dir(
                             base_dir=self.config.explainability.lambda_vol_output_dir,
@@ -1688,16 +1742,52 @@ def _parse_args(argv: Any | None = None):
         help="Target total patches when auto-cap is enabled (<=0 disables auto-cap).",
     )
     ap.add_argument(
+        "--chem_ace_embed_dim_2d",
+        type=int,
+        default=64,
+        help="Hybrid Chem-ACE concept embedding width for 2D modality.",
+    )
+    ap.add_argument(
+        "--chem_ace_embed_dim_3d_geom",
+        type=int,
+        default=64,
+        help="Hybrid Chem-ACE concept embedding width for 3D geometry modality.",
+    )
+    ap.add_argument(
+        "--chem_ace_embed_dim_3d_qm",
+        type=int,
+        default=64,
+        help="Hybrid Chem-ACE concept embedding width for 3D QM modality.",
+    )
+    ap.add_argument(
+        "--chem_ace_context_dim",
+        type=int,
+        default=16,
+        help="Context projection width used by hybrid patch embeddings.",
+    )
+    ap.add_argument(
+        "--chem_ace_context_alpha",
+        type=float,
+        default=0.2,
+        help="Weight of context branch in hybrid local+context patch embeddings.",
+    )
+    ap.add_argument(
+        "--chem_ace_qm_gating",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable geometry-gated local QM contribution in 3D QM patch embeddings.",
+    )
+    ap.add_argument(
         "--chem_ace_max_2d_dim",
         type=int,
         default=0,
-        help="Max 2D dims for Chem-ACE embedding (<=0 uses full available 2D raw dim).",
+        help="[Deprecated] Legacy feature-projection cap. Kept for CLI compatibility only.",
     )
     ap.add_argument(
         "--chem_ace_max_3dqm_dim",
         type=int,
         default=0,
-        help="Max merged 3D+QM dims for Chem-ACE embedding (<=0 uses full available merged dim).",
+        help="[Deprecated] Legacy feature-projection cap. Kept for CLI compatibility only.",
     )
     ap.add_argument(
         "--chem_ace_persist_patch_embeddings",
@@ -1793,6 +1883,62 @@ def _parse_args(argv: Any | None = None):
     )
     ap.add_argument("--chem_ace_orca_min_vectors_for_tagging", type=int, default=8)
     ap.add_argument("--chem_ace_orca_z_threshold", type=float, default=0.50)
+    ap.add_argument(
+        "--chem_ace_use_pmapper_signatures",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Compute conformer-level pmapper pharmacophore signatures from SDF and "
+            "attach signature diagnostics to attention exports."
+        ),
+    )
+    ap.add_argument(
+        "--chem_ace_pmapper_tol",
+        type=int,
+        default=0,
+        help="Primary pmapper signature tolerance (0 uses exact/default signature).",
+    )
+    ap.add_argument(
+        "--chem_ace_pmapper_tol_alt",
+        type=int,
+        default=5,
+        help="Secondary pmapper signature tolerance for coarse grouping.",
+    )
+    ap.add_argument(
+        "--chem_ace_strict_rerank",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Run strict post-discovery re-embedding in trained mixer space for "
+            "concept medoids + top-attention conformers and use scores for final reranking."
+        ),
+    )
+    ap.add_argument(
+        "--chem_ace_strict_rerank_layer_name",
+        default="mixer_post_norm",
+        help="Layer used for strict re-embedding (default: mixer_post_norm).",
+    )
+    ap.add_argument(
+        "--chem_ace_strict_rerank_top_rows_per_task",
+        type=int,
+        default=256,
+        help=(
+            "Top-attention conformer rows per task used in strict pass; "
+            "<=0 means all rows (can be expensive)."
+        ),
+    )
+    ap.add_argument(
+        "--chem_ace_strict_rerank_batch_size",
+        type=int,
+        default=256,
+        help="Batch size for strict mixer-space re-embedding.",
+    )
+    ap.add_argument(
+        "--chem_ace_strict_rerank_weight",
+        type=float,
+        default=0.35,
+        help="Weight of strict mixer-space score in final concept explanation reranking.",
+    )
     ap.add_argument("--lambda_vol_output_dir", default=None)
     ap.add_argument("--lambda_vol_db_uri", default=None)
     ap.add_argument("--lambda_vol_layer_name", default="mixer_post_norm")

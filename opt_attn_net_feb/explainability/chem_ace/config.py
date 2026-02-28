@@ -61,8 +61,14 @@ class EmbeddingConfig:
     """Embedding extraction settings."""
 
     layer_name: str
-    strategy: str = "masked_input"
+    strategy: str = "hybrid_local_context"
     normalize: bool = True
+    embed_dim_2d: int = 64
+    embed_dim_3d_geom: int = 64
+    embed_dim_3d_qm: int = 64
+    context_dim: int = 16
+    context_alpha: float = 0.2
+    qm_gating: bool = True
     cache: EmbeddingCacheConfig = field(default_factory=EmbeddingCacheConfig)
 
 

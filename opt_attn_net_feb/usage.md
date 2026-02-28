@@ -69,12 +69,19 @@ Useful controls:
 - `--chem_ace_local_radii 1` (default)
 - `--chem_ace_patch_cap_per_mol 0` (default: dynamic auto-cap)
 - `--chem_ace_target_total_patches 1200000` (used when auto-cap is enabled)
+- `--chem_ace_embed_dim_2d 64`
+- `--chem_ace_embed_dim_3d_geom 64`
+- `--chem_ace_embed_dim_3d_qm 64`
+- `--chem_ace_context_dim 16`
+- `--chem_ace_context_alpha 0.2`
+- `--chem_ace_qm_gating` / `--no-chem_ace_qm_gating`
 - `--chem_ace_top_concepts 64`
 - `--chem_ace_output_dir /path/to/chem_ace_out`
 - `--chem_ace_conformer_sdf /path/to/precomputed_conformers.sdf`
 - `--chem_ace_sdf_conf_id_prop conf_id` (falls back to SDF record name if missing; use `_Name` when your SDF stores `conf_id` in record name)
 - `--feat3d_raw /path/to/raw_3d.csv` (optional; must be paired with `--feat3d_qm_raw`)
 - `--feat3d_qm_raw /path/to/raw_3d_quantum.csv` (optional; must be paired with `--feat3d_raw`)
+- `--chem_ace_max_2d_dim` and `--chem_ace_max_3dqm_dim` are deprecated compatibility flags and ignored by the hybrid runtime
 - `--run_activity_calibration` / `--no-run_activity_calibration` (default: enabled)
 - `--activity_calibration_keep_threshold 0.55`
 - `--activity_calibration_min_concept_support 12`
@@ -85,6 +92,11 @@ Useful controls:
 - `--activity_calibration_bitmask_weight 0.30`
 - `--activity_calibration_bitmask_min_count 20`
 - `--activity_calibration_ratio_cap 8.0`
+- `--chem_ace_strict_rerank` / `--no-chem_ace_strict_rerank`
+- `--chem_ace_strict_rerank_layer_name mixer_post_norm`
+- `--chem_ace_strict_rerank_top_rows_per_task 256`
+- `--chem_ace_strict_rerank_batch_size 256`
+- `--chem_ace_strict_rerank_weight 0.35`
 - `--cpu_workers -1`
 
 Scaled vs raw behavior:
@@ -102,12 +114,23 @@ Anti-leakage behavior:
 - Leaderboard explainability is inference-only: leaderboard patches are assigned to frozen train centroids (no reclustering).
 - Use `--chem_ace_infer_max_distance` to drop far leaderboard assignments (`<=0` disables gating).
 - Activity calibration is train-only and leakage-safe: it uses only train IDs and train labels/bitmasks.
+- Strict mixer-space rerank does not redefine concepts: it only rescales final explanation ranking with trained-layer similarity between concept medoids and top-attention leaderboard conformers.
 
 Behavior for conformers:
 
 - 2D patches are generated once per molecule.
 - 3D Pharm3D patches are generated only for conformers found in the SDF.
 - If a `conf_id` from the features is missing in SDF, it is skipped (no conformer generation fallback).
+- Optional pmapper signatures can be computed from SDF conformers:
+  - `--chem_ace_use_pmapper_signatures` / `--no-chem_ace_use_pmapper_signatures`
+  - `--chem_ace_pmapper_tol 0`
+  - `--chem_ace_pmapper_tol_alt 5`
+- When enabled and available, signatures are exported to:
+  - `<chem_ace_output_dir>/conformer_pmapper_signatures.csv`
+  - `<chem_ace_output_dir>/conformer_pmapper_signatures_summary.json`
+- Attention export then includes:
+  - `pmapper_sig_md5`, `pmapper_sig_md5_alt`
+  - per-task signature mass/rank/top columns (e.g. `pmapper_sig_md5_mass_<task>`, `pmapper_sig_md5_rank_<task>`, `pmapper_sig_md5_top_<task>`).
 
 Functional-group rules behavior:
 
@@ -219,3 +242,4 @@ Final outputs include:
 - Concept-RL policy history JSON (`concept_rl_policy_history.json`) inside final run directory when enabled
 - Ricci artifacts (`ricci_edges_long.csv`, `ricci_task_summary.csv`, `ricci_flow_tensors.npz`) inside Lambda-Vol output
 - Prediction explanations CSV (`*_explained.csv`) with per-task text explanations when Chem-ACE is enabled
+- Optional conformer pharmacophore signature artifacts and signature-aware attention diagnostics (when pmapper + SDF are available)

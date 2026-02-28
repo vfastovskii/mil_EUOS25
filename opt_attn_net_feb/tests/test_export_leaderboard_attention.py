@@ -100,6 +100,46 @@ class ExportLeaderboardAttentionTest(unittest.TestCase):
                 self.assertEqual(int(row_m1[f"pred_label_{task}"]), expected_m1[i])
                 self.assertEqual(int(row_m2[f"pred_label_{task}"]), expected_m2[i])
 
+    @unittest.skipUnless(_HAS_TORCH, "torch is required for export_leaderboard_attention test")
+    def test_pmapper_signature_columns_and_mass_are_exported(self) -> None:
+        model = _DummyExportModel()
+        device = torch.device("cpu")
+
+        mol_ids = ["m1"]
+        conf_pad = np.array([["c1", "c2", ""]], dtype=object)
+        x2d = torch.tensor([[0.0, 1.0, -1.0, 2.0]], dtype=torch.float32)
+        x3d = torch.zeros((1, 3, 2), dtype=torch.float32)
+        kpm = torch.tensor([[False, False, True]], dtype=torch.bool)
+        dl = [(mol_ids, conf_pad, x2d, x3d, kpm)]
+
+        sig_map = {"c1": "sigA", "c2": "sigA"}
+        sig_map_alt = {"c1": "sigX", "c2": "sigY"}
+
+        with tempfile.TemporaryDirectory() as td:
+            out_csv = Path(td) / "leaderboard_attn.csv"
+            export_leaderboard_attention(
+                model=model,
+                dl_lb_export=dl,
+                device=device,
+                out_path=out_csv,
+                conf_signature_map=sig_map,
+                conf_signature_alt_map=sig_map_alt,
+            )
+            df = pd.read_csv(out_csv)
+
+            self.assertIn("pmapper_sig_md5", df.columns)
+            self.assertIn("pmapper_sig_md5_alt", df.columns)
+            for task in TASK_COLS:
+                self.assertIn(f"pmapper_sig_md5_mass_{task}", df.columns)
+                self.assertIn(f"pmapper_sig_md5_rank_{task}", df.columns)
+                self.assertIn(f"pmapper_sig_md5_top_{task}", df.columns)
+
+            # Both conformers share primary signature sigA, so per-task mass should be 1.0.
+            row0 = df.iloc[0]
+            for task in TASK_COLS:
+                self.assertAlmostEqual(float(row0[f"pmapper_sig_md5_mass_{task}"]), 1.0, places=6)
+                self.assertEqual(int(row0[f"pmapper_sig_md5_top_{task}"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

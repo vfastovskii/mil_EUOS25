@@ -775,6 +775,7 @@ Output format:
 ## 14. Chem-ACE Integration (Optional)
 
 Integration entry: `training/explainability_runtime.py::prepare_chem_ace_bundle`
+Alignment checklist: `docs/ACE_TCAV_ALIGNMENT.md`
 
 Enabled by:
 - `--run_chem_ace`
@@ -787,8 +788,8 @@ Hard requirements:
 ### 14.1 Chem-ACE pipeline configuration in final run
 
 Runtime sets:
-- `embedding.layer_name = "feature_fusion_2d3dqm"`
-- `embedding.strategy = "masked_input"` at config object level, but integrated final embedding persistence uses explicit `strategy="feature_projection"` for fused vectors
+- `embedding.layer_name = "feature_hybrid_multimodal"`
+- `embedding.strategy = "hybrid_local_context"`
 - `patch_generation.pharm3d.enabled = True` in this integrated path
 - database default URI:
   - `sqlite:///<chem_ace_output_dir>/chem_ace.sqlite3`
@@ -821,22 +822,37 @@ Patch IDs/hashes are deterministic SHA1 signatures over:
 
 ### 14.4 Patch embedding in integrated final pipeline
 
-For each patch, integrated runtime creates feature-level vector:
-- `v2d = take_or_pad(x2d, resolved_chem_ace_2d_dim)`
-  - where `resolved_chem_ace_2d_dim = chem_ace_max_2d_dim` if `chem_ace_max_2d_dim > 0`
-  - else `resolved_chem_ace_2d_dim = full 2D raw dimension` from `X2d_file.shape[1]`
-- `v3dqm = take_or_pad(conf-specific instance vector or molecule mean, resolved_chem_ace_3dqm_dim)`
-  - where `resolved_chem_ace_3dqm_dim = chem_ace_max_3dqm_dim` if `chem_ace_max_3dqm_dim > 0`
-  - else `resolved_chem_ace_3dqm_dim = full merged 3D+QM model-input dimension` from `Xinst_sorted.shape[1]`
-- descriptor vector:
-  - 10 scalar patch descriptors (RobustScaler-transformed; scaler fitted on discover-train descriptors)
-  - +5 one-hot patch type indicators
+Legacy long-concat feature projection is removed from final runtime.
 
-Final patch vector:
-- `vec = concat([v2d, v3dqm, descriptors])`
-- dimension = `resolved_chem_ace_2d_dim + resolved_chem_ace_3dqm_dim + 15`
+Current integrated runtime uses modality-separated hybrid embedding spaces:
 
-Stored with metadata via embedding cache and DB.
+- `2d`
+- `3d_geom`
+- `3d_qm`
+
+Patch routing:
+
+- non-conformer patch (`conf_id=None`) -> `2d`
+- conformer patch without valid QM slice -> `3d_geom`
+- conformer patch with QM support -> `3d_qm`
+
+Per-modality embedding equation:
+
+- `z_local = MLP_local(local_features)`
+- `z_ctx = MLP_ctx(context_features)`
+- `z = LayerNorm(z_local + alpha * z_ctx)`
+- `z = l2_normalize(z)`
+
+Default dimensions:
+
+- `chem_ace_embed_dim_2d = 64`
+- `chem_ace_embed_dim_3d_geom = 64`
+- `chem_ace_embed_dim_3d_qm = 64`
+- `chem_ace_context_dim = 16`
+- `chem_ace_context_alpha = 0.2`
+- `chem_ace_qm_gating = True`
+
+Stored with metadata via embedding cache and DB when embedding persistence is enabled.
 
 Semantic source split:
 - Concept discovery embeddings use scaled model-input tables.
@@ -1424,8 +1440,14 @@ This section lists defaults exactly as defined in typed configs and CLI parser, 
 - `chem_ace_db_uri = None`
 - `chem_ace_max_ids = 0` (`0` means use all IDs in scope)
 - `chem_ace_max_confs_per_id = 0` (`<=0` means use all conformers)
-- `chem_ace_max_2d_dim = 0` (`<=0` means auto-use full 2D raw dimension)
-- `chem_ace_max_3dqm_dim = 0` (`<=0` means auto-use full merged 3D+QM raw dimension)
+- `chem_ace_embed_dim_2d = 64`
+- `chem_ace_embed_dim_3d_geom = 64`
+- `chem_ace_embed_dim_3d_qm = 64`
+- `chem_ace_context_dim = 16`
+- `chem_ace_context_alpha = 0.2`
+- `chem_ace_qm_gating = True`
+- `chem_ace_max_2d_dim = 0` (deprecated compatibility flag, ignored by hybrid runtime)
+- `chem_ace_max_3dqm_dim = 0` (deprecated compatibility flag, ignored by hybrid runtime)
 - `chem_ace_persist_patch_embeddings = False` (avoid writing millions of per-patch embedding files by default)
 - `chem_ace_top_concepts = 0` (`<=0` means keep all discovered concepts)
 - `lambda_vol_output_dir = None`
@@ -1478,8 +1500,14 @@ Explainability:
 - `--chem_ace_db_uri None`
 - `--chem_ace_max_ids 0` (`0` means use all IDs in scope)
 - `--chem_ace_max_confs_per_id 0` (`<=0` means use all conformers)
-- `--chem_ace_max_2d_dim 0` (`<=0` means auto-use full 2D raw dimension)
-- `--chem_ace_max_3dqm_dim 0` (`<=0` means auto-use full merged 3D+QM raw dimension)
+- `--chem_ace_embed_dim_2d 64`
+- `--chem_ace_embed_dim_3d_geom 64`
+- `--chem_ace_embed_dim_3d_qm 64`
+- `--chem_ace_context_dim 16`
+- `--chem_ace_context_alpha 0.2`
+- `--chem_ace_qm_gating` (`--no-chem_ace_qm_gating` to disable)
+- `--chem_ace_max_2d_dim 0` (deprecated compatibility flag, ignored by hybrid runtime)
+- `--chem_ace_max_3dqm_dim 0` (deprecated compatibility flag, ignored by hybrid runtime)
 - `--chem_ace_persist_patch_embeddings false` (enable only if you explicitly need patch-embedding files/rows)
 - `--chem_ace_top_concepts 0` (`<=0` means keep all discovered concepts)
 - `--lambda_vol_output_dir None`

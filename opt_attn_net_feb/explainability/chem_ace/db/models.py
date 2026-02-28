@@ -258,6 +258,7 @@ class ConceptORM(Base):
     coherence: Mapped[float] = mapped_column(Float, nullable=False)
     centroid_uri: Mapped[str] = mapped_column(Text, nullable=False)
     medoid_patch_id: Mapped[str] = mapped_column(String(64), ForeignKey("patches.id"), nullable=False)
+    modality: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     label_auto: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     metadata_json: Mapped[str] = mapped_column(Text, nullable=False)
 
@@ -288,6 +289,7 @@ class ConceptMembershipORM(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     concept_id: Mapped[str] = mapped_column(String(64), ForeignKey("concepts.id"), nullable=False)
     patch_id: Mapped[str] = mapped_column(String(64), ForeignKey("patches.id"), nullable=False)
+    modality: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     membership_score: Mapped[float] = mapped_column(Float, nullable=False)
     distance_to_centroid: Mapped[float] = mapped_column(Float, nullable=False)
 
@@ -313,6 +315,7 @@ class ConceptTagORM(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     concept_id: Mapped[str] = mapped_column(String(64), ForeignKey("concepts.id"), nullable=False)
+    modality: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     tag: Mapped[str] = mapped_column(String(128), nullable=False)
     confidence: Mapped[float] = mapped_column(Float, nullable=False)
     provenance: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -355,6 +358,7 @@ class CAVORM(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     concept_id: Mapped[str] = mapped_column(String(64), ForeignKey("concepts.id"), nullable=False)
+    concept_modality: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     task_id: Mapped[str] = mapped_column(String(64), ForeignKey("tasks.id"), nullable=False)
     layer_name: Mapped[str] = mapped_column(String(256), nullable=False)
     seed: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -392,6 +396,7 @@ class TCAVEpochORM(Base):
     run_id: Mapped[str] = mapped_column(String(64), ForeignKey("runs.id"), nullable=False)
     epoch: Mapped[int] = mapped_column(Integer, nullable=False)
     concept_id: Mapped[str] = mapped_column(String(64), ForeignKey("concepts.id"), nullable=False)
+    concept_modality: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     task_id: Mapped[str] = mapped_column(String(64), ForeignKey("tasks.id"), nullable=False)
     layer_name: Mapped[str] = mapped_column(String(256), nullable=False)
     seed: Mapped[int] = mapped_column(Integer, nullable=False)

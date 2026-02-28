@@ -141,6 +141,72 @@ class PredictionTextExplanationsTest(unittest.TestCase):
             self.assertIn("A-priori tags", expl_m3)
             self.assertIn("carboxylate", str(row_m3["assigned_semantic_tags"]))
 
+    def test_export_prediction_text_explanations_strict_rerank(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pred_path = root / "pred.csv"
+            out_path = root / "pred_expl.csv"
+            strict_path = root / "strict_scores.csv"
+
+            row = {"ID": "m1", "conf_id": "c1"}
+            for task in TASK_COLS:
+                row[f"pred_{task}"] = 0.75
+                row[f"pred_label_{task}"] = 1
+                row[f"attn_{task}"] = 0.5
+            pd.DataFrame([row]).to_csv(pred_path, index=False)
+
+            concept_ids = ["c_a", "c_b"]
+            concept_metadata = {
+                "c_a": {"label_auto": "concept A", "tags": ["aliphatic"], "support": 20},
+                "c_b": {"label_auto": "concept B", "tags": ["aromatic pi-system"], "support": 20},
+            }
+            concept_mol_map = {"c_a": {"m1"}, "c_b": {"m1"}}
+            concept_conf_map = {"c_a": {("m1", "c1")}, "c_b": {("m1", "c1")}}
+
+            strict_rows = []
+            for task in TASK_COLS:
+                strict_rows.extend(
+                    [
+                        {
+                            "ID": "m1",
+                            "conf_id": "c1",
+                            "task": str(task),
+                            "task_idx": int(list(TASK_COLS).index(task)),
+                            "concept_id": "c_a",
+                            "strict_cosine": -1.0,
+                            "attn": 0.5,
+                        },
+                        {
+                            "ID": "m1",
+                            "conf_id": "c1",
+                            "task": str(task),
+                            "task_idx": int(list(TASK_COLS).index(task)),
+                            "concept_id": "c_b",
+                            "strict_cosine": 1.0,
+                            "attn": 0.5,
+                        },
+                    ]
+                )
+            pd.DataFrame(strict_rows).to_csv(strict_path, index=False)
+
+            written = export_prediction_text_explanations(
+                pred_table_path=pred_path,
+                out_path=out_path,
+                concept_ids=concept_ids,
+                concept_metadata=concept_metadata,
+                concept_mol_map=concept_mol_map,
+                concept_conf_map=concept_conf_map,
+                task_cols=TASK_COLS,
+                strict_scores_csv=str(strict_path),
+                strict_weight=1.0,
+                top_k=2,
+            )
+
+            self.assertEqual(Path(written), out_path)
+            df = pd.read_csv(out_path)
+            row_out = df.iloc[0]
+            self.assertEqual(str(row_out[f"top_concepts_{TASK_COLS[0]}"]), "c_b|c_a")
+
 
 if __name__ == "__main__":
     unittest.main()

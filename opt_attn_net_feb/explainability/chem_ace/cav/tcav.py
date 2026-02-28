@@ -111,13 +111,14 @@ def _fit_linear_separator(
     x = np.concatenate([x_pos, x_neg], axis=0)
     y = np.concatenate([y_pos, y_neg], axis=0)
 
-    if str(classifier).lower() == "svm":
+    clf = str(classifier).lower().strip()
+    if clf == "svm":
         model = LinearSVC(random_state=int(seed), max_iter=int(max_iter))
         model.fit(x, y)
         coef = np.asarray(model.coef_[0], dtype=np.float64)
         intercept = float(model.intercept_[0])
         pred = model.predict(x)
-    else:
+    elif clf in {"logreg", "logistic", "logistic_regression"}:
         model = LogisticRegression(
             random_state=int(seed),
             max_iter=int(max_iter),
@@ -127,6 +128,8 @@ def _fit_linear_separator(
         coef = np.asarray(model.coef_[0], dtype=np.float64)
         intercept = float(model.intercept_[0])
         pred = model.predict(x)
+    else:
+        raise ValueError(f"Unsupported classifier '{classifier}'. Expected one of: svm, logreg")
 
     norm = float(np.linalg.norm(coef))
     if norm <= 1e-12:
@@ -265,6 +268,7 @@ def run_tcav_from_arrays(
     tcav_records: list[TCAVRecord] = []
     sign_rates: list[float] = []
     mean_dds: list[float] = []
+    n_pos_per_repeat: list[int] = []
 
     repeats = int(max(1, config.n_random_repeats))
     n_random = int(max(2, config.random_counterexamples_per_repeat))
@@ -322,6 +326,11 @@ def run_tcav_from_arrays(
 
         sign_rates.append(float(sign_rate))
         mean_dds.append(float(mean_dd))
+        n_pos_per_repeat.append(int(n_pos))
+
+    pooled_n = int(len(n_pos_per_repeat) * int(grads.shape[0]))
+    pooled_k = int(sum(n_pos_per_repeat))
+    pooled_p = _binom_two_sided_p_value(pooled_k, pooled_n, p0=0.5) if pooled_n > 0 else None
 
     summary = TCAVSummary(
         concept_id=str(concept_id),
@@ -332,7 +341,7 @@ def run_tcav_from_arrays(
         std_sign_rate=float(np.std(sign_rates)),
         mean_directional_derivative=float(np.mean(mean_dds)),
         std_directional_derivative=float(np.std(mean_dds)),
-        p_value_mean_sign_rate=float(np.mean([r.p_value for r in tcav_records if r.p_value is not None])) if tcav_records else None,
+        p_value_mean_sign_rate=(None if pooled_p is None else float(pooled_p)),
         n_repeats=int(len(sign_rates)),
     )
     return cav_records, tcav_records, summary

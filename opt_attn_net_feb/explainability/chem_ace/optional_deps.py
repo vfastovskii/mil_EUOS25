@@ -62,6 +62,15 @@ def has_ripser() -> bool:
         return False
 
 
+def has_pmapper() -> bool:
+    """Return True when pmapper is importable."""
+    try:
+        import_module("pmapper")
+        return True
+    except Exception:
+        return False
+
+
 def require_rdkit() -> ModuleType:
     """Import and return the RDKit root module or raise a clear error."""
     return _import_module("rdkit", "pip install rdkit")
@@ -95,15 +104,22 @@ def require_ripser() -> ModuleType:
     return _import_module("ripser", "pip install ripser")
 
 
+def require_pmapper() -> ModuleType:
+    """Import and return pmapper module or raise a clear error."""
+    return _import_module("pmapper", "pip install pmapper")
+
+
 __all__ = [
     "OptionalDependencyError",
     "has_hdbscan",
     "has_openbabel_pybel",
+    "has_pmapper",
     "has_ripser",
     "has_rdkit",
     "has_scipy",
     "require_hdbscan",
     "require_openbabel_pybel",
+    "require_pmapper",
     "require_ripser",
     "require_rdkit",
     "require_scipy",
