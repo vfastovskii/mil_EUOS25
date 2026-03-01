@@ -154,23 +154,31 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=["pos_weight", "gamma", "lam"])
 
+        self.mol_dim = int(mol_dim)
         self.inst_dim = int(inst_dim)
         self.inst_geom_dim = int(inst_geom_dim)
         self.inst_qm_dim = int(inst_qm_dim)
         self.inst_hidden = int(inst_hidden)
-        if self.inst_geom_dim <= 0 and self.inst_qm_dim <= 0:
+        use_2d = self.mol_dim > 0
+        use_geom = self.inst_geom_dim > 0
+        use_qm = self.inst_qm_dim > 0
+        if not (use_2d or use_geom or use_qm):
             raise ValueError(
-                f"At least one 3D modality dimension must be >0; "
-                f"got inst_geom_dim={self.inst_geom_dim} inst_qm_dim={self.inst_qm_dim}"
+                "At least one modality must be enabled: "
+                f"mol_dim={self.mol_dim} inst_geom_dim={self.inst_geom_dim} inst_qm_dim={self.inst_qm_dim}"
             )
 
-        self.mol_enc = build_2d_embedder(
-            name=str(mol_embedder_name),
-            input_dim=int(mol_dim),
-            hidden_dim=int(mol_hidden),
-            layers=int(mol_layers),
-            dropout=float(mol_dropout),
-            activation=str(activation),
+        self.mol_enc = (
+            None
+            if not use_2d
+            else build_2d_embedder(
+                name=str(mol_embedder_name),
+                input_dim=int(mol_dim),
+                hidden_dim=int(mol_hidden),
+                layers=int(mol_layers),
+                dropout=float(mol_dropout),
+                activation=str(activation),
+            )
         )
         self.inst_geom_enc = (
             None
@@ -196,7 +204,9 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 activation=str(activation),
             )
         )
-        self.mol_post_embed_norm = nn.LayerNorm(int(mol_hidden))
+        self.mol_post_embed_norm = (
+            None if self.mol_enc is None else nn.LayerNorm(int(mol_hidden))
+        )
         self.inst_geom_post_embed_norm = nn.LayerNorm(int(inst_hidden))
         self.inst_qm_post_embed_norm = nn.LayerNorm(int(inst_hidden))
 
@@ -228,15 +238,33 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 **agg_kwargs,
             )
         )
-        self.agg_geom_post_norm = nn.LayerNorm(int(inst_hidden))
-        self.agg_qm_post_norm = nn.LayerNorm(int(inst_hidden))
+        self.agg_geom_post_norm = (
+            None if self.attn_pool_geom is None else nn.LayerNorm(int(inst_hidden))
+        )
+        self.agg_qm_post_norm = (
+            None if self.attn_pool_qm is None else nn.LayerNorm(int(inst_hidden))
+        )
 
-        self.proj2d = make_projection(int(mol_hidden), int(proj_dim))
-        self.proj3d_geom = make_projection(int(inst_hidden), int(proj_dim))
-        self.proj3d_qm = make_projection(int(inst_hidden), int(proj_dim))
+        self.proj2d = (
+            None if self.mol_enc is None else make_projection(int(mol_hidden), int(proj_dim))
+        )
+        self.proj3d_geom = (
+            None if self.attn_pool_geom is None else make_projection(int(inst_hidden), int(proj_dim))
+        )
+        self.proj3d_qm = (
+            None if self.attn_pool_qm is None else make_projection(int(inst_hidden), int(proj_dim))
+        )
+        self.active_modalities = tuple(
+            x for x, enabled in (
+                ("2d", self.proj2d is not None),
+                ("3d_geom", self.proj3d_geom is not None),
+                ("3d_qm", self.proj3d_qm is not None),
+            ) if enabled
+        )
+        mixer_in_dim = int(max(1, len(self.active_modalities)) * int(proj_dim))
 
         self.mixer = build_mlp_v3_embedder(
-            input_dim=int(3 * proj_dim),
+            input_dim=mixer_in_dim,
             hidden_dim=int(mixer_hidden),
             layers=int(mixer_layers),
             dropout=float(mixer_dropout),
@@ -609,16 +637,28 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         pooled_qm: torch.Tensor,
     ) -> torch.Tensor:
         batch_size = x2d.shape[0]
-        mol_emb = self.mol_post_embed_norm(self.mol_enc(x2d))
-        e2d = self.proj2d(mol_emb)  # [B,proj]
-        e2d_rep = e2d.unsqueeze(1).expand(-1, NUM_TASKS, -1)  # [B,4,proj]
+        mix_parts: list[torch.Tensor] = []
+        if self.mol_enc is not None and self.mol_post_embed_norm is not None and self.proj2d is not None:
+            mol_emb = self.mol_post_embed_norm(self.mol_enc(x2d))
+            e2d = self.proj2d(mol_emb)  # [B,proj]
+            e2d_rep = e2d.unsqueeze(1).expand(-1, NUM_TASKS, -1)  # [B,4,proj]
+            mix_parts.append(e2d_rep)
+        if self.proj3d_geom is not None and self.agg_geom_post_norm is not None:
+            pooled_geom = self.agg_geom_post_norm(pooled_geom)
+            e3d_geom = self.proj3d_geom(
+                pooled_geom.reshape(batch_size * NUM_TASKS, -1)
+            ).reshape(batch_size, NUM_TASKS, -1)
+            mix_parts.append(e3d_geom)
+        if self.proj3d_qm is not None and self.agg_qm_post_norm is not None:
+            pooled_qm = self.agg_qm_post_norm(pooled_qm)
+            e3d_qm = self.proj3d_qm(
+                pooled_qm.reshape(batch_size * NUM_TASKS, -1)
+            ).reshape(batch_size, NUM_TASKS, -1)
+            mix_parts.append(e3d_qm)
+        if len(mix_parts) == 0:
+            raise RuntimeError("No active modality projections found for mixer input.")
 
-        pooled_geom = self.agg_geom_post_norm(pooled_geom)
-        e3d_geom = self.proj3d_geom(pooled_geom.reshape(batch_size * NUM_TASKS, -1)).reshape(batch_size, NUM_TASKS, -1)
-        pooled_qm = self.agg_qm_post_norm(pooled_qm)
-        e3d_qm = self.proj3d_qm(pooled_qm.reshape(batch_size * NUM_TASKS, -1)).reshape(batch_size, NUM_TASKS, -1)
-
-        mix_in = torch.cat([e2d_rep, e3d_geom, e3d_qm], dim=2).reshape(batch_size * NUM_TASKS, -1)  # [B*4,3*proj]
+        mix_in = torch.cat(mix_parts, dim=2).reshape(batch_size * NUM_TASKS, -1)
         z_tasks = self.mixer(mix_in).reshape(batch_size, NUM_TASKS, -1)  # [B,4,mixer_hidden]
         return self.mixer_post_norm(z_tasks)
 

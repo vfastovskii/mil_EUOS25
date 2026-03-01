@@ -1204,7 +1204,7 @@ class MILCrossValidator:
                 "INFO",
                 "hpo.trial.fold_start",
                 trial=int(trial.number),
-                step=int(step),
+                cv_step=int(step),
                 fold=int(fold_id),
             )
             fold_score, detail = fold_runner.run_fold(
@@ -1221,7 +1221,7 @@ class MILCrossValidator:
                     "WARN",
                     "hpo.trial.pruned",
                     trial=int(trial.number),
-                    step=int(step),
+                    cv_step=int(step),
                     mean_score=f"{float(np.mean(scores)):.6f}",
                 )
                 raise optuna.TrialPruned()

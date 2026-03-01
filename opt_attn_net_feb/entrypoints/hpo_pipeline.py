@@ -1688,6 +1688,34 @@ def _parse_args(argv: Any | None = None):
     ap.add_argument("--trials", type=int, default=50)
     ap.add_argument("--trials_mil", type=int, default=None)
     ap.add_argument(
+        "--run_family_suite",
+        action="store_true",
+        help=(
+            "Run multi-family pipeline: "
+            "catboost_st + mt_2d + mt_2d3d + mt_3d with calibration + blending."
+        ),
+    )
+    ap.add_argument(
+        "--model_families",
+        nargs="+",
+        default=["catboost_st", "mt_2d", "mt_2d3d", "mt_3d"],
+        help="Model families for --run_family_suite.",
+    )
+    ap.add_argument(
+        "--calibration_method",
+        choices=["platt", "isotonic", "temperature"],
+        default="platt",
+        help="Post-hoc calibration method for family probabilities on leaderboard.",
+    )
+    ap.add_argument(
+        "--best_params_dir",
+        default=None,
+        help=(
+            "Directory with per-family best-params JSONs (<family>.json). "
+            "If omitted, defaults to <study_dir>/best_params."
+        ),
+    )
+    ap.add_argument(
         "--run_hpo",
         action="store_true",
         help="Run Optuna CV optimization before final train.",
@@ -2126,6 +2154,20 @@ def main(argv: Any | None = None) -> None:
     with log_step("pipeline.main"):
         args = _parse_args(argv)
         _normalize_compat_args(args)
+        if bool(getattr(args, "run_family_suite", False)):
+            from .family_suite import run_family_suite
+
+            log_event(
+                "INFO",
+                "pipeline.main.family_suite_dispatch",
+                run_hpo=bool(args.run_hpo),
+                hpo_only=bool(args.hpo_only),
+                study_dir=str(args.study_dir),
+                families=[str(x) for x in (args.model_families or [])],
+                calibration_method=str(args.calibration_method),
+            )
+            run_family_suite(args)
+            return
         config = PipelineConfigFactory.from_args(args)
         log_event(
             "INFO",

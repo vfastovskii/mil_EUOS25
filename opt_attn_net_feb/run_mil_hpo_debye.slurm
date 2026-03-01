@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=milExpl
+#SBATCH --job-name=milOptL
 #SBATCH --export=ALL,MODULESHOME='',MODULEPATH=''   # Required on Debye
 #SBATCH --partition=qGPU
 #SBATCH --gres=gpu:1
