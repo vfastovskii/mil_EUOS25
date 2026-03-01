@@ -126,6 +126,7 @@ def export_leaderboard_attention(
     pred_thresholds: List[float] | None = None,
     conf_signature_map: Mapping[str, str] | None = None,
     conf_signature_alt_map: Mapping[str, str] | None = None,
+    true_labels_by_id: Mapping[str, Sequence[float]] | None = None,
 ) -> Path:
     """
     Exports attention weights for leaderboard evaluation to a specified output path.
@@ -137,6 +138,7 @@ def export_leaderboard_attention(
     - conf_id
     - 4 endpoint predictions (probabilities from logits)
     - 4 endpoint binary labels (thresholded probabilities)
+    - 4 endpoint true binary labels (if `true_labels_by_id` provided)
     - 8 attention weights (per endpoint and per 3D modality):
       - `attn_geom_<task>`
       - `attn_qm_<task>`
@@ -164,6 +166,9 @@ def export_leaderboard_attention(
             Optional mapping conf_id -> pmapper signature hash.
         conf_signature_alt_map: Mapping[str, str] | None
             Optional mapping conf_id -> alternate/coarser pmapper signature hash.
+        true_labels_by_id: Mapping[str, Sequence[float]] | None
+            Optional mapping `ID -> [task0..task3]` with true binary labels.
+            When provided, exports `true_label_<task>` columns.
 
     Raises:
         RuntimeError:
@@ -281,12 +286,31 @@ def export_leaderboard_attention(
                 f"pred_label_{TASK_COLS[t]}": int(float(probs_np[b, t]) >= float(pred_thresholds_arr[t]))
                 for t in range(T)
             }
+            true_label_cols: Dict[str, Any] = {}
+            if true_labels_by_id is not None:
+                y_true_raw = true_labels_by_id.get(mid)
+                if y_true_raw is None:
+                    true_label_cols = {
+                        f"true_label_{TASK_COLS[t]}": np.nan
+                        for t in range(T)
+                    }
+                else:
+                    y_true_vec = np.asarray(y_true_raw, dtype=np.float64).reshape(-1)
+                    if y_true_vec.shape[0] != T:
+                        raise ValueError(
+                            f"true_labels_by_id[{mid!r}] has length {int(y_true_vec.shape[0])}, expected {int(T)}"
+                        )
+                    true_label_cols = {
+                        f"true_label_{TASK_COLS[t]}": int(float(y_true_vec[t]) > 0.5)
+                        for t in range(T)
+                    }
             for i in range(L):
                 row: Dict[str, Any] = {
                     "ID": mid,
                     "conf_id": confs[i],
                     **pred_cols,
                     **pred_label_cols,
+                    **true_label_cols,
                 }
                 if conf_signature_map is not None:
                     key = _normalize_conf_id(confs[i])

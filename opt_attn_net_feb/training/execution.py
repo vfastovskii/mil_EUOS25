@@ -1810,6 +1810,10 @@ class MILFinalTrainer:
         )
         log_event("INFO", "final.export.attention.start")
         out_path = Path(self.config.attn_out) if self.config.attn_out else (outdir / "leaderboard_attn.csv")
+        true_labels_by_id: Dict[str, np.ndarray] = {
+            str(ids_lb[i]): np.asarray(y_lb[i], dtype=np.float32).reshape(-1)
+            for i in range(len(ids_lb))
+        }
         conf_sig_map: Dict[str, str] = {}
         conf_sig_map_alt: Dict[str, str] = {}
         if chem_bundle is not None:
@@ -1830,6 +1834,7 @@ class MILFinalTrainer:
             out_path=out_path,
             conf_signature_map=(conf_sig_map if len(conf_sig_map) > 0 else None),
             conf_signature_alt_map=(conf_sig_map_alt if len(conf_sig_map_alt) > 0 else None),
+            true_labels_by_id=true_labels_by_id,
         )
         log_event("INFO", "final.export.attention.done", path=str(written_attn_path))
 

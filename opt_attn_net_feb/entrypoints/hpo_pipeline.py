@@ -176,11 +176,16 @@ class CLIHPOControlConfig:
 
     Attributes:
         run_hpo: If True, run Optuna CV optimization.
+        hpo_only: If True, run only HPO and skip final training/evaluation.
         best_params_json: Optional path to JSON file with best params in the
             same format as `<study_name>_best_params.json`.
+        pruner_warmup_steps: Number of validation-report steps ignored before
+            Optuna pruning activates.
     """
     run_hpo: bool
+    hpo_only: bool
     best_params_json: str | None
+    pruner_warmup_steps: int
 
 
 @dataclass(frozen=True)
@@ -424,9 +429,11 @@ class PipelineConfigFactory:
             ),
             hpo=CLIHPOControlConfig(
                 run_hpo=bool(args.run_hpo),
+                hpo_only=bool(args.hpo_only),
                 best_params_json=(
                     None if args.best_params_json is None else str(args.best_params_json)
                 ),
+                pruner_warmup_steps=int(args.pruner_warmup_steps),
             ),
             explainability=CLIExplainabilityConfig(
                 run_chem_ace=bool(args.run_chem_ace),
@@ -600,7 +607,9 @@ class PipelineEnvironmentFactory:
                 "num_workers": int(self.config.runtime.num_workers),
                 "cpu_workers": int(self.config.runtime.cpu_workers),
                 "run_hpo": bool(self.config.hpo.run_hpo),
+                "hpo_only": bool(self.config.hpo.hpo_only),
                 "best_params_json": self.config.hpo.best_params_json,
+                "pruner_warmup_steps": int(self.config.hpo.pruner_warmup_steps),
                 "feat3d_raw": self.config.data_paths.feat3d_raw,
                 "feat3d_qm_raw": self.config.data_paths.feat3d_qm_raw,
                 "run_chem_ace": bool(self.config.explainability.run_chem_ace),
@@ -877,8 +886,16 @@ class MILPipelineOrchestrator:
                 with log_step("pipeline.load_best_params"):
                     best_params = self._load_best_params(outdir=env.outdir)
 
-            with log_step("pipeline.run_final"):
-                self._run_final(env=env, hpo_data=hpo_data, best_params=best_params)
+            if bool(self.config.hpo.hpo_only):
+                log_event(
+                    "INFO",
+                    "pipeline.hpo_only.completed",
+                    run_hpo=bool(self.config.hpo.run_hpo),
+                    n_best_params=int(len(best_params)),
+                )
+            else:
+                with log_step("pipeline.run_final"):
+                    self._run_final(env=env, hpo_data=hpo_data, best_params=best_params)
 
             with log_step("pipeline.cleanup"):
                 if ckpt_root is not None:
@@ -918,6 +935,7 @@ class MILPipelineOrchestrator:
                     study_name="multimodal_mil_aux_gpu",
                     n_trials=int(self.config.runtime.trials),
                     seed=int(self.config.runtime.seed),
+                    pruner_warmup_steps=int(self.config.hpo.pruner_warmup_steps),
                 ),
                 cross_validator=cross_validator,
             )
@@ -1675,12 +1693,23 @@ def _parse_args(argv: Any | None = None):
         help="Run Optuna CV optimization before final train.",
     )
     ap.add_argument(
+        "--hpo_only",
+        action="store_true",
+        help="Run Optuna CV optimization only and skip final train/eval.",
+    )
+    ap.add_argument(
         "--best_params_json",
         default=None,
         help=(
             "Path to precomputed best params JSON (pipeline format). "
             "Used when --run_hpo is not set."
         ),
+    )
+    ap.add_argument(
+        "--pruner_warmup_steps",
+        type=int,
+        default=8,
+        help="Warmup validation-report steps before Optuna pruner can prune trials.",
     )
 
     ap.add_argument("--seed", type=int, default=0)
@@ -2065,6 +2094,14 @@ def _normalize_compat_args(args) -> None:
     """
     if args.trials_mil is not None:
         args.trials = int(args.trials_mil)
+    if bool(args.hpo_only) and (not bool(args.run_hpo)):
+        raise ValueError("--hpo_only requires --run_hpo")
+    if bool(args.hpo_only):
+        # HPO-only mode intentionally skips final-stage explainability pipeline.
+        args.run_chem_ace = False
+        args.run_lambda_vol = False
+        args.run_concept_rl = False
+        args.run_concept_rl_ablation = False
     if bool(args.run_lambda_vol) or bool(args.run_concept_rl) or bool(args.run_concept_rl_ablation):
         # Lambda-Vol and concept RL both rely on concept families from Chem-ACE.
         args.run_chem_ace = True
@@ -2094,6 +2131,7 @@ def main(argv: Any | None = None) -> None:
             "INFO",
             "pipeline.main.args",
             run_hpo=bool(config.hpo.run_hpo),
+            hpo_only=bool(config.hpo.hpo_only),
             study_dir=str(config.data_paths.study_dir),
             num_workers=int(config.runtime.num_workers),
             cpu_workers=int(config.runtime.cpu_workers),

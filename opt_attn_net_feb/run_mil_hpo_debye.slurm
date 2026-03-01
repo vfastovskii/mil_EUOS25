@@ -88,10 +88,13 @@ CONF_SDF="${CONF_SDF:-${REPO_DIR}/full_data_set_confs.sdf}"
 CONF_ID_PROP="${CONF_ID_PROP:-_Name}"
 
 # -------------------- mode / knobs --------------------
-# RUN_HPO=1: CV optimization + final fit/eval.
-# RUN_HPO=0: skip optimization and use BEST_PARAMS_JSON.
-RUN_HPO="${RUN_HPO:-0}"
+# RUN_HPO=1: run CV optimization + final train/eval (default behavior).
+# RUN_HPO=0: skip optimization and use BEST_PARAMS_JSON for final train/eval.
+RUN_HPO="${RUN_HPO:-1}"
+# HPO_ONLY=1: run only optimization (skip final training/eval completely).
+HPO_ONLY="${HPO_ONLY:-0}"
 TRIALS="${TRIALS:-35}"
+PRUNER_WARMUP_STEPS="${PRUNER_WARMUP_STEPS:-20}"
 
 MAX_EPOCHS="${MAX_EPOCHS:-150}"
 PATIENCE="${PATIENCE:-10}"
@@ -104,11 +107,11 @@ PIN_MEMORY="${PIN_MEMORY:-0}"
 LEADERBOARD_SPLIT="${LEADERBOARD_SPLIT:-leaderboard}"
 CURATED_SMILES_COL="${CURATED_SMILES_COL:-curated_SMILES}"
 
-# Explainability toggles
-RUN_CHEM_ACE="${RUN_CHEM_ACE:-1}"
-RUN_LAMBDA_VOL="${RUN_LAMBDA_VOL:-1}"
-RUN_CONCEPT_RL="${RUN_CONCEPT_RL:-1}"
-RUN_CONCEPT_RL_ABLATION="${RUN_CONCEPT_RL_ABLATION:-1}"
+# Explainability toggles (off by default; enable explicitly when needed)
+RUN_CHEM_ACE="${RUN_CHEM_ACE:-0}"
+RUN_LAMBDA_VOL="${RUN_LAMBDA_VOL:-0}"
+RUN_CONCEPT_RL="${RUN_CONCEPT_RL:-0}"
+RUN_CONCEPT_RL_ABLATION="${RUN_CONCEPT_RL_ABLATION:-0}"
 LAMBDA_VOL_RUN_RICCI="${LAMBDA_VOL_RUN_RICCI:-0}"
 LAMBDA_VOL_RICCI_USE_FLOW_AS_COUPLING="${LAMBDA_VOL_RICCI_USE_FLOW_AS_COUPLING:-0}"
 
@@ -178,6 +181,15 @@ if [[ "$RUN_LAMBDA_VOL" == "1" || "$RUN_CONCEPT_RL" == "1" || "$RUN_CONCEPT_RL_A
   RUN_CHEM_ACE=1
 fi
 
+# In HPO-only mode, final-stage explainability is not executed.
+if [[ "$HPO_ONLY" == "1" ]]; then
+  RUN_HPO=0
+  RUN_CHEM_ACE=0
+  RUN_LAMBDA_VOL=0
+  RUN_CONCEPT_RL=0
+  RUN_CONCEPT_RL_ABLATION=0
+fi
+
 # -------------------- node-local scratch --------------------
 WORKDIR="${SLURM_TMPDIR:-/tmp}/${SLURM_JOB_ID}"
 STUDY_DIR="${WORKDIR}/study_${SLURM_JOB_ID}"
@@ -191,7 +203,7 @@ echo "[INFO] Workdir: $WORKDIR"
 echo "[INFO] Study dir (node-local): $STUDY_DIR"
 echo "[INFO] Output dir: $OUTDIR"
 echo "[INFO] CPUs=${SLURM_CPUS_PER_TASK} | CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
-echo "[INFO] RUN_HPO=$RUN_HPO | RUN_CHEM_ACE=$RUN_CHEM_ACE | RUN_LAMBDA_VOL=$RUN_LAMBDA_VOL | RUN_CONCEPT_RL=$RUN_CONCEPT_RL | RUN_CONCEPT_RL_ABLATION=$RUN_CONCEPT_RL_ABLATION"
+echo "[INFO] RUN_HPO=$RUN_HPO | HPO_ONLY=$HPO_ONLY | PRUNER_WARMUP_STEPS=$PRUNER_WARMUP_STEPS | RUN_CHEM_ACE=$RUN_CHEM_ACE | RUN_LAMBDA_VOL=$RUN_LAMBDA_VOL | RUN_CONCEPT_RL=$RUN_CONCEPT_RL | RUN_CONCEPT_RL_ABLATION=$RUN_CONCEPT_RL_ABLATION"
 echo "[INFO] Conformer SDF: $CONF_SDF | conf_id source: $CONF_ID_PROP"
 
 command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || true
@@ -287,7 +299,10 @@ if [[ "$PIN_MEMORY" == "1" ]]; then
 fi
 
 if [[ "$RUN_HPO" == "1" ]]; then
-  CMD+=(--run_hpo --trials "$TRIALS")
+  CMD+=(--run_hpo --trials "$TRIALS" --pruner_warmup_steps "$PRUNER_WARMUP_STEPS")
+  if [[ "$HPO_ONLY" == "1" ]]; then
+    CMD+=(--hpo_only)
+  fi
 else
   CMD+=(--best_params_json "$WORKDIR/$(basename "$BEST_PARAMS_JSON")")
 fi

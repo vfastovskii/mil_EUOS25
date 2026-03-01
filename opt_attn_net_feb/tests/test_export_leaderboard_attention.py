@@ -107,6 +107,61 @@ class ExportLeaderboardAttentionTest(unittest.TestCase):
                 self.assertEqual(int(row_m2[f"pred_label_{task}"]), expected_m2[i])
 
     @unittest.skipUnless(_HAS_TORCH, "torch is required for export_leaderboard_attention test")
+    def test_true_binary_label_columns_are_exported_when_provided(self) -> None:
+        model = _DummyExportModel()
+        device = torch.device("cpu")
+
+        mol_ids = ["m1", "m2"]
+        conf_pad = np.array(
+            [
+                ["c1", "c2", ""],
+                ["d1", "", ""],
+            ],
+            dtype=object,
+        )
+        x2d = torch.tensor(
+            [
+                [0.0, 1.0, -1.0, 2.0],
+                [-0.01, 0.0, 0.01, -0.5],
+            ],
+            dtype=torch.float32,
+        )
+        x3d = torch.zeros((2, 3, 2), dtype=torch.float32)
+        kpm = torch.tensor(
+            [
+                [False, False, True],
+                [False, True, True],
+            ],
+            dtype=torch.bool,
+        )
+        dl = [(mol_ids, conf_pad, x2d, x3d, kpm)]
+
+        true_labels = {
+            "m1": [1, 0, 1, 0],
+            "m2": [0, 1, 0, 1],
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            out_csv = Path(td) / "leaderboard_attn.csv"
+            export_leaderboard_attention(
+                model=model,
+                dl_lb_export=dl,
+                device=device,
+                out_path=out_csv,
+                true_labels_by_id=true_labels,
+            )
+            df = pd.read_csv(out_csv)
+            for task in TASK_COLS:
+                self.assertIn(f"true_label_{task}", df.columns)
+            row_m1 = df[(df["ID"] == "m1") & (df["conf_id"] == "c1")].iloc[0]
+            row_m2 = df[(df["ID"] == "m2") & (df["conf_id"] == "d1")].iloc[0]
+            expected_m1 = [1, 0, 1, 0]
+            expected_m2 = [0, 1, 0, 1]
+            for i, task in enumerate(TASK_COLS):
+                self.assertEqual(int(row_m1[f"true_label_{task}"]), expected_m1[i])
+                self.assertEqual(int(row_m2[f"true_label_{task}"]), expected_m2[i])
+
+    @unittest.skipUnless(_HAS_TORCH, "torch is required for export_leaderboard_attention test")
     def test_pmapper_signature_columns_and_mass_are_exported(self) -> None:
         model = _DummyExportModel()
         device = torch.device("cpu")
