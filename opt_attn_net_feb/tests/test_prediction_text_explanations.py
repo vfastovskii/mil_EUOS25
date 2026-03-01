@@ -12,11 +12,11 @@ if str(PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(PKG_ROOT))
 
 try:
-    from ..data.exports import export_prediction_text_explanations
-    from ..utils.constants import TASK_COLS
+    from opt_attn_net_feb.data.exports import export_prediction_text_explanations
+    from opt_attn_net_feb.utils.constants import TASK_COLS
 except Exception:  # pragma: no cover
-    from data.exports import export_prediction_text_explanations
-    from utils.constants import TASK_COLS
+    from opt_attn_net_feb.data.exports import export_prediction_text_explanations
+    from opt_attn_net_feb.utils.constants import TASK_COLS
 
 
 class PredictionTextExplanationsTest(unittest.TestCase):

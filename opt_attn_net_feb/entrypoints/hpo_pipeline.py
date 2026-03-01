@@ -257,6 +257,10 @@ class CLIExplainabilityConfig:
     lambda_vol_tcav_repeats: int
     lambda_vol_random_counterexamples: int
     lambda_vol_min_concept_samples: int
+    lambda_vol_tcav_holdout_fraction: float
+    lambda_vol_tcav_holdout_min_samples: int
+    lambda_vol_tcav_significance_alpha: float
+    lambda_vol_tcav_bonferroni_m: int
     lambda_vol_run_ricci: bool
     lambda_vol_ricci_edge_keep_quantile: float
     lambda_vol_ricci_min_edge_weight: float
@@ -523,6 +527,10 @@ class PipelineConfigFactory:
                 lambda_vol_tcav_repeats=int(args.lambda_vol_tcav_repeats),
                 lambda_vol_random_counterexamples=int(args.lambda_vol_random_counterexamples),
                 lambda_vol_min_concept_samples=int(args.lambda_vol_min_concept_samples),
+                lambda_vol_tcav_holdout_fraction=float(args.lambda_vol_tcav_holdout_fraction),
+                lambda_vol_tcav_holdout_min_samples=int(args.lambda_vol_tcav_holdout_min_samples),
+                lambda_vol_tcav_significance_alpha=float(args.lambda_vol_tcav_significance_alpha),
+                lambda_vol_tcav_bonferroni_m=int(args.lambda_vol_tcav_bonferroni_m),
                 lambda_vol_run_ricci=bool(args.lambda_vol_run_ricci),
                 lambda_vol_ricci_edge_keep_quantile=float(args.lambda_vol_ricci_edge_keep_quantile),
                 lambda_vol_ricci_min_edge_weight=float(args.lambda_vol_ricci_min_edge_weight),
@@ -1232,6 +1240,18 @@ class MILPipelineOrchestrator:
                         lambda_vol_tcav_repeats=int(self.config.explainability.lambda_vol_tcav_repeats),
                         lambda_vol_random_counterexamples=int(self.config.explainability.lambda_vol_random_counterexamples),
                         lambda_vol_min_concept_samples=int(self.config.explainability.lambda_vol_min_concept_samples),
+                        lambda_vol_tcav_holdout_fraction=float(
+                            self.config.explainability.lambda_vol_tcav_holdout_fraction
+                        ),
+                        lambda_vol_tcav_holdout_min_samples=int(
+                            self.config.explainability.lambda_vol_tcav_holdout_min_samples
+                        ),
+                        lambda_vol_tcav_significance_alpha=float(
+                            self.config.explainability.lambda_vol_tcav_significance_alpha
+                        ),
+                        lambda_vol_tcav_bonferroni_m=int(
+                            self.config.explainability.lambda_vol_tcav_bonferroni_m
+                        ),
                         lambda_vol_run_ricci=bool(self.config.explainability.lambda_vol_run_ricci),
                         lambda_vol_ricci_edge_keep_quantile=float(
                             self.config.explainability.lambda_vol_ricci_edge_keep_quantile
@@ -1955,9 +1975,33 @@ def _parse_args(argv: Any | None = None):
     ap.add_argument("--lambda_vol_random_counterexamples", type=int, default=96)
     ap.add_argument("--lambda_vol_min_concept_samples", type=int, default=8)
     ap.add_argument(
+        "--lambda_vol_tcav_holdout_fraction",
+        type=float,
+        default=0.2,
+        help="Holdout fraction for TCAV directional-derivative evaluation (<=0 disables holdout).",
+    )
+    ap.add_argument(
+        "--lambda_vol_tcav_holdout_min_samples",
+        type=int,
+        default=16,
+        help="Minimum holdout evaluation samples for TCAV when holdout is enabled.",
+    )
+    ap.add_argument(
+        "--lambda_vol_tcav_significance_alpha",
+        type=float,
+        default=0.05,
+        help="Significance alpha for repeat-level and pooled TCAV tests.",
+    )
+    ap.add_argument(
+        "--lambda_vol_tcav_bonferroni_m",
+        type=int,
+        default=0,
+        help="Bonferroni hypothesis count for TCAV significance (<=0 auto-uses number of concepts).",
+    )
+    ap.add_argument(
         "--lambda_vol_run_ricci",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
     )
     ap.add_argument("--lambda_vol_ricci_edge_keep_quantile", type=float, default=0.75)
     ap.add_argument("--lambda_vol_ricci_min_edge_weight", type=float, default=0.05)

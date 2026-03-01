@@ -6,13 +6,15 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 if str(PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(PKG_ROOT))
 
-from ..explainability.chem_ace.types import PatchEmbeddingRecord, PatchRecord
-from ..training.explainability_runtime import _build_hybrid_patch_embeddings, prepare_chem_ace_bundle
+from opt_attn_net_feb.explainability.chem_ace.types import PatchEmbeddingRecord, PatchRecord
+pytest.importorskip("torch")
+from opt_attn_net_feb.training.explainability_runtime import _build_hybrid_patch_embeddings, prepare_chem_ace_bundle
 
 
 class _DummyEmbeddingCache:

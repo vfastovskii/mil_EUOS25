@@ -103,6 +103,10 @@ class LambdaVolMonitor:
             ConceptRicciFlowAnalyzer(
                 task_ids=self.task_ids,
                 concept_ids=self.concept_ids,
+                concept_modalities=tuple(
+                    str(self.concept_metadata.get(cid, {}).get("modality", "2d"))
+                    for cid in self.concept_ids
+                ),
                 config=self.config.ricci,
             )
             if bool(self.config.ricci.enabled)
@@ -163,6 +167,7 @@ class LambdaVolMonitor:
         task_attention_df: Optional[pd.DataFrame] = None,
         task_metrics_df: Optional[pd.DataFrame] = None,
         context_covariates: Optional[Mapping[str, float]] = None,
+        ricci_payload: Optional[Mapping[str, Any]] = None,
     ) -> EpochStepResult:
         """Run one monitoring step from explicit frames (online or offline)."""
         ep = int(epoch)
@@ -200,21 +205,35 @@ class LambdaVolMonitor:
 
         ricci_out: Optional[RicciEpochOutput] = None
         if self.ricci_analyzer is not None:
-            ricci_out = self.ricci_analyzer.analyze_epoch(
-                epoch=ep,
-                rho=state.rho,
-                attention_support=state.attention_support,
-                prevalence=state.prevalence,
-                tcav_history_by_task=self._tcav_history_by_task(),
-            )
-            self._ricci_edges.extend(ricci_out.edge_rows)
-            self._ricci_summaries.extend(ricci_out.task_summaries)
-            if bool(self.config.ricci.use_flow_as_concept_coupling):
-                coupling = LinearConceptDynamicsModel.make_similarity_coupling(
-                    ricci_out.mean_flowed_similarity,
-                    strength=float(self.config.ricci.coupling_strength),
+            ricci_interval = int(max(1, int(getattr(self.config.ricci, "update_interval_epochs", 1))))
+            if (ep % ricci_interval) != 0:
+                ricci_out = None
+            else:
+                activity_samples = None
+                if ricci_payload is not None:
+                    try:
+                        raw = ricci_payload.get("concept_activity_samples")
+                        if raw is not None:
+                            arr = np.asarray(raw, dtype=np.float32)
+                            expected = (len(self.task_ids), -1, len(self.concept_ids))
+                            if arr.ndim == 3 and arr.shape[0] == expected[0] and arr.shape[2] == expected[2]:
+                                activity_samples = arr
+                    except Exception:
+                        activity_samples = None
+                ricci_out = self.ricci_analyzer.analyze_epoch(
+                    epoch=ep,
+                    tcav_smoothed=state.tcav_smoothed,
+                    attention_support=state.attention_support,
+                    concept_activity_samples=activity_samples,
                 )
-                self.dynamics.set_concept_coupling(coupling)
+                self._ricci_edges.extend(ricci_out.edge_rows)
+                self._ricci_summaries.extend(ricci_out.task_summaries)
+                if bool(self.config.ricci.use_flow_as_concept_coupling):
+                    coupling = LinearConceptDynamicsModel.make_similarity_coupling(
+                        ricci_out.mean_flowed_similarity,
+                        strength=float(self.config.ricci.coupling_strength),
+                    )
+                    self.dynamics.set_concept_coupling(coupling)
 
         decomp = self.dynamics.predict_next(
             rho=state.rho,
@@ -316,6 +335,7 @@ class LambdaVolMonitor:
             task_attention_df=task_attention_df,
             task_metrics_df=task_metrics_df,
             context_covariates=context_covariates,
+            ricci_payload=None,
         )
 
     def finalize(self) -> PressureRunArtifacts:

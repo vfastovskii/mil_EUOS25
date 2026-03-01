@@ -11,7 +11,7 @@ if str(PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(PKG_ROOT))
 
 try:
-    from ..entrypoints.lambda_vol_demo import main as lambda_vol_demo_main
+    from opt_attn_net_feb.entrypoints.lambda_vol_demo import main as lambda_vol_demo_main
 except Exception:  # pragma: no cover
     from opt_attn_net_feb.entrypoints.lambda_vol_demo import main as lambda_vol_demo_main
 

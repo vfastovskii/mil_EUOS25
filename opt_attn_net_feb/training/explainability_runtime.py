@@ -150,7 +150,16 @@ class FinalExplainabilityConfig:
     lambda_vol_tcav_repeats: int = 2
     lambda_vol_random_counterexamples: int = 96
     lambda_vol_min_concept_samples: int = 8
-    lambda_vol_run_ricci: bool = True
+    # Fraction of monitor samples reserved for TCAV directional-derivative evaluation.
+    # <=0 disables holdout and evaluates on all monitor samples.
+    lambda_vol_tcav_holdout_fraction: float = 0.2
+    # Minimum number of evaluation samples when holdout is enabled.
+    lambda_vol_tcav_holdout_min_samples: int = 16
+    # Per-concept significance alpha for raw and corrected tests.
+    lambda_vol_tcav_significance_alpha: float = 0.05
+    # Bonferroni hypothesis count; <=0 auto-uses number of concepts in scope.
+    lambda_vol_tcav_bonferroni_m: int = 0
+    lambda_vol_run_ricci: bool = False
     lambda_vol_ricci_edge_keep_quantile: float = 0.75
     lambda_vol_ricci_min_edge_weight: float = 0.05
     lambda_vol_ricci_top_k_per_node: int = 4
@@ -255,7 +264,7 @@ def build_positive_concept_targets_with_report(
 
     ids = [str(x) for x in ids_train]
     train_set = set(ids)
-    concept_ids = [str(x) for x in chem_bundle.concept_ids]
+    concept_ids_all = [str(x) for x in chem_bundle.concept_ids]
     concept_source = str(
         getattr(chem_bundle, "train_membership_source", "discover_cluster_memberships")
     )
@@ -272,6 +281,23 @@ def build_positive_concept_targets_with_report(
             mid = str(mol_id)
             if mid in train_set:
                 concept_conf_mol_map[c].add(mid)
+
+    injectable_concept_ids = [
+        str(cid)
+        for cid in concept_ids_all
+        if len(concept_conf_mol_map.get(str(cid), set())) > 0
+    ]
+    concept_ids = list(injectable_concept_ids)
+    if len(concept_ids) == 0:
+        return {}, {
+            "enabled": False,
+            "reason": "no_injectable_concepts_with_conf_support",
+            "concept_source_train": str(concept_source),
+            "n_train_ids": int(len(ids)),
+            "n_concepts_total": int(len(concept_ids_all)),
+            "n_concepts_injectable": 0,
+            "injectable_only": True,
+        }
 
     out: dict[int, tuple[str, ...]] = {}
     top_k_raw = int(config.concept_rl_top_k_per_task)
@@ -441,7 +467,10 @@ def build_positive_concept_targets_with_report(
         "enabled": True,
         "concept_source_train": str(concept_source),
         "n_train_ids": int(len(ids)),
+        "n_concepts_total": int(len(concept_ids_all)),
         "n_concepts": int(len(concept_ids)),
+        "n_concepts_injectable": int(len(concept_ids)),
+        "injectable_only": True,
         "n_any_active": int(len(any_active_ids)),
         "n_multi_active": int(len(multi_active_ids)),
         "bitmask_counts": {str(int(k)): int(v) for k, v in sorted(bitmask_counts.items())},
@@ -528,25 +557,112 @@ class MILLambdaVolFrameProvider:
         concept_ids: Sequence[str],
         concept_mol_map: Mapping[str, set[str]],
         concept_conf_map: Mapping[str, set[tuple[str, str]]],
+        concept_modality_map: Mapping[str, str] | None,
         task_ids: Sequence[str],
         layer_name: str,
         monitor_max_samples: int,
         tcav_repeats: int,
         tcav_random_counterexamples: int,
         tcav_min_concept_samples: int,
+        tcav_holdout_fraction: float,
+        tcav_holdout_min_samples: int,
+        tcav_significance_alpha: float,
+        tcav_bonferroni_m: int,
+        tcav_significance_report_dir: Path | None,
+        collect_activity_for_ricci: bool,
         seed: int,
     ) -> None:
         self.monitor_loader = monitor_loader
         self.concept_ids = tuple(str(x) for x in concept_ids)
         self.concept_mol_map = {str(k): set(v) for k, v in concept_mol_map.items()}
         self.concept_conf_map = {str(k): set(v) for k, v in concept_conf_map.items()}
+        self.concept_modality_map = {
+            str(k): str(v) for k, v in (concept_modality_map or {}).items()
+        }
         self.task_ids = tuple(str(x) for x in task_ids)
         self.layer_name = str(layer_name)
         self.monitor_max_samples = int(max(1, monitor_max_samples))
         self.tcav_repeats = int(max(1, tcav_repeats))
         self.tcav_random_counterexamples = int(max(8, tcav_random_counterexamples))
         self.tcav_min_concept_samples = int(max(2, tcav_min_concept_samples))
+        self.tcav_holdout_fraction = float(np.clip(float(tcav_holdout_fraction), 0.0, 0.95))
+        self.tcav_holdout_min_samples = int(max(1, tcav_holdout_min_samples))
+        self.tcav_significance_alpha = float(np.clip(float(tcav_significance_alpha), 1e-12, 1.0))
+        self.tcav_bonferroni_m = int(tcav_bonferroni_m)
+        self.tcav_significance_report_dir = tcav_significance_report_dir
+        self.collect_activity_for_ricci = bool(collect_activity_for_ricci)
         self.seed = int(seed)
+
+    def _modality_for_concept(self, concept_id: str) -> str:
+        cid = str(concept_id)
+        mode = str(self.concept_modality_map.get(cid, "")).strip()
+        if mode in {"2d", "3d_geom", "3d_qm"}:
+            return mode
+        if ":" in cid:
+            pref = cid.split(":", 1)[0].strip()
+            if pref in {"2d", "3d_geom", "3d_qm"}:
+                return pref
+        return "2d"
+
+    def _split_tcav_train_eval(
+        self,
+        *,
+        concept_mask: np.ndarray,
+        rng: np.random.Generator,
+    ) -> tuple[np.ndarray, np.ndarray, bool]:
+        """
+        Build stratified holdout split for TCAV:
+        - train split is used for CAV fitting (concept vs random),
+        - eval split is used for directional-derivative sign-rate.
+        """
+        n = int(concept_mask.shape[0])
+        all_idx = np.arange(n, dtype=np.int64)
+        if self.tcav_holdout_fraction <= 0.0:
+            return np.ones((n,), dtype=bool), np.ones((n,), dtype=bool), False
+
+        pos_idx = all_idx[np.asarray(concept_mask, dtype=bool)]
+        neg_idx = all_idx[~np.asarray(concept_mask, dtype=bool)]
+        min_train = int(self.tcav_min_concept_samples)
+        if len(pos_idx) <= (min_train + 1) or len(neg_idx) <= (min_train + 1):
+            return np.ones((n,), dtype=bool), np.ones((n,), dtype=bool), False
+
+        def _n_eval(cls_n: int) -> int:
+            raw = int(round(self.tcav_holdout_fraction * float(cls_n)))
+            raw = max(1, raw)
+            max_allowed = max(0, int(cls_n) - int(min_train))
+            return int(min(raw, max_allowed))
+
+        n_eval_pos = _n_eval(len(pos_idx))
+        n_eval_neg = _n_eval(len(neg_idx))
+        if (n_eval_pos + n_eval_neg) < int(self.tcav_holdout_min_samples):
+            needed = int(self.tcav_holdout_min_samples) - int(n_eval_pos + n_eval_neg)
+            pos_room = max(0, len(pos_idx) - min_train - n_eval_pos)
+            add_pos = min(pos_room, needed // 2 + needed % 2)
+            n_eval_pos += int(add_pos)
+            needed -= int(add_pos)
+            neg_room = max(0, len(neg_idx) - min_train - n_eval_neg)
+            add_neg = min(neg_room, needed)
+            n_eval_neg += int(add_neg)
+
+        if n_eval_pos <= 0 or n_eval_neg <= 0:
+            return np.ones((n,), dtype=bool), np.ones((n,), dtype=bool), False
+
+        eval_pos = rng.choice(pos_idx, size=int(n_eval_pos), replace=False)
+        eval_neg = rng.choice(neg_idx, size=int(n_eval_neg), replace=False)
+        eval_idx = np.concatenate([eval_pos, eval_neg], axis=0)
+
+        eval_mask = np.zeros((n,), dtype=bool)
+        eval_mask[eval_idx] = True
+        train_mask = ~eval_mask
+
+        train_pos = int(np.sum(np.asarray(concept_mask, dtype=bool) & train_mask))
+        train_neg = int(np.sum((~np.asarray(concept_mask, dtype=bool)) & train_mask))
+        if train_pos < min_train or train_neg < min_train:
+            return np.ones((n,), dtype=bool), np.ones((n,), dtype=bool), False
+        if int(np.sum(eval_mask)) < int(self.tcav_holdout_min_samples):
+            return np.ones((n,), dtype=bool), np.ones((n,), dtype=bool), False
+
+        return train_mask, eval_mask, True
 
     def collect_epoch_frames(
         self,
@@ -570,6 +686,7 @@ class MILLambdaVolFrameProvider:
         sample_inputs: list[dict[str, torch.Tensor]] = []
         sample_mol_ids: list[str] = []
         sample_has_concept: list[np.ndarray] = []
+        sample_activity: list[np.ndarray] | None = ([] if self.collect_activity_for_ricci else None)
         activations: list[np.ndarray] = []
 
         with torch.no_grad():
@@ -579,15 +696,40 @@ class MILLambdaVolFrameProvider:
                 kpm = kpm.to(device, non_blocking=True)
 
                 with LayerActivationHook(model, self.layer_name) as hook:
-                    logits, _, _, attn = model(x2d, x3d, kpm, return_attn=True)
+                    logits, _, _, attn = model(
+                        x2d,
+                        x3d,
+                        kpm,
+                        return_attn=True,
+                        return_attn_modalities=True,
+                    )
 
                 if hook.last_activation is None:
                     raise RuntimeError(f"No activation captured for layer '{self.layer_name}'")
                 batch_act = _collapse_activation(hook.last_activation)
 
-                attn_np = attn.detach().cpu().numpy()  # [B,T,N]
+                attn_geom_np: np.ndarray | None
+                attn_qm_np: np.ndarray | None
+                if isinstance(attn, Mapping):
+                    attn_geom_t = attn.get("attn_geom")
+                    attn_qm_t = attn.get("attn_qm")
+                    attn_geom_np = (
+                        None if attn_geom_t is None else attn_geom_t.detach().cpu().numpy()
+                    )
+                    attn_qm_np = (
+                        None if attn_qm_t is None else attn_qm_t.detach().cpu().numpy()
+                    )
+                else:
+                    # Backward-compat path when model returns fused attention tensor.
+                    fused = attn.detach().cpu().numpy()
+                    attn_geom_np = fused
+                    attn_qm_np = fused
+
+                ref = attn_geom_np if attn_geom_np is not None else attn_qm_np
+                if ref is None:
+                    raise RuntimeError("Lambda-Vol frame provider expected attention payload")
                 kpm_np = kpm.detach().cpu().numpy().astype(bool)
-                B, T, _N = attn_np.shape
+                B, T, _N = ref.shape
 
                 for b in range(B):
                     if len(sample_mol_ids) >= self.monitor_max_samples:
@@ -599,23 +741,41 @@ class MILLambdaVolFrameProvider:
                         continue
                     confs = [str(c) for c in conf_pad[b, :L].tolist()]
 
-                    # Build per-task normalized attention over valid conformers.
-                    attn_norm = np.zeros((T, L), dtype=np.float64)
+                    # Build per-task normalized attention over valid conformers, per 3D modality.
+                    attn_geom_norm = np.zeros((T, L), dtype=np.float64)
+                    attn_qm_norm = np.zeros((T, L), dtype=np.float64)
                     for t in range(T):
-                        w = attn_np[b, t, :L].astype(np.float64)
-                        s = float(np.sum(w))
-                        if (not np.isfinite(s)) or s <= 0.0:
-                            w[:] = 1.0 / float(L)
+                        if attn_geom_np is not None:
+                            wg = attn_geom_np[b, t, :L].astype(np.float64)
+                            sg = float(np.sum(wg))
+                            if (not np.isfinite(sg)) or sg <= 0.0:
+                                wg[:] = 0.0
+                            else:
+                                wg /= sg
                         else:
-                            w /= s
-                        attn_norm[t] = w
-                        entropy_sum[t] += _normalized_entropy(w)
-                        witness_sum[t] += float(np.max(w))
+                            wg = np.zeros((L,), dtype=np.float64)
+                        if attn_qm_np is not None:
+                            wq = attn_qm_np[b, t, :L].astype(np.float64)
+                            sq = float(np.sum(wq))
+                            if (not np.isfinite(sq)) or sq <= 0.0:
+                                wq[:] = 0.0
+                            else:
+                                wq /= sq
+                        else:
+                            wq = np.zeros((L,), dtype=np.float64)
+
+                        attn_geom_norm[t] = wg
+                        attn_qm_norm[t] = wq
+                        w_fused = 0.5 * (wg + wq)
+                        entropy_sum[t] += _normalized_entropy(w_fused)
+                        witness_sum[t] += float(np.max(w_fused))
 
                     has_concept = np.zeros((n_concepts,), dtype=bool)
+                    activity_row = np.zeros((n_tasks, n_concepts), dtype=np.float32)
                     for ci, concept_id in enumerate(self.concept_ids):
                         mol_present = mol_id in self.concept_mol_map.get(concept_id, set())
                         has_concept[ci] = bool(mol_present)
+                        modality = self._modality_for_concept(concept_id)
 
                         conf_hits = [
                             i
@@ -626,13 +786,24 @@ class MILLambdaVolFrameProvider:
                         prevalence_val = 1.0 if mol_present else 0.0
                         for t in range(n_tasks):
                             prevalence_sum[t, ci] += prevalence_val
-                            if conf_hits:
-                                support_sum[t, ci] += float(np.sum(attn_norm[t, conf_hits]))
-                            elif mol_present:
-                                support_sum[t, ci] += 1.0
+                            contrib = 0.0
+                            if modality == "3d_geom":
+                                if conf_hits:
+                                    contrib = float(np.sum(attn_geom_norm[t, conf_hits]))
+                            elif modality == "3d_qm":
+                                if conf_hits:
+                                    contrib = float(np.sum(attn_qm_norm[t, conf_hits]))
+                            else:
+                                # 2D concepts are molecule-level and have no conformer-attention support.
+                                # Keep their prevalence, but keep attention_support strictly 3D-attention-based.
+                                contrib = 0.0
+                            support_sum[t, ci] += float(contrib)
+                            activity_row[t, ci] = float(contrib)
 
                     sample_mol_ids.append(mol_id)
                     sample_has_concept.append(has_concept)
+                    if sample_activity is not None:
+                        sample_activity.append(activity_row)
                     activations.append(batch_act[b].astype(np.float32))
 
                     sample_inputs.append(
@@ -653,8 +824,9 @@ class MILLambdaVolFrameProvider:
         witness_rate = (witness_sum / float(n_samples)).astype(np.float32)
 
         tcav_scores = np.zeros((n_tasks, n_concepts), dtype=np.float32)
+        tcav_summary_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
         if len(sample_mol_ids) >= max(self.tcav_min_concept_samples * 2, 8):
-            tcav_scores = self._compute_tcav_matrix(
+            tcav_scores, tcav_summary_by_pair = self._compute_tcav_matrix(
                 model=model,
                 device=device,
                 epoch=int(epoch),
@@ -668,11 +840,13 @@ class MILLambdaVolFrameProvider:
             concept_ids=self.concept_ids,
             attention_support=attention_support,
             prevalence=prevalence,
+            concept_modality_map=self.concept_modality_map,
         )
         tcav_df = _build_tcav_df(
             task_ids=self.task_ids,
             concept_ids=self.concept_ids,
             tcav_matrix=tcav_scores,
+            tcav_summary_by_pair=tcav_summary_by_pair,
         )
 
         task_attention_df = pd.DataFrame(
@@ -690,12 +864,23 @@ class MILLambdaVolFrameProvider:
             witness_rate=witness_rate,
         )
 
+        if sample_activity:
+            activity_tensor = np.stack(sample_activity, axis=0).astype(np.float32)  # [N, T, C]
+            activity_tensor = np.transpose(activity_tensor, (1, 0, 2))  # [T, N, C]
+        else:
+            activity_tensor = None
+
         return LightningEpochFrames(
             tcav_df=tcav_df,
             concept_attention_df=concept_attention_df,
             task_attention_df=task_attention_df,
             task_metrics_df=task_metrics_df,
             context_covariates=context_covariates,
+            ricci_payload=(
+                None
+                if activity_tensor is None
+                else {"concept_activity_samples": activity_tensor}
+            ),
         )
 
     def _compute_tcav_matrix(
@@ -707,8 +892,13 @@ class MILLambdaVolFrameProvider:
         sample_inputs: Sequence[dict[str, torch.Tensor]],
         sample_has_concept: np.ndarray,
         activation_matrix: np.ndarray,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, dict[tuple[str, str], dict[str, Any]]]:
         tcav_scores = np.zeros((len(self.task_ids), len(self.concept_ids)), dtype=np.float32)
+        tcav_summary_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+        repeat_report_rows: list[dict[str, Any]] = []
+        bonf_m = int(self.tcav_bonferroni_m)
+        if bonf_m <= 0:
+            bonf_m = int(max(1, len(self.concept_ids)))
         log_event(
             "INFO",
             "explainability.lambda_vol.tcav.compute.start",
@@ -716,6 +906,10 @@ class MILLambdaVolFrameProvider:
             n_tasks=int(len(self.task_ids)),
             n_concepts=int(len(self.concept_ids)),
             concept_source="chem_ace_memberships_from_hybrid_modal_spaces",
+            holdout_fraction=float(self.tcav_holdout_fraction),
+            holdout_min_samples=int(self.tcav_holdout_min_samples),
+            significance_alpha=float(self.tcav_significance_alpha),
+            bonferroni_m=int(bonf_m),
         )
 
         adapter = _MILTaskAdapter(model=model, task_ids=self.task_ids)
@@ -733,10 +927,27 @@ class MILLambdaVolFrameProvider:
                     continue
 
                 for ci, concept_id in enumerate(self.concept_ids):
-                    mask = sample_has_concept[:, ci]
+                    mask = np.asarray(sample_has_concept[:, ci], dtype=bool)
                     n_pos = int(mask.sum())
                     n_neg = int((~mask).sum())
                     if n_pos < self.tcav_min_concept_samples or n_neg < self.tcav_min_concept_samples:
+                        continue
+
+                    split_rng = np.random.default_rng(
+                        int(self.seed) + int(epoch) * 10007 + int(ti) * 137 + int(ci) * 17
+                    )
+                    train_mask, eval_mask, holdout_used = self._split_tcav_train_eval(
+                        concept_mask=mask,
+                        rng=split_rng,
+                    )
+                    pos_train_mask = np.asarray(mask & train_mask, dtype=bool)
+                    neg_train_mask = np.asarray((~mask) & train_mask, dtype=bool)
+                    grads_eval = grads[np.asarray(eval_mask, dtype=bool)]
+                    if grads_eval.ndim != 2 or grads_eval.shape[0] <= 0:
+                        continue
+                    n_train_pos = int(np.sum(pos_train_mask))
+                    n_train_neg = int(np.sum(neg_train_mask))
+                    if n_train_pos < self.tcav_min_concept_samples or n_train_neg < self.tcav_min_concept_samples:
                         continue
 
                     _cav_records, _tcav_records, summary = run_tcav_from_arrays(
@@ -745,27 +956,93 @@ class MILLambdaVolFrameProvider:
                         concept_id=str(concept_id),
                         task_id=str(task_id),
                         layer_name=str(self.layer_name),
-                        concept_embeddings=activation_matrix[mask],
-                        random_pool_embeddings=activation_matrix[~mask],
-                        target_gradients=grads,
+                        concept_embeddings=activation_matrix[pos_train_mask],
+                        random_pool_embeddings=activation_matrix[neg_train_mask],
+                        target_gradients=grads_eval,
                         config=CAVConfig(
                             classifier="logreg",
                             n_random_repeats=int(self.tcav_repeats),
                             random_counterexamples_per_repeat=int(self.tcav_random_counterexamples),
                             max_iter=1200,
+                            significance_alpha=float(self.tcav_significance_alpha),
+                            bonferroni_n_hypotheses=int(bonf_m),
                         ),
                         seed=int(self.seed + 1000 * int(epoch) + 10 * ti + ci),
                     )
                     tcav_scores[ti, ci] = float(summary.mean_sign_rate)
+                    tcav_summary_by_pair[(str(task_id), str(concept_id))] = {
+                        "tcav_p_value": (
+                            np.nan
+                            if summary.p_value_mean_sign_rate is None
+                            else float(summary.p_value_mean_sign_rate)
+                        ),
+                        "tcav_p_value_bonferroni": (
+                            np.nan
+                            if summary.p_value_mean_sign_rate_bonferroni is None
+                            else float(summary.p_value_mean_sign_rate_bonferroni)
+                        ),
+                        "tcav_significant_raw": int(bool(summary.is_significant_raw)),
+                        "tcav_significant_bonferroni": int(bool(summary.is_significant_bonferroni)),
+                        "tcav_repeat_significant_raw_fraction": float(summary.repeat_significant_raw_fraction),
+                        "tcav_repeat_significant_bonferroni_fraction": float(
+                            summary.repeat_significant_bonferroni_fraction
+                        ),
+                        "tcav_n_eval_samples": int(summary.n_eval_samples),
+                        "tcav_n_train_concept": int(n_train_pos),
+                        "tcav_n_train_random": int(n_train_neg),
+                        "tcav_holdout_used": int(bool(holdout_used)),
+                        "tcav_holdout_fraction": float(self.tcav_holdout_fraction if holdout_used else 0.0),
+                    }
+                    repeat_rows = summary.details.get("repeat_rows", [])
+                    if isinstance(repeat_rows, Sequence):
+                        for rr in repeat_rows:
+                            if not isinstance(rr, Mapping):
+                                continue
+                            row = dict(rr)
+                            row["epoch"] = int(epoch)
+                            row["task_id"] = str(task_id)
+                            row["concept_id"] = str(concept_id)
+                            row["holdout_used"] = int(bool(holdout_used))
+                            repeat_report_rows.append(row)
         model.zero_grad(set_to_none=True)
         valid_scores = int(np.isfinite(tcav_scores).sum())
+        n_sig = int(
+            sum(
+                1
+                for v in tcav_summary_by_pair.values()
+                if int(v.get("tcav_significant_bonferroni", 0)) > 0
+            )
+        )
         log_event(
             "INFO",
             "explainability.lambda_vol.tcav.compute.done",
             layer_name=str(self.layer_name),
             valid_scores=int(valid_scores),
+            n_significant_bonferroni=int(n_sig),
         )
-        return tcav_scores
+        if self.tcav_significance_report_dir is not None:
+            try:
+                out_dir = Path(self.tcav_significance_report_dir)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_csv = out_dir / f"tcav_significance_epoch_{int(epoch):04d}.csv"
+                pd.DataFrame(repeat_report_rows).to_csv(out_csv, index=False)
+                log_event(
+                    "INFO",
+                    "explainability.lambda_vol.tcav.significance_report",
+                    epoch=int(epoch),
+                    path=str(out_csv),
+                    n_rows=int(len(repeat_report_rows)),
+                    alpha=float(self.tcav_significance_alpha),
+                    bonferroni_m=int(bonf_m),
+                )
+            except Exception as exc:
+                log_event(
+                    "WARN",
+                    "explainability.lambda_vol.tcav.significance_report_failed",
+                    epoch=int(epoch),
+                    error=str(exc),
+                )
+        return tcav_scores, tcav_summary_by_pair
 
 
 
@@ -2398,12 +2675,22 @@ def build_lambda_vol_callback(
         concept_ids=tuple(concept_ids),
         concept_mol_map={cid: chem_bundle.concept_mol_map.get(cid, set()) for cid in concept_ids},
         concept_conf_map={cid: chem_bundle.concept_conf_map.get(cid, set()) for cid in concept_ids},
+        concept_modality_map={
+            cid: str(chem_bundle.concept_metadata.get(cid, {}).get("modality", "2d"))
+            for cid in concept_ids
+        },
         task_ids=tuple(TASK_COLS),
         layer_name=str(config.lambda_vol_layer_name),
         monitor_max_samples=int(config.lambda_vol_monitor_max_samples),
         tcav_repeats=int(config.lambda_vol_tcav_repeats),
         tcav_random_counterexamples=int(config.lambda_vol_random_counterexamples),
         tcav_min_concept_samples=int(config.lambda_vol_min_concept_samples),
+        tcav_holdout_fraction=float(config.lambda_vol_tcav_holdout_fraction),
+        tcav_holdout_min_samples=int(config.lambda_vol_tcav_holdout_min_samples),
+        tcav_significance_alpha=float(config.lambda_vol_tcav_significance_alpha),
+        tcav_bonferroni_m=int(config.lambda_vol_tcav_bonferroni_m),
+        tcav_significance_report_dir=(lv_out / "tcav_significance"),
+        collect_activity_for_ricci=bool(config.lambda_vol_run_ricci),
         seed=int(seed),
     )
 
@@ -3335,6 +3622,7 @@ def _discover_and_store_concepts_by_modality(
             "n_embeddings": int(len(emb)),
             "algorithms": ",".join(str(x) for x in pipeline.config.discovery.algorithms),
             "kmeans_k": int(pipeline.config.discovery.kmeans_k),
+            "kmeans_auto_max_k": int(pipeline.config.discovery.kmeans_auto_max_k),
         }
         if "hierarchical" in algo_keys:
             payload["hierarchical_max_samples"] = int(pipeline.config.discovery.hierarchical_max_samples)
@@ -3549,15 +3837,27 @@ def _build_concept_attention_df(
     concept_ids: Sequence[str],
     attention_support: np.ndarray,
     prevalence: np.ndarray,
+    concept_modality_map: Mapping[str, str] | None = None,
 ) -> pd.DataFrame:
+    modality_map = {
+        str(cid): str((concept_modality_map or {}).get(str(cid), "2d"))
+        for cid in concept_ids
+    }
     rows: list[dict[str, Any]] = []
     for ti, task_id in enumerate(task_ids):
+        denom = float(np.sum(np.asarray(attention_support[ti], dtype=np.float64)))
+        if denom <= 1e-12:
+            denom = 1.0
         for ci, concept_id in enumerate(concept_ids):
+            cid = str(concept_id)
+            attn_val = float(attention_support[ti, ci])
             rows.append(
                 {
                     "task_id": str(task_id),
-                    "concept_id": str(concept_id),
-                    "attention_support": float(attention_support[ti, ci]),
+                    "concept_id": cid,
+                    "modality": str(modality_map.get(cid, "2d")),
+                    "attention_support": attn_val,
+                    "attention_share": float(max(0.0, attn_val) / denom),
                     "prevalence": float(prevalence[ti, ci]),
                 }
             )
@@ -3570,17 +3870,23 @@ def _build_tcav_df(
     task_ids: Sequence[str],
     concept_ids: Sequence[str],
     tcav_matrix: np.ndarray,
+    tcav_summary_by_pair: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
 ) -> pd.DataFrame:
+    summary_map = {} if tcav_summary_by_pair is None else dict(tcav_summary_by_pair)
     rows: list[dict[str, Any]] = []
     for ti, task_id in enumerate(task_ids):
         for ci, concept_id in enumerate(concept_ids):
-            rows.append(
-                {
-                    "task_id": str(task_id),
-                    "concept_id": str(concept_id),
-                    "tcav": float(tcav_matrix[ti, ci]),
-                }
-            )
+            key = (str(task_id), str(concept_id))
+            row: dict[str, Any] = {
+                "task_id": str(task_id),
+                "concept_id": str(concept_id),
+                "tcav": float(tcav_matrix[ti, ci]),
+            }
+            extra = summary_map.get(key, {})
+            if isinstance(extra, Mapping) and len(extra) > 0:
+                for k, v in extra.items():
+                    row[str(k)] = v
+            rows.append(row)
     return pd.DataFrame(rows)
 
 

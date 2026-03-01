@@ -54,6 +54,14 @@ class LambdaVolArtifactExporter:
 
         concept_df = self._concept_rows_df(concept_rows)
         task_df = self._task_rows_df(task_rows)
+        attention_focus_csv: Optional[Path] = None
+        if not concept_df.empty:
+            attention_focus_df = self._build_attention_focus_df(
+                concept_df=concept_df,
+                concept_metadata=concept_metadata or {},
+            )
+            attention_focus_csv = out_dir / "attention_focus_top.csv"
+            attention_focus_df.to_csv(attention_focus_csv, index=False)
 
         long_csv = out_dir / "concept_pressure_long.csv"
         concept_df.to_csv(long_csv, index=False)
@@ -192,6 +200,9 @@ class LambdaVolArtifactExporter:
                 "recommendations_json": str(recommendations_json),
                 "diagnostics_md": str(diagnostics_md),
                 "heatmap_dir": str(out_dir / "heatmaps"),
+                "attention_focus_top_csv": (
+                    None if attention_focus_csv is None else str(attention_focus_csv)
+                ),
                 "ricci_edges_csv": (None if ricci_edges_csv is None else str(ricci_edges_csv)),
                 "ricci_summary_csv": (None if ricci_summary_csv is None else str(ricci_summary_csv)),
                 "ricci_flow_npz": (None if ricci_flow_npz is None else str(ricci_flow_npz)),
@@ -285,6 +296,56 @@ class LambdaVolArtifactExporter:
             )
             out = out.drop(columns=["extra"])
         return out.sort_values(["epoch", "task_id"]).reset_index(drop=True)
+
+    @staticmethod
+    def _build_attention_focus_df(
+        *,
+        concept_df: pd.DataFrame,
+        concept_metadata: Mapping[str, Mapping[str, Any]],
+    ) -> pd.DataFrame:
+        """
+        Build a compact table that directly answers:
+        "what did attention concentrate on per epoch/task?"
+        """
+        df = concept_df.loc[
+            :,
+            [
+                "epoch",
+                "task_id",
+                "concept_id",
+                "attention_support",
+                "prevalence",
+                "tcav",
+                "tcav_smoothed",
+                "rho",
+            ],
+        ].copy()
+        if df.empty:
+            return df
+
+        md_mod = {
+            str(cid): str(meta.get("modality", "2d"))
+            for cid, meta in concept_metadata.items()
+        }
+        md_label = {
+            str(cid): str(meta.get("label_auto") or "")
+            for cid, meta in concept_metadata.items()
+        }
+        df["modality"] = df["concept_id"].map(lambda x: md_mod.get(str(x), "2d"))
+        df["label_auto"] = df["concept_id"].map(lambda x: md_label.get(str(x), ""))
+
+        # Attention share is computed only over positive attention concepts.
+        grp = df.groupby(["epoch", "task_id"], sort=False)["attention_support"]
+        denom = grp.transform(lambda s: float(max(1e-12, float(np.sum(np.maximum(s.to_numpy(dtype=np.float64), 0.0))))))
+        df["attention_share"] = np.maximum(df["attention_support"].to_numpy(dtype=np.float64), 0.0) / denom
+        df["attention_rank"] = (
+            df.groupby(["epoch", "task_id"], sort=False)["attention_support"]
+            .rank(method="first", ascending=False)
+            .astype(int)
+        )
+        # Keep top rows for readability while preserving all tasks/epochs.
+        out = df[df["attention_rank"] <= 20].copy()
+        return out.sort_values(["epoch", "task_id", "attention_rank", "concept_id"]).reset_index(drop=True)
 
     @staticmethod
     def _ricci_edges_df(rows: Sequence[RicciEdgeMetrics]) -> pd.DataFrame:

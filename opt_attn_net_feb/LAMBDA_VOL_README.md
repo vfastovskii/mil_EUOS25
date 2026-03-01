@@ -11,6 +11,13 @@ For full Ricci geometry details (formulas, thresholds, artifact schema, interpre
 - Per-epoch concept pressure tracking:
   - `TCAV[x,y,t]`, `delta_TCAV`, `attention_support`, `prevalence`, `rho[x,y,t]`
   - task metrics: attention entropy, witness rate, train/val metrics, loss, calibration error
+  - attention semantics are strict:
+    - `attention_support` is computed only from 3D conformer attention (`3d_geom`, `3d_qm`)
+    - `2d` concepts contribute via `TCAV` + `prevalence`, not synthetic attention mass
+- TCAV protocol hardening:
+  - CAV fit on monitor-train split
+  - directional-derivative evaluation on holdout split when feasible
+  - repeat-level raw and Bonferroni-corrected significance logging
 - Regime inference `q(t)`:
   - rule-based regimes: `warmup`, `fitting`, `stable_generalization`, `overfit_onset`, `refit`
   - classifier interface stub for future learned regime labeling
@@ -21,7 +28,10 @@ For full Ricci geometry details (formulas, thresholds, artifact schema, interpre
   - concentration/collapse (`top-k mass`, entropy drop)
   - blocked concept positive drift
 - Ricci geometry diagnostics + flow (new):
-  - per-task concept graph construction from `rho/attention/prevalence + TCAV-history corr`
+  - per-task concept graph construction from sparse co-activation in top concepts
+  - node score per concept: `w_tcav * tcav_ema + w_attention * attn_ema` (2D uses `w_attn=0`)
+  - same-modality edges from Jaccard/co-occurrence
+  - cross-modality edges from weighted co-activation in the same molecules
   - Forman-Ricci edge curvature per epoch
   - Ricci-flow-style edge reweighting
   - bridge/bottleneck alerts from negative-curvature structure
@@ -73,15 +83,23 @@ This produces:
 - `/tmp/lambda_vol_demo/<run_id>/concept_pressure_tensors.npz`
 - `/tmp/lambda_vol_demo/<run_id>/concept_pressure_long.csv`
 - `/tmp/lambda_vol_demo/<run_id>/task_metrics_long.csv`
+- `/tmp/lambda_vol_demo/<run_id>/attention_focus_top.csv`
 - `/tmp/lambda_vol_demo/<run_id>/metadata.json`
 - `/tmp/lambda_vol_demo/<run_id>/alerts.json`
 - `/tmp/lambda_vol_demo/<run_id>/recommendations.json`
-- `/tmp/lambda_vol_demo/<run_id>/ricci_edges_long.csv`
-- `/tmp/lambda_vol_demo/<run_id>/ricci_task_summary.csv`
-- `/tmp/lambda_vol_demo/<run_id>/ricci_flow_tensors.npz`
 - `/tmp/lambda_vol_demo/<run_id>/pressure_lattice.html` (if Plotly installed)
 - `/tmp/lambda_vol_demo/<run_id>/concept_manifold_<task>.html` (if Plotly installed)
 - `/tmp/lambda_vol_demo/lambda_vol_demo_summary.json`
+
+Ricci-specific files are produced only when `--lambda_vol_run_ricci` is enabled:
+
+- `/tmp/lambda_vol_demo/<run_id>/ricci_edges_long.csv`
+- `/tmp/lambda_vol_demo/<run_id>/ricci_task_summary.csv`
+- `/tmp/lambda_vol_demo/<run_id>/ricci_flow_tensors.npz`
+
+In MIL final runs, Lambda-Vol additionally writes per-epoch TCAV significance tables:
+
+- `<lambda_vol_output_dir>/tcav_significance/tcav_significance_epoch_XXXX.csv`
 
 ## Integrating into training
 
@@ -108,6 +126,38 @@ Use `/Users/vfastovskii/Desktop/mil_explainability_2026/opt_attn_net_feb/explain
 - Implement `LightningFrameProvider.collect_epoch_frames(...)` to return DataFrames.
 - Attach `LambdaVolLightningCallback` to `Trainer(callbacks=[...])`.
 
+## TCAV controls (pipeline)
+
+When running `hpo_pipeline.py` / `opt_net_fast.py`, TCAV monitor controls include:
+
+- `--lambda_vol_layer_name` (default `mixer_post_norm`)
+- `--lambda_vol_top_concepts` (default `0` -> all concepts)
+- `--lambda_vol_monitor_max_samples` (default `512`)
+- `--lambda_vol_tcav_repeats` (default `2`)
+- `--lambda_vol_random_counterexamples` (default `96`)
+- `--lambda_vol_min_concept_samples` (default `8`)
+- `--lambda_vol_tcav_holdout_fraction` (default `0.2`, `<=0` disables holdout)
+- `--lambda_vol_tcav_holdout_min_samples` (default `16`)
+- `--lambda_vol_tcav_significance_alpha` (default `0.05`)
+- `--lambda_vol_tcav_bonferroni_m` (default `0`, auto-uses current concept count)
+
+Significance export schema:
+
+- one row per `(epoch, task_id, concept_id, repeat_idx)`
+- includes:
+  - `sign_rate`, `mean_directional_derivative`
+  - `p_value_raw`, `p_value_bonferroni`
+  - `significant_raw`, `significant_bonferroni`
+  - `n_eval_samples`, `holdout_used`
+
+Attention concentration export:
+
+- `attention_focus_top.csv` includes per `(epoch, task)` top attention concepts with:
+  - `attention_support`
+  - `attention_share` (normalized within task/epoch)
+  - `attention_rank`
+  - `modality`, `label_auto`
+
 ## Ricci controls (pipeline)
 
 When running `hpo_pipeline.py` / `opt_net_fast.py`, Ricci monitoring is available via:
@@ -121,7 +171,12 @@ When running `hpo_pipeline.py` / `opt_net_fast.py`, Ricci monitoring is availabl
 - `--lambda_vol_ricci_use_flow_as_coupling` / `--no-lambda_vol_ricci_use_flow_as_coupling`
 - `--lambda_vol_ricci_coupling_strength`
 
-By default, Ricci is enabled for Lambda-Vol runs and exported as:
+Ricci defaults and exports:
+- `--lambda_vol_run_ricci` defaults to `False` (recommended baseline for speed/clarity)
+- when disabled, Ricci artifacts are not produced and no Ricci coupling is injected
+- enable Ricci only for dedicated geometry diagnostics runs
+
+When enabled, exported as:
 
 - `ricci_edges_long.csv`
 - `ricci_task_summary.csv`
@@ -129,14 +184,17 @@ By default, Ricci is enabled for Lambda-Vol runs and exported as:
 
 ### Ricci implementation summary
 
-- Concept graph edges are built from weighted combination of:
-  - pressure `rho`
-  - attention support
-  - prevalence
-  - absolute TCAV-history correlation
+- Concept node score is built from:
+  - `tcav_ema` for all concepts
+  - `attn_ema` for 3D concepts (`3d_geom`, `3d_qm`)
+- For each task/epoch, a top-k concept subset is selected before edge construction.
+- Concept graph edges are built from sample-level concept co-activation:
+  - same-modality: Jaccard/co-occurrence
+  - cross-modality: weighted overlap in the same molecules
 - Edges are sparsified by quantile/min-threshold + top-k per node.
 - Curvature uses Forman-Ricci style discrete edge curvature.
 - Flow iteratively updates edge lengths/weights (`flow_steps`, `flow_step_size`).
+- Ricci can run on interval (`update_interval_epochs`) instead of every epoch.
 - Optional: mean flowed similarity is injected as concept coupling in dynamics.
 - Detector emits Ricci alerts:
   - `ricci_negative_curvature_surge`

@@ -11,13 +11,13 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 if str(PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(PKG_ROOT))
 
-from ..explainability.chem_ace.analytics import ConceptQueryService
-from ..explainability.chem_ace.cav import run_tcav_from_arrays
-from ..explainability.chem_ace.config import CAVConfig, ConceptDiscoveryConfig
-from ..explainability.chem_ace.concepts import discover_concepts
-from ..explainability.chem_ace.db.repository import ChemACERepository
-from ..explainability.chem_ace.patches.base import make_patch_record
-from ..explainability.chem_ace.types import PatchEmbeddingRecord
+from opt_attn_net_feb.explainability.chem_ace.analytics import ConceptQueryService
+from opt_attn_net_feb.explainability.chem_ace.cav import run_tcav_from_arrays
+from opt_attn_net_feb.explainability.chem_ace.config import CAVConfig, ConceptDiscoveryConfig
+from opt_attn_net_feb.explainability.chem_ace.concepts import discover_concepts
+from opt_attn_net_feb.explainability.chem_ace.db.repository import ChemACERepository
+from opt_attn_net_feb.explainability.chem_ace.patches.base import make_patch_record
+from opt_attn_net_feb.explainability.chem_ace.types import PatchEmbeddingRecord
 
 
 class ChemACETest(unittest.TestCase):
@@ -92,6 +92,12 @@ class ChemACETest(unittest.TestCase):
         self.assertEqual(len(tcavs), 3)
         self.assertGreaterEqual(summary.mean_sign_rate, 0.0)
         self.assertLessEqual(summary.mean_sign_rate, 1.0)
+        self.assertGreaterEqual(summary.repeat_significant_raw_fraction, 0.0)
+        self.assertLessEqual(summary.repeat_significant_raw_fraction, 1.0)
+        self.assertGreaterEqual(summary.repeat_significant_bonferroni_fraction, 0.0)
+        self.assertLessEqual(summary.repeat_significant_bonferroni_fraction, 1.0)
+        self.assertIn("repeat_rows", summary.details)
+        self.assertEqual(len(summary.details.get("repeat_rows", [])), 3)
 
     def test_repository_and_queries(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -132,7 +138,7 @@ class ChemACETest(unittest.TestCase):
                 metadata={"m": 1},
             )
 
-            from explainability.chem_ace.types import ConceptCandidate, ConceptMembership, TCAVRecord
+            from opt_attn_net_feb.explainability.chem_ace.types import ConceptCandidate, ConceptMembership, TCAVRecord
 
             cand = ConceptCandidate(
                 concept_local_id="c1",

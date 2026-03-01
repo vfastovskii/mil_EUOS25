@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 
 import pandas as pd
 
@@ -23,6 +23,7 @@ class LambdaVolPyTorchAdapter:
         task_attention_df: Optional[pd.DataFrame] = None,
         task_metrics_df: Optional[pd.DataFrame] = None,
         context_covariates: Optional[Mapping[str, float]] = None,
+        ricci_payload: Optional[Mapping[str, Any]] = None,
     ) -> EpochStepResult:
         """Call this at the end of each epoch in a custom PyTorch loop."""
         return self.monitor.step_from_frames(
@@ -32,6 +33,7 @@ class LambdaVolPyTorchAdapter:
             task_attention_df=task_attention_df,
             task_metrics_df=task_metrics_df,
             context_covariates=context_covariates,
+            ricci_payload=ricci_payload,
         )
 
 

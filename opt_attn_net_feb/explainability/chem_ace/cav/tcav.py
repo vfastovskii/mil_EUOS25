@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 from math import comb
 from typing import Any, Iterable, Mapping, Optional, Sequence
@@ -68,6 +68,13 @@ class TCAVSummary:
     std_directional_derivative: float
     p_value_mean_sign_rate: Optional[float]
     n_repeats: int
+    p_value_mean_sign_rate_bonferroni: Optional[float] = None
+    is_significant_raw: bool = False
+    is_significant_bonferroni: bool = False
+    n_eval_samples: int = 0
+    repeat_significant_raw_fraction: float = 0.0
+    repeat_significant_bonferroni_fraction: float = 0.0
+    details: Mapping[str, Any] = field(default_factory=dict)
 
 
 
@@ -269,9 +276,16 @@ def run_tcav_from_arrays(
     sign_rates: list[float] = []
     mean_dds: list[float] = []
     n_pos_per_repeat: list[int] = []
+    pvals_per_repeat: list[float] = []
+    pvals_bonf_per_repeat: list[float] = []
+    n_sig_raw = 0
+    n_sig_bonf = 0
+    repeat_rows: list[dict[str, Any]] = []
 
     repeats = int(max(1, config.n_random_repeats))
     n_random = int(max(2, config.random_counterexamples_per_repeat))
+    alpha = float(np.clip(float(getattr(config, "significance_alpha", 0.05)), 1e-12, 1.0))
+    bonf_m = int(max(1, int(getattr(config, "bonferroni_n_hypotheses", 1))))
 
     for repeat_idx in range(repeats):
         repeat_seed = int(seed) + int(repeat_idx)
@@ -289,6 +303,11 @@ def run_tcav_from_arrays(
         sign_rate, mean_dd = directional_stats(fit.cav_vector, grads)
         n_pos = int(np.sum((grads @ fit.cav_vector.reshape(-1)) > 0.0))
         p_val = _binom_two_sided_p_value(n_pos, int(grads.shape[0]), p0=0.5)
+        p_val_bonf = float(min(1.0, float(p_val) * float(bonf_m)))
+        sig_raw = bool(float(p_val) < alpha)
+        sig_bonf = bool(float(p_val_bonf) < alpha)
+        n_sig_raw += int(sig_raw)
+        n_sig_bonf += int(sig_bonf)
 
         cav_records.append(
             CAVRecord(
@@ -304,6 +323,7 @@ def run_tcav_from_arrays(
                     "n_concept": int(x_pos.shape[0]),
                     "n_random": int(x_neg.shape[0]),
                     "classifier": str(config.classifier),
+                    "n_eval": int(grads.shape[0]),
                 },
             )
         )
@@ -320,17 +340,48 @@ def run_tcav_from_arrays(
                 tcav_mean_directional_derivative=float(mean_dd),
                 n_samples=int(grads.shape[0]),
                 p_value=float(p_val),
-                metadata={"repeat_idx": int(repeat_idx)},
+                metadata={
+                    "repeat_idx": int(repeat_idx),
+                    "p_value_bonferroni": float(p_val_bonf),
+                    "significant_raw": bool(sig_raw),
+                    "significant_bonferroni": bool(sig_bonf),
+                    "significance_alpha": float(alpha),
+                    "bonferroni_n_hypotheses": int(bonf_m),
+                },
             )
         )
 
         sign_rates.append(float(sign_rate))
         mean_dds.append(float(mean_dd))
         n_pos_per_repeat.append(int(n_pos))
+        pvals_per_repeat.append(float(p_val))
+        pvals_bonf_per_repeat.append(float(p_val_bonf))
+        repeat_rows.append(
+            {
+                "repeat_idx": int(repeat_idx),
+                "seed": int(repeat_seed),
+                "n_concept_train": int(x_pos.shape[0]),
+                "n_random_train": int(x_neg.shape[0]),
+                "n_eval": int(grads.shape[0]),
+                "tcav_sign_rate": float(sign_rate),
+                "tcav_mean_directional_derivative": float(mean_dd),
+                "p_value": float(p_val),
+                "p_value_bonferroni": float(p_val_bonf),
+                "significant_raw": bool(sig_raw),
+                "significant_bonferroni": bool(sig_bonf),
+            }
+        )
 
     pooled_n = int(len(n_pos_per_repeat) * int(grads.shape[0]))
     pooled_k = int(sum(n_pos_per_repeat))
     pooled_p = _binom_two_sided_p_value(pooled_k, pooled_n, p0=0.5) if pooled_n > 0 else None
+    pooled_p_bonf = (
+        None
+        if pooled_p is None
+        else float(min(1.0, float(pooled_p) * float(bonf_m)))
+    )
+    repeat_sig_raw_frac = float(n_sig_raw / float(max(1, repeats)))
+    repeat_sig_bonf_frac = float(n_sig_bonf / float(max(1, repeats)))
 
     summary = TCAVSummary(
         concept_id=str(concept_id),
@@ -343,6 +394,25 @@ def run_tcav_from_arrays(
         std_directional_derivative=float(np.std(mean_dds)),
         p_value_mean_sign_rate=(None if pooled_p is None else float(pooled_p)),
         n_repeats=int(len(sign_rates)),
+        p_value_mean_sign_rate_bonferroni=pooled_p_bonf,
+        is_significant_raw=(False if pooled_p is None else bool(float(pooled_p) < alpha)),
+        is_significant_bonferroni=(
+            False if pooled_p_bonf is None else bool(float(pooled_p_bonf) < alpha)
+        ),
+        n_eval_samples=int(grads.shape[0]),
+        repeat_significant_raw_fraction=float(repeat_sig_raw_frac),
+        repeat_significant_bonferroni_fraction=float(repeat_sig_bonf_frac),
+        details={
+            "significance_alpha": float(alpha),
+            "bonferroni_n_hypotheses": int(bonf_m),
+            "repeat_rows": repeat_rows,
+            "mean_repeat_p_value": float(np.mean(pvals_per_repeat)) if len(pvals_per_repeat) > 0 else 1.0,
+            "mean_repeat_p_value_bonferroni": (
+                float(np.mean(pvals_bonf_per_repeat)) if len(pvals_bonf_per_repeat) > 0 else 1.0
+            ),
+            "n_repeats_significant_raw": int(n_sig_raw),
+            "n_repeats_significant_bonferroni": int(n_sig_bonf),
+        },
     )
     return cav_records, tcav_records, summary
 

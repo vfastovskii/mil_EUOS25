@@ -30,6 +30,7 @@ class LightningEpochFrames:
     task_attention_df: Optional[pd.DataFrame] = None
     task_metrics_df: Optional[pd.DataFrame] = None
     context_covariates: Optional[Mapping[str, float]] = None
+    ricci_payload: Optional[Mapping[str, Any]] = None
 
 
 class LightningFrameProvider(Protocol):
@@ -68,6 +69,7 @@ class LambdaVolLightningCallback(Callback):
             task_attention_df=frames.task_attention_df,
             task_metrics_df=frames.task_metrics_df,
             context_covariates=frames.context_covariates,
+            ricci_payload=frames.ricci_payload,
         )
         logger.info(
             "Lambda-Vol callback epoch end",

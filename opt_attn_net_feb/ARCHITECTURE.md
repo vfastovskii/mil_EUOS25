@@ -1028,6 +1028,18 @@ For task `x`, concept `y`, epoch `t`:
   - `prevalence[x,y,t]`
   - task-level entropy/witness/train/val/loss/calibration
 
+TCAV evaluation protocol in current runtime:
+- CAV is trained on monitor-train split.
+- Directional-derivative scoring is evaluated on monitor-holdout split when feasible.
+- Holdout behavior is controlled by:
+  - `lambda_vol_tcav_holdout_fraction` (default `0.2`; `<=0` disables holdout)
+  - `lambda_vol_tcav_holdout_min_samples` (default `16`)
+- Repeat-level significance is computed with:
+  - raw binomial p-values
+  - Bonferroni-corrected p-values
+  - configurable `lambda_vol_tcav_significance_alpha` (default `0.05`)
+  - configurable `lambda_vol_tcav_bonferroni_m` (default `0` -> auto concept count)
+
 Smoothing and drift:
 - `tcav_smoothed_t = beta * tcav_smoothed_{t-1} + (1-beta)*tcav_t` with `beta = tcav_ema_beta`
 - `delta_tcav_t = tcav_t - tcav_{t-1}`
@@ -1144,6 +1156,7 @@ Exporter writes under `<lambda_vol_output_dir>/<run_id>/`:
 - `diagnostics_summary.md`
 - optional VTK (`concept_pressure.vtp`)
 - `metadata.json`
+- `tcav_significance/tcav_significance_epoch_XXXX.csv`
 
 ### 15.7 Lambda-Vol persistence schema
 
@@ -1177,6 +1190,7 @@ When enabled in final run:
 4. On each validation epoch end:
    - monitor loader sampled from leaderboard set
    - per-epoch frames collected (TCAV + attention + task metrics)
+   - TCAV uses holdout-eval protocol and writes repeat-level significance report
    - monitor step updates rho/regime/dynamics/alerts/recommendations and DB
 5. On fit end:
    - Lambda-Vol exports finalized artifacts
@@ -1289,8 +1303,8 @@ Graceful degradation:
 - Intended for monitoring/control signals, not mechanistic simulation.
 
 5. Chem-ACE integrated embedding strategy in final pipeline
-- Uses fused feature vectors (`2D + 3D/QM + descriptors`) rather than model-layer activations.
-- This is deliberate for deterministic, scalable concept extraction over large datasets.
+- Uses modality-separated hybrid local+context spaces (`2d`, `3d_geom`, `3d_qm`) for discovery.
+- This remains a deterministic/scalable approximation versus strict ACE discovery directly in model bottleneck activations.
 
 6. Objective choice
 - `macro_plus_min` explicitly trades global gain vs weakest-task protection.
@@ -1472,6 +1486,10 @@ This section lists defaults exactly as defined in typed configs and CLI parser, 
 - `lambda_vol_tcav_repeats = 2`
 - `lambda_vol_random_counterexamples = 96`
 - `lambda_vol_min_concept_samples = 8`
+- `lambda_vol_tcav_holdout_fraction = 0.2`
+- `lambda_vol_tcav_holdout_min_samples = 16`
+- `lambda_vol_tcav_significance_alpha = 0.05`
+- `lambda_vol_tcav_bonferroni_m = 0` (`<=0` auto-uses number of concepts in scope)
 
 ### 23.10 CLI parser defaults (`entrypoints/hpo_pipeline.py`)
 
@@ -1532,6 +1550,10 @@ Explainability:
 - `--lambda_vol_tcav_repeats 2`
 - `--lambda_vol_random_counterexamples 96`
 - `--lambda_vol_min_concept_samples 8`
+- `--lambda_vol_tcav_holdout_fraction 0.2`
+- `--lambda_vol_tcav_holdout_min_samples 16`
+- `--lambda_vol_tcav_significance_alpha 0.05`
+- `--lambda_vol_tcav_bonferroni_m 0` (`<=0` auto-uses number of concepts in scope)
 - `--concept_rl_top_k_per_task 8` (`<=0` means all passing concepts, uncapped)
 
 ---
@@ -1583,7 +1605,11 @@ Detailed Ricci reference:
 
 The explainability pack now includes a discrete graph-Ricci module integrated into Lambda-Vol epoch monitoring:
 
-- Build per-task concept graph from `rho`, `attention_support`, `prevalence`, and absolute TCAV-history correlation.
+- Build per-task concept graph from sparse concept co-activation (not global prevalence/correlation mix).
+- Node score per concept is `w_tcav * tcav_ema + w_attention * attn_ema` (2D concepts force `w_attn=0`).
+- Keep top-k concepts per task/epoch before edge construction.
+- Same-modality edges use Jaccard/co-occurrence.
+- Cross-modality (2D<->3D) edges use weighted overlap in the same molecules.
 - Compute Forman-Ricci curvature on concept edges.
 - Run Ricci-flow-style edge reweighting (iterative length update; similarity is inverse length).
 - Export per-edge/per-task geometry artifacts:

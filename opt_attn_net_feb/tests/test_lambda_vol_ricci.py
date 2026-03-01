@@ -11,15 +11,15 @@ if str(PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(PKG_ROOT))
 
 try:
-    from ..explainability.lambda_vol.config import DetectorConfig, RicciConfig
-    from ..explainability.lambda_vol.detectors import ConceptPressureDetector
-    from ..explainability.lambda_vol.ricci import ConceptRicciFlowAnalyzer
-    from ..explainability.lambda_vol.types import RicciTaskSummary
+    from opt_attn_net_feb.explainability.lambda_vol.config import DetectorConfig, RicciConfig
+    from opt_attn_net_feb.explainability.lambda_vol.detectors import ConceptPressureDetector
+    from opt_attn_net_feb.explainability.lambda_vol.ricci import ConceptRicciFlowAnalyzer
+    from opt_attn_net_feb.explainability.lambda_vol.types import RicciTaskSummary
 except Exception:  # pragma: no cover
-    from ..explainability.lambda_vol.config import DetectorConfig, RicciConfig
-    from ..explainability.lambda_vol.detectors import ConceptPressureDetector
-    from ..explainability.lambda_vol.ricci import ConceptRicciFlowAnalyzer
-    from ..explainability.lambda_vol.types import RicciTaskSummary
+    from opt_attn_net_feb.explainability.lambda_vol.config import DetectorConfig, RicciConfig
+    from opt_attn_net_feb.explainability.lambda_vol.detectors import ConceptPressureDetector
+    from opt_attn_net_feb.explainability.lambda_vol.ricci import ConceptRicciFlowAnalyzer
+    from opt_attn_net_feb.explainability.lambda_vol.types import RicciTaskSummary
 
 
 class LambdaVolRicciTest(unittest.TestCase):
@@ -30,18 +30,20 @@ class LambdaVolRicciTest(unittest.TestCase):
         analyzer = ConceptRicciFlowAnalyzer(
             task_ids=task_ids,
             concept_ids=concept_ids,
+            concept_modalities=["2d", "2d", "3d_geom", "3d_qm"],
             config=RicciConfig(
                 enabled=True,
                 edge_keep_quantile=0.4,
                 min_edge_weight=0.01,
                 top_k_per_node=2,
+                node_top_k_per_task=4,
                 flow_enabled=True,
                 flow_steps=3,
                 flow_step_size=0.2,
             ),
         )
 
-        rho = np.asarray(
+        tcav = np.asarray(
             [
                 [0.40, 0.32, 0.06, 0.10],
                 [0.30, 0.20, 0.15, 0.04],
@@ -55,38 +57,24 @@ class LambdaVolRicciTest(unittest.TestCase):
             ],
             dtype=np.float32,
         )
-        prev = np.asarray(
-            [
-                [0.25, 0.20, 0.04, 0.06],
-                [0.21, 0.15, 0.12, 0.02],
-            ],
-            dtype=np.float32,
-        )
-        tcav_hist = {
-            "t0": np.asarray(
-                [
-                    [0.10, 0.08, 0.00, 0.02],
-                    [0.12, 0.09, 0.01, 0.03],
-                    [0.14, 0.10, 0.01, 0.04],
-                ],
-                dtype=np.float32,
-            ),
-            "t1": np.asarray(
-                [
-                    [0.07, 0.06, 0.03, 0.00],
-                    [0.09, 0.06, 0.04, 0.01],
-                    [0.10, 0.07, 0.05, 0.01],
-                ],
-                dtype=np.float32,
-            ),
-        }
+        n_samples = 24
+        concept_activity = np.zeros((len(task_ids), n_samples, len(concept_ids)), dtype=np.float32)
+        # task 0: c0/c1 co-activate strongly; c2/c3 co-activate with attention-weighted mass
+        concept_activity[0, :12, 0] = 1.0
+        concept_activity[0, :10, 1] = 1.0
+        concept_activity[0, 8:18, 2] = 0.8
+        concept_activity[0, 9:19, 3] = 0.7
+        # task 1: weaker but still non-trivial co-activation structure
+        concept_activity[1, 3:14, 0] = 1.0
+        concept_activity[1, 4:12, 1] = 1.0
+        concept_activity[1, 10:20, 2] = 0.6
+        concept_activity[1, 11:22, 3] = 0.5
 
         out = analyzer.analyze_epoch(
             epoch=3,
-            rho=rho,
+            tcav_smoothed=tcav,
             attention_support=attn,
-            prevalence=prev,
-            tcav_history_by_task=tcav_hist,
+            concept_activity_samples=concept_activity,
         )
 
         self.assertEqual(len(out.task_summaries), len(task_ids))

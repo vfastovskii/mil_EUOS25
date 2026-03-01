@@ -19,15 +19,27 @@ class TrackerConfig:
 class RicciConfig:
     """Discrete graph-Ricci diagnostics and flow settings."""
 
-    enabled: bool = True
+    enabled: bool = False
+    # Graph rebuild cadence (in epochs). 1 => every epoch, 2 => every 2 epochs.
+    update_interval_epochs: int = 2
+    # Keep only top-k concepts per task by node score before edge construction.
+    # <=0 disables this prefilter.
+    node_top_k_per_task: int = 128
+    # Keep only top-contributing samples per task before co-activation edges.
+    # 0.5 keeps top 50% by sample activity score.
+    sample_keep_quantile: float = 0.50
     edge_keep_quantile: float = 0.75
     min_edge_weight: float = 0.05
     top_k_per_node: int = 4
 
-    w_rho: float = 0.40
-    w_attention: float = 0.30
-    w_prevalence: float = 0.15
-    w_tcav_corr: float = 0.15
+    # Node score = w_tcav * tcav_ema + w_attention * attention_support
+    # (for 2D concepts, attention term is forced to 0).
+    w_tcav: float = 0.60
+    w_attention: float = 0.40
+    # Legacy fields kept for backward compatibility with old serialized configs.
+    w_rho: float = 0.0
+    w_prevalence: float = 0.0
+    w_tcav_corr: float = 0.0
 
     negative_curvature_threshold: float = -0.15
     strong_negative_curvature_threshold: float = -0.35

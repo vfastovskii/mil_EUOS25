@@ -174,15 +174,27 @@ Detailed Ricci-flow documentation:
 Useful controls:
 
 - `--lambda_vol_layer_name mixer_post_norm`
-- `--lambda_vol_top_concepts 24`
+- `--lambda_vol_top_concepts 0` (`<=0` uses all Chem-ACE concepts)
 - `--lambda_vol_monitor_max_samples 512`
 - `--lambda_vol_tcav_repeats 2`
+- `--lambda_vol_tcav_holdout_fraction 0.2` (`<=0` disables holdout)
+- `--lambda_vol_tcav_holdout_min_samples 16`
+- `--lambda_vol_tcav_significance_alpha 0.05`
+- `--lambda_vol_tcav_bonferroni_m 0` (`<=0` auto-uses current concept count)
 - `--lambda_vol_output_dir /path/to/lambda_vol_out`
 - `--lambda_vol_run_ricci` / `--no-lambda_vol_run_ricci`
 - `--lambda_vol_ricci_edge_keep_quantile 0.75`
 - `--lambda_vol_ricci_flow_steps 8`
 - `--lambda_vol_ricci_flow_step_size 0.12`
 - `--lambda_vol_ricci_use_flow_as_coupling` / `--no-lambda_vol_ricci_use_flow_as_coupling`
+
+TCAV significance behavior in Lambda-Vol:
+
+- CAV is fit on monitor-train split (holdout disabled when `--lambda_vol_tcav_holdout_fraction <= 0`).
+- Directional-derivative TCAV is evaluated on holdout split when feasible.
+- Repeat-level raw and Bonferroni-corrected significance are computed per `(epoch, task, concept)`.
+- Per-epoch report is exported to:
+  - `<lambda_vol_output_dir>/tcav_significance/tcav_significance_epoch_XXXX.csv`
 
 ## Enable concept-guided RL control during final training
 
@@ -239,6 +251,8 @@ Final outputs include:
   - `concept_tags_calibrated.csv`
   - `concept_tags_calibration_summary.json`
 - Lambda-Vol tensor/log/html artifacts in `lambda_vol_output_dir` (or `<study_dir>/lambda_vol`)
+- Lambda-Vol TCAV significance reports:
+  - `<lambda_vol_output_dir>/tcav_significance/tcav_significance_epoch_XXXX.csv`
 - Concept-RL policy history JSON (`concept_rl_policy_history.json`) inside final run directory when enabled
 - Ricci artifacts (`ricci_edges_long.csv`, `ricci_task_summary.csv`, `ricci_flow_tensors.npz`) inside Lambda-Vol output
 - Prediction explanations CSV (`*_explained.csv`) with per-task text explanations when Chem-ACE is enabled

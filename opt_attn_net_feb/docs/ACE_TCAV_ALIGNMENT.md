@@ -91,6 +91,8 @@ Partially aligned.
 
 - Current implementation uses repeated random counterexample draws and reports per-repeat binomial p-values on sign-rate.
 - Summary p-value is computed via pooled binomial test across repeats.
+- Bonferroni-corrected p-values and corrected significance flags are produced (repeat-level and pooled).
+- Lambda-Vol runtime now evaluates directional derivatives on holdout split (when feasible), with CAV fit on monitor-train split.
 - It still does not implement the paper-style random-concept baseline hypothesis test (e.g., comparing against a bank of random concepts with statistical test over repeats).
 
 Code:
@@ -118,4 +120,4 @@ Code:
 ## 4) Open Items
 
 - Add optional strict ACE runtime mode that discovers concepts directly from model activations (`masked_input` / `node_pooling`) instead of hybrid engineered vectors.
-- Add optional TCAV random-concept significance track to match original TCAV statistical protocol more closely.
+- Add optional TCAV random-concept baseline track to match original TCAV statistical protocol more closely.

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-from typing import Mapping, Optional, Sequence
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -23,57 +23,93 @@ class RicciEpochOutput:
 
 
 class ConceptRicciFlowAnalyzer:
-    """Builds concept graphs and applies discrete Ricci-flow-style reweighting."""
+    """
+    Build concept graph from co-activation and apply discrete Ricci-flow-style reweighting.
+
+    Node scores (per task/concept/epoch):
+      score = w_tcav * tcav_ema + w_attention * attn_ema (2D forces attention term to 0).
+
+    Edge construction:
+      - same modality: Jaccard/co-occurrence over sample-level concept activity.
+      - cross modality: weighted co-activation using per-sample min/max overlap.
+      - edge weight scales by sqrt(score_i * score_j).
+    """
+
+    _VALID_MODALITIES = {"2d", "3d_geom", "3d_qm"}
 
     def __init__(
         self,
         *,
         task_ids: Sequence[str],
         concept_ids: Sequence[str],
+        concept_modalities: Sequence[str],
         config: RicciConfig,
     ) -> None:
         self.task_ids = tuple(str(x) for x in task_ids)
         self.concept_ids = tuple(str(x) for x in concept_ids)
         self.config = config
-
         if len(self.task_ids) == 0:
             raise ValueError("task_ids cannot be empty")
         if len(self.concept_ids) < 2:
             raise ValueError("concept_ids must contain at least 2 concepts")
+        if len(concept_modalities) != len(self.concept_ids):
+            raise ValueError("concept_modalities length mismatch")
+
+        self.concept_modalities = tuple(
+            (m if str(m) in self._VALID_MODALITIES else "2d")
+            for m in (str(x) for x in concept_modalities)
+        )
 
     def analyze_epoch(
         self,
         *,
         epoch: int,
-        rho: np.ndarray,
+        tcav_smoothed: np.ndarray,
         attention_support: np.ndarray,
-        prevalence: np.ndarray,
-        tcav_history_by_task: Optional[Mapping[str, np.ndarray]] = None,
+        concept_activity_samples: Optional[np.ndarray] = None,
     ) -> RicciEpochOutput:
-        """Compute per-task curvature diagnostics and flowed similarity graphs."""
-        rho_m = np.asarray(rho, dtype=np.float32)
+        """
+        Compute per-task curvature diagnostics and flowed similarity graphs.
+
+        Parameters
+        ----------
+        tcav_smoothed:
+            [T, C] task-concept TCAV EMA matrix.
+        attention_support:
+            [T, C] task-concept attention support matrix.
+        concept_activity_samples:
+            Optional [T, N, C] sample-level concept activities.
+            For 3D concepts this should be attention-derived mass; for 2D binary/continuous
+            molecule-level concept activity.
+        """
+        tcav_m = np.asarray(tcav_smoothed, dtype=np.float32)
         attn_m = np.asarray(attention_support, dtype=np.float32)
-        prev_m = np.asarray(prevalence, dtype=np.float32)
         expected_shape = (len(self.task_ids), len(self.concept_ids))
-        if rho_m.shape != expected_shape:
-            raise ValueError(f"rho shape mismatch: expected {expected_shape}, got {rho_m.shape}")
-        if attn_m.shape != expected_shape or prev_m.shape != expected_shape:
-            raise ValueError("attention_support/prevalence shape mismatch")
+        if tcav_m.shape != expected_shape:
+            raise ValueError(f"tcav_smoothed shape mismatch: expected {expected_shape}, got {tcav_m.shape}")
+        if attn_m.shape != expected_shape:
+            raise ValueError(f"attention_support shape mismatch: expected {expected_shape}, got {attn_m.shape}")
+
+        activity = None
+        if concept_activity_samples is not None:
+            arr = np.asarray(concept_activity_samples, dtype=np.float32)
+            if arr.ndim == 3 and arr.shape[0] == expected_shape[0] and arr.shape[2] == expected_shape[1]:
+                activity = np.maximum(arr, 0.0)
 
         flowed_stack = np.zeros((len(self.task_ids), len(self.concept_ids), len(self.concept_ids)), dtype=np.float32)
         edge_rows: list[RicciEdgeMetrics] = []
         summaries: list[RicciTaskSummary] = []
 
         for ti, task_id in enumerate(self.task_ids):
-            tcav_hist = None
-            if tcav_history_by_task is not None:
-                tcav_hist = tcav_history_by_task.get(str(task_id))
-
-            sim = self._build_similarity(
-                rho=np.asarray(rho_m[ti], dtype=np.float32),
+            act_t = None if activity is None else np.asarray(activity[ti], dtype=np.float32)  # [N, C]
+            scores = self._node_scores(
+                tcav=np.asarray(tcav_m[ti], dtype=np.float32),
                 attention=np.asarray(attn_m[ti], dtype=np.float32),
-                prevalence=np.asarray(prev_m[ti], dtype=np.float32),
-                tcav_history=tcav_hist,
+                activity=act_t,
+            )
+            sim = self._build_similarity_from_coactivation(
+                node_scores=scores,
+                activity=act_t,
             )
             curvature = self._forman_curvature(sim)
             sim_flow = self._run_ricci_flow(sim)
@@ -105,79 +141,166 @@ class ConceptRicciFlowAnalyzer:
             mean_flowed_similarity=mean_flowed,
         )
 
-    def _build_similarity(
+    def _node_scores(
         self,
         *,
-        rho: np.ndarray,
+        tcav: np.ndarray,
         attention: np.ndarray,
-        prevalence: np.ndarray,
-        tcav_history: Optional[np.ndarray],
+        activity: Optional[np.ndarray],
     ) -> np.ndarray:
-        x_rho = np.maximum(np.asarray(rho, dtype=np.float64), 0.0)
-        x_attn = np.maximum(np.asarray(attention, dtype=np.float64), 0.0)
-        x_prev = np.maximum(np.asarray(prevalence, dtype=np.float64), 0.0)
-        x_corr = self._tcav_abs_corr(tcav_history, n_concepts=len(self.concept_ids))
-
-        sim_rho = np.sqrt(np.outer(x_rho, x_rho))
-        sim_attn = np.sqrt(np.outer(x_attn, x_attn))
-        sim_prev = np.sqrt(np.outer(x_prev, x_prev))
-
-        sim = (
-            float(self.config.w_rho) * sim_rho
-            + float(self.config.w_attention) * sim_attn
-            + float(self.config.w_prevalence) * sim_prev
-            + float(self.config.w_tcav_corr) * x_corr
-        )
-        np.fill_diagonal(sim, 0.0)
-
-        mx = float(np.max(sim))
+        tc = np.maximum(np.asarray(tcav, dtype=np.float64), 0.0)
+        att = np.maximum(np.asarray(attention, dtype=np.float64), 0.0)
+        out = float(self.config.w_tcav) * tc
+        for ci, mode in enumerate(self.concept_modalities):
+            if mode != "2d":
+                out[ci] += float(self.config.w_attention) * float(att[ci])
+        mx = float(np.max(out))
         if mx > 1e-12:
-            sim = sim / mx
+            out = out / mx
+            return out.astype(np.float32)
 
-        upper = sim[np.triu_indices(sim.shape[0], k=1)]
+        # Fallback: if all node scores are zero, derive weak ranking from observed activity.
+        if activity is not None and activity.ndim == 2 and activity.shape[1] == len(self.concept_ids):
+            mean_act = np.maximum(np.mean(np.asarray(activity, dtype=np.float64), axis=0), 0.0)
+            mx2 = float(np.max(mean_act))
+            if mx2 > 1e-12:
+                return (mean_act / mx2).astype(np.float32)
+        return np.zeros((len(self.concept_ids),), dtype=np.float32)
+
+    def _build_similarity_from_coactivation(
+        self,
+        *,
+        node_scores: np.ndarray,
+        activity: Optional[np.ndarray],
+    ) -> np.ndarray:
+        n_concepts = len(self.concept_ids)
+        sim = np.zeros((n_concepts, n_concepts), dtype=np.float64)
+        eps = 1e-12
+
+        selected = self._selected_concepts(node_scores=node_scores)
+        if selected.size < 2:
+            return sim.astype(np.float32)
+
+        if activity is None or activity.ndim != 2 or activity.shape[1] != n_concepts:
+            # Fallback for providers without sample-level activity:
+            # score-only sparse graph.
+            idx = selected
+            s = np.asarray(node_scores[idx], dtype=np.float64)
+            outer = np.sqrt(np.outer(s, s))
+            for ii, i in enumerate(idx):
+                for jj, j in enumerate(idx):
+                    if ii == jj:
+                        continue
+                    sim[i, j] = outer[ii, jj]
+            np.fill_diagonal(sim, 0.0)
+            return self._sparsify_similarity(sim.astype(np.float32))
+
+        act = np.maximum(np.asarray(activity, dtype=np.float64), 0.0)[:, selected]  # [N, K]
+        k = int(act.shape[1])
+        if int(act.shape[0]) <= 0:
+            return sim.astype(np.float32)
+
+        # Focus same-modality co-occurrence on top-contributing samples.
+        sample_keep_q = float(np.clip(getattr(self.config, "sample_keep_quantile", 0.5), 0.0, 1.0))
+        if 0.0 < sample_keep_q < 1.0 and act.shape[0] > 4:
+            s_sel = np.maximum(np.asarray(node_scores[selected], dtype=np.float64), 0.0)
+            sample_score = act @ s_sel
+            thr = float(np.quantile(sample_score, sample_keep_q))
+            keep = sample_score >= thr
+            if int(np.sum(keep)) >= 2:
+                act = act[keep]
+
+        # Normalize per concept to [0,1] for stable pairwise weighted overlap.
+        scale = np.maximum(np.max(act, axis=0, keepdims=True), eps)
+        act_n = act / scale
+        active_b = act_n > 0.0
+
+        for ii in range(k):
+            i = int(selected[ii])
+            si = float(node_scores[i])
+            if si <= 0.0:
+                continue
+            for jj in range(ii + 1, k):
+                j = int(selected[jj])
+                sj = float(node_scores[j])
+                if sj <= 0.0:
+                    continue
+
+                ai = act_n[:, ii]
+                aj = act_n[:, jj]
+                same_modality = self.concept_modalities[i] == self.concept_modalities[j]
+                if same_modality:
+                    bi = active_b[:, ii]
+                    bj = active_b[:, jj]
+                    union = float(np.sum(np.logical_or(bi, bj)))
+                    if union <= 0.0:
+                        continue
+                    inter = float(np.sum(np.logical_and(bi, bj)))
+                    jaccard = inter / union
+                    cooccur = inter / float(max(1, act.shape[0]))
+                    pair = 0.7 * jaccard + 0.3 * cooccur
+                else:
+                    # Cross-modality weighted co-activation:
+                    # high when both concepts are active in the same molecules
+                    # and 3D activity mass aligns with 2D concept presence.
+                    num = float(np.mean(np.minimum(ai, aj)))
+                    den = float(np.mean(np.maximum(ai, aj)))
+                    if den <= eps:
+                        continue
+                    pair = num / den
+
+                wij = float(pair) * float(np.sqrt(si * sj))
+                if wij <= 0.0:
+                    continue
+                sim[i, j] = wij
+                sim[j, i] = wij
+
+        np.fill_diagonal(sim, 0.0)
+        mx = float(np.max(sim))
+        if mx > eps:
+            sim = sim / mx
+        return self._sparsify_similarity(sim.astype(np.float32))
+
+    def _selected_concepts(self, *, node_scores: np.ndarray) -> np.ndarray:
+        n_concepts = len(self.concept_ids)
+        top_k = int(getattr(self.config, "node_top_k_per_task", 0))
+        scores = np.asarray(node_scores, dtype=np.float64)
+        if top_k <= 0 or top_k >= n_concepts:
+            return np.arange(n_concepts, dtype=np.int64)
+        k = max(2, top_k)
+        idx = np.argpartition(scores, -k)[-k:]
+        # keep deterministic ordering by descending score then index
+        order = np.argsort(-scores[idx], kind="mergesort")
+        return idx[order].astype(np.int64)
+
+    def _sparsify_similarity(self, sim: np.ndarray) -> np.ndarray:
+        out = np.asarray(sim, dtype=np.float32).copy()
+        np.fill_diagonal(out, 0.0)
+        upper = out[np.triu_indices(out.shape[0], k=1)]
         positive = upper[upper > 0.0]
         if positive.size == 0:
-            return np.zeros_like(sim, dtype=np.float32)
+            return np.zeros_like(out, dtype=np.float32)
 
         q = float(np.clip(self.config.edge_keep_quantile, 0.0, 1.0))
         q_thr = float(np.quantile(positive, q))
         thr = max(float(self.config.min_edge_weight), q_thr)
-        keep = sim >= thr
+        keep = out >= thr
 
         k = int(max(0, self.config.top_k_per_node))
         if k > 0:
-            n = sim.shape[0]
+            n = out.shape[0]
             kk = min(k, max(0, n - 1))
             if kk > 0:
                 for i in range(n):
-                    row = sim[i].copy()
+                    row = out[i].copy()
                     row[i] = -np.inf
                     top_idx = np.argpartition(row, -kk)[-kk:]
                     keep[i, top_idx] = True
 
         keep = np.logical_or(keep, keep.T)
-        sim = np.where(keep, sim, 0.0)
-        np.fill_diagonal(sim, 0.0)
-        return sim.astype(np.float32)
-
-    @staticmethod
-    def _tcav_abs_corr(history: Optional[np.ndarray], *, n_concepts: int) -> np.ndarray:
-        if history is None:
-            return np.zeros((n_concepts, n_concepts), dtype=np.float64)
-        arr = np.asarray(history, dtype=np.float64)
-        if arr.ndim != 2 or arr.shape[0] < 2 or arr.shape[1] != n_concepts:
-            return np.zeros((n_concepts, n_concepts), dtype=np.float64)
-        centered = arr - np.mean(arr, axis=0, keepdims=True)
-        std = np.std(centered, axis=0)
-        valid = std > 1e-12
-        if not np.any(valid):
-            return np.zeros((n_concepts, n_concepts), dtype=np.float64)
-        z = np.zeros_like(centered, dtype=np.float64)
-        z[:, valid] = centered[:, valid] / std[valid]
-        corr = (z.T @ z) / float(max(1, arr.shape[0]))
-        corr = np.nan_to_num(np.abs(corr), nan=0.0, posinf=0.0, neginf=0.0)
-        np.fill_diagonal(corr, 0.0)
-        return corr
+        out = np.where(keep, out, 0.0)
+        np.fill_diagonal(out, 0.0)
+        return out.astype(np.float32)
 
     @staticmethod
     def _forman_curvature(sim: np.ndarray) -> np.ndarray:

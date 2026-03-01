@@ -80,6 +80,9 @@ class ConceptDiscoveryConfig:
     algorithms: tuple[str, ...] = ("kmeans",)
     # <=1 enables automatic k selection based on embedding count.
     kmeans_k: int = 0
+    # Hard ceiling used when kmeans_k<=1 auto mode is active.
+    # Keeps concept count interpretable and runtime stable at very large N.
+    kmeans_auto_max_k: int = 128
     # Use MiniBatchKMeans above this sample size to reduce memory pressure.
     kmeans_minibatch_over: int = 200000
     kmeans_minibatch_size: int = 4096
@@ -105,6 +108,10 @@ class CAVConfig:
     max_iter: int = 2000
     use_sign_rate: bool = True
     use_mean_directional_derivative: bool = True
+    # Significance threshold used for raw and corrected repeat-level decisions.
+    significance_alpha: float = 0.05
+    # Number of hypotheses for Bonferroni correction (<=0 means no correction).
+    bonferroni_n_hypotheses: int = 1
 
 
 @dataclass(frozen=True)

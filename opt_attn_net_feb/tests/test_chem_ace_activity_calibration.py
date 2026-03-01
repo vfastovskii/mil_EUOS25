@@ -10,13 +10,13 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 if str(PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(PKG_ROOT))
 
-from ..utils.constants import TASK_COLS
-from ..explainability.chem_ace.types import TagAssignment
-from ..explainability.chem_ace.semantics.calibration import (
+from opt_attn_net_feb.utils.constants import TASK_COLS
+from opt_attn_net_feb.explainability.chem_ace.types import TagAssignment
+from opt_attn_net_feb.explainability.chem_ace.semantics.calibration import (
     ActivityAwareSemanticCalibrator,
     ActivityCalibrationConfig,
 )
-from ..explainability.chem_ace.semantics.taggers import SemanticTaggingResult
+from opt_attn_net_feb.explainability.chem_ace.semantics.taggers import SemanticTaggingResult
 
 
 class ChemACEActivityCalibrationTest(unittest.TestCase):

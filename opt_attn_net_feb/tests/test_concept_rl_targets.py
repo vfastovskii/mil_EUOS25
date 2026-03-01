@@ -18,7 +18,7 @@ except Exception:
     _HAS_TORCH = False
 
 if _HAS_TORCH:
-    from training.explainability_runtime import (  # type: ignore
+    from opt_attn_net_feb.training.explainability_runtime import (  # type: ignore
         ChemACEBundle,
         FinalExplainabilityConfig,
         build_positive_concept_targets_with_report,

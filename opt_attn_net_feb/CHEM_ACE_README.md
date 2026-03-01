@@ -344,13 +344,14 @@ Discovery config defaults in `ConceptDiscoveryConfig`:
 
 - `algorithms=("kmeans",)`
 - `kmeans_k=0` (auto)
+- `kmeans_auto_max_k=128` (hard ceiling in auto mode)
 - `kmeans_minibatch_over=200000`
 - `kmeans_minibatch_size=4096`
 
 KMeans `k` resolution:
 
 - if `kmeans_k > 1`: use configured `k` (bounded to sample count)
-- else: `k = floor(sqrt(n_embeddings))` (bounded)
+- else: `k = floor(sqrt(n_embeddings))`, then clipped by `kmeans_auto_max_k`
 
 Optional algorithms still exist but are guarded for memory:
 
@@ -371,6 +372,11 @@ Modality separation:
   - `3d_qm:<sha1>`
 - merged concept view is created only after per-modality clustering and deduplication
 - frozen-centroid inference is also executed per modality
+
+Practical implication on large runs:
+
+- at `>1M` patch embeddings, auto mode will no longer explode to ~1000 clusters by default
+- effective `k` is now bounded by `kmeans_auto_max_k` unless you explicitly raise it
 
 Additional artifacts written by runtime:
 
@@ -421,6 +427,12 @@ TCAV note:
 
 - TCAV in Lambda-Vol is computed from model activations, not directly from raw descriptor values
 - using raw tables affects semantic label evidence, not the model activation geometry used for TCAV
+- Lambda-Vol TCAV now uses holdout evaluation by default:
+  - CAV fit on monitor-train split
+  - directional derivatives evaluated on monitor-holdout split when feasible
+- Per-epoch repeat-level significance tables are exported under:
+  - `<lambda_vol_output_dir>/tcav_significance/tcav_significance_epoch_XXXX.csv`
+- Significance columns include raw and Bonferroni-corrected p-values/flags.
 
 ## 12) Detailed Tagging Logs (Latest Update)
 
@@ -710,6 +722,7 @@ Final run summary output (`final_best_train_vs_leaderboard/explainability_artifa
 - Chem-ACE core artifacts
 - a priori views
 - activity-calibration artifacts
+- Lambda-Vol TCAV significance per-epoch CSVs (when Lambda-Vol is enabled)
 
 Advanced semantic evidence now also includes:
 
@@ -730,6 +743,8 @@ Chem-ACE concept maps feed:
 - Lambda-Vol concept-pressure tracking
 - Ricci diagnostics over concept relations
 - Concept-RL target concept selection
+  - targets are filtered to injectable concepts only (must have conformer support in train scope)
+  - this keeps RL aligned with attention-net controllable channels
 - text explanations exported with per-task predictions/attention
 
 ## 21) Known Limits and Practical Guidance

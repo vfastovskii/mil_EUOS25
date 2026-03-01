@@ -21,8 +21,8 @@ if str(PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(PKG_ROOT))
 
 if _HAS_TORCH:
-    from ..data.exports import export_leaderboard_attention
-    from ..utils.constants import TASK_COLS
+    from opt_attn_net_feb.data.exports import export_leaderboard_attention
+    from opt_attn_net_feb.utils.constants import TASK_COLS
 else:  # pragma: no cover - unavailable torch runtime
     TASK_COLS = ("t0", "t1", "t2", "t3")
     export_leaderboard_attention = None  # type: ignore

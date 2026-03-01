@@ -380,12 +380,25 @@ class ChemACEPipeline:
         algo_keys = tuple(str(x).lower() for x in self.config.discovery.algorithms)
         n_embeddings = int(len(embeddings))
         k_cfg = int(self.config.discovery.kmeans_k)
-        k_eff = int(max(2, min((int(np.sqrt(max(2, n_embeddings))) if k_cfg <= 1 else k_cfg), max(2, n_embeddings))))
+        if k_cfg > 1:
+            k_eff = int(max(2, min(k_cfg, max(2, n_embeddings))))
+        else:
+            k_eff = int(
+                max(
+                    2,
+                    min(
+                        int(np.sqrt(float(max(2, n_embeddings)))),
+                        int(max(2, self.config.discovery.kmeans_auto_max_k)),
+                        max(2, n_embeddings),
+                    ),
+                )
+            )
         config_payload: dict[str, object] = {
             "n_embeddings": int(n_embeddings),
             "algorithms": ",".join(str(x) for x in self.config.discovery.algorithms),
             "kmeans_k": int(k_cfg),
             "kmeans_k_effective": int(k_eff),
+            "kmeans_auto_max_k": int(self.config.discovery.kmeans_auto_max_k),
         }
         if "hierarchical" in algo_keys:
             config_payload["hierarchical_max_samples"] = int(self.config.discovery.hierarchical_max_samples)
