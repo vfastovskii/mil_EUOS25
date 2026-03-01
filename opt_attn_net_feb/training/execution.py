@@ -995,7 +995,8 @@ class MILFoldTrainer:
             devices=int(self.run_config.trainer.devices),
             precision=str(self.run_config.trainer.precision),
             accumulate_grad_batches=int(cfg.runtime.accumulate_grad_batches),
-            save_checkpoint=False,
+            # Save fold-best checkpoint so each trial can persist best-epoch params.
+            save_checkpoint=True,
             save_weights_only=True,
         )
         trainer, ckpt_cb = LightningTrainerFactory(trainer_cfg).build(
@@ -1008,12 +1009,29 @@ class MILFoldTrainer:
         epochs_trained = int(trainer.current_epoch) + 1
 
         best_epoch = None
+        best_ckpt_path: str | None = None
         if ckpt_cb is not None:
             best_path = ckpt_cb.best_model_path
             if best_path and Path(best_path).exists():
                 ckpt = torch.load(best_path, map_location="cpu")
                 best_epoch = int(ckpt.get("epoch", -1))
                 model.load_state_dict(ckpt["state_dict"], strict=True)
+                # Retain fold-best checkpoint under a stable trial artifact path.
+                retained_dir = self.run_config.ckpt_root.parent / "hpo_trial_fold_best_ckpts"
+                retained_dir.mkdir(parents=True, exist_ok=True)
+                retained_path = retained_dir / (
+                    f"mil_trial{int(self.trial.number)}_fold{int(fold_id)}_best_epoch{int(best_epoch)}.ckpt"
+                )
+                shutil.copy2(best_path, retained_path)
+                best_ckpt_path = str(retained_path)
+                log_event(
+                    "INFO",
+                    "hpo.fold.best_ckpt_retained",
+                    trial=int(self.trial.number),
+                    fold=int(fold_id),
+                    best_epoch=int(best_epoch),
+                    path=str(retained_path),
+                )
 
         evaluator = ModelEvaluator(device=self.eval_device)
         with log_step("hpo.fold.eval", trial=int(self.trial.number), fold=int(fold_id)):
@@ -1043,6 +1061,7 @@ class MILFoldTrainer:
         detail = {
             "trained_epochs": epochs_trained,
             "best_epoch": best_epoch,
+            "best_ckpt_path": best_ckpt_path,
             "macro_ap_best_epoch": float(best_macro),
             "macro_pr_auc_best_epoch": float(best_macro),
             "macro_auc_best_epoch": float(best_macro_auc),
@@ -1084,6 +1103,62 @@ class MILFoldTrainer:
             score=f"{fold_score:.6f}",
         )
         return fold_score, detail
+
+
+def _persist_trial_best_epoch_artifacts(
+    *,
+    outdir: Path,
+    trial: Trial,
+    params: Mapping[str, Any],
+    fold_detail: Mapping[str, Any],
+    mean_score: float,
+) -> str | None:
+    """
+    Persist per-trial best-epoch artifact:
+      - selected best fold by fold score,
+      - checkpoint path for that fold best epoch,
+      - trial params used to produce it.
+    """
+    if len(fold_detail) == 0:
+        return None
+
+    best_fold_id: str | None = None
+    best_fold_score = float("-inf")
+    best_fold_payload: Mapping[str, Any] | None = None
+    for fold_id, payload in fold_detail.items():
+        score = float(payload.get("score", float("-inf")))
+        if score > best_fold_score:
+            best_fold_score = float(score)
+            best_fold_id = str(fold_id)
+            best_fold_payload = payload
+
+    if best_fold_id is None or best_fold_payload is None:
+        return None
+
+    save_dir = Path(outdir) / "hpo_trial_best_epoch_params"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    out_path = save_dir / f"trial_{int(trial.number):05d}_best_epoch_params.json"
+
+    payload = {
+        "trial_number": int(trial.number),
+        "objective_value_macro_plus_min_cv": float(mean_score),
+        "best_fold_id": str(best_fold_id),
+        "best_fold_score": float(best_fold_score),
+        "best_epoch": best_fold_payload.get("best_epoch"),
+        "best_ckpt_path": best_fold_payload.get("best_ckpt_path"),
+        "params": dict(params),
+        "fold_detail": dict(fold_detail),
+    }
+    out_path.write_text(
+        json.dumps(
+            payload,
+            indent=2,
+            default=lambda x: (
+                x.item() if isinstance(x, np.generic) else (x.tolist() if isinstance(x, np.ndarray) else str(x))
+            ),
+        )
+    )
+    return str(out_path)
 
 
 class MILCrossValidator:
@@ -1151,8 +1226,23 @@ class MILCrossValidator:
                 )
                 raise optuna.TrialPruned()
 
-        trial.set_user_attr("fold_detail", fold_detail)
         mean_score = float(np.mean(scores))
+        trial_artifact_json = _persist_trial_best_epoch_artifacts(
+            outdir=Path(self.run_config.ckpt_root).parent,
+            trial=trial,
+            params=params,
+            fold_detail=fold_detail,
+            mean_score=float(mean_score),
+        )
+        trial.set_user_attr("fold_detail", fold_detail)
+        if trial_artifact_json is not None:
+            trial.set_user_attr("best_epoch_params_json", str(trial_artifact_json))
+            log_event(
+                "INFO",
+                "hpo.trial.best_epoch_artifact_saved",
+                trial=int(trial.number),
+                path=str(trial_artifact_json),
+            )
         log_event(
             "DONE",
             "hpo.trial.evaluate",

@@ -16,6 +16,13 @@ from .constants import (
     WEIGHT_COLS,
 )
 
+# Scale factors for raw per-row sample-weight columns.
+# Requested calibration: 0.50 -> 0.95 for transmittance tasks.
+SAMPLE_WEIGHT_COL_SCALE: Dict[str, float] = {
+    "sample_weight_340": 1.9,
+    "sample_weight_450": 1.9,
+}
+
 
 def set_all_seeds(seed: int):
     np.random.seed(seed)
@@ -45,7 +52,14 @@ def build_task_weights(df_lab: pd.DataFrame) -> np.ndarray:
     for t in range(4):
         col = WEIGHT_COLS[t]
         if col in df_lab.columns:
-            W[:, t] = df_lab[col].astype(float).fillna(1.0).to_numpy(dtype=np.float32)
+            scale = float(SAMPLE_WEIGHT_COL_SCALE.get(col, 1.0))
+            W[:, t] = (
+                df_lab[col]
+                .astype(float)
+                .fillna(1.0)
+                .to_numpy(dtype=np.float32)
+                * np.float32(scale)
+            )
     return np.clip(W, 0.0, np.inf)
 
 
@@ -68,8 +82,18 @@ def build_aux_targets_and_masks(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarra
 
 
 def build_aux_weights(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    w340 = df["sample_weight_340"].astype(float).fillna(1.0).to_numpy(dtype=np.float32) if "sample_weight_340" in df.columns else np.ones(len(df), dtype=np.float32)
-    w450 = df["sample_weight_450"].astype(float).fillna(1.0).to_numpy(dtype=np.float32) if "sample_weight_450" in df.columns else np.ones(len(df), dtype=np.float32)
+    w340_scale = np.float32(SAMPLE_WEIGHT_COL_SCALE.get("sample_weight_340", 1.0))
+    w450_scale = np.float32(SAMPLE_WEIGHT_COL_SCALE.get("sample_weight_450", 1.0))
+    w340 = (
+        df["sample_weight_340"].astype(float).fillna(1.0).to_numpy(dtype=np.float32) * w340_scale
+        if "sample_weight_340" in df.columns
+        else np.ones(len(df), dtype=np.float32)
+    )
+    w450 = (
+        df["sample_weight_450"].astype(float).fillna(1.0).to_numpy(dtype=np.float32) * w450_scale
+        if "sample_weight_450" in df.columns
+        else np.ones(len(df), dtype=np.float32)
+    )
     wad  = df["w_ad"].astype(float).fillna(1.0).to_numpy(dtype=np.float32) if "w_ad" in df.columns else np.ones(len(df), dtype=np.float32)
 
     w_abs = np.stack([w340, w450], axis=1).astype(np.float32)

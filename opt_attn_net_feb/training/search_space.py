@@ -87,9 +87,9 @@ def search_space(trial: Trial) -> Dict[str, Any]:
 
         "lam_floor": trial.suggest_float("lam_floor", 0.35, 0.85),
         "lam_ceil": trial.suggest_float("lam_ceil", 1.30, 2.20),
-        "lambda_aux_abs": trial.suggest_float("lambda_aux_abs", 0.05, 0.5),
-        "lambda_aux_fluo": trial.suggest_float("lambda_aux_fluo", 0.05, 0.5),
-        "lambda_aux_bitmask": trial.suggest_float("lambda_aux_bitmask", 0.02, 0.08),
+        "lambda_aux_abs": trial.suggest_float("lambda_aux_abs", 0.05, 0.3),
+        "lambda_aux_fluo": trial.suggest_float("lambda_aux_fluo", 0.05, 0.3),
+        "lambda_aux_bitmask": trial.suggest_float("lambda_aux_bitmask", 0.02, 0.1),
         "reg_loss_type": trial.suggest_categorical("reg_loss_type", ["mse"]),
          "min_w": trial.suggest_float("min_w", 0.1, 0.6),
          "accumulate_grad_batches": trial.suggest_categorical("accumulate_grad_batches", [8, 16]),
