@@ -1,0 +1,17 @@
+{
+  "family": "catboost_st",
+  "task_idx": 2,
+  "task_name": "Fluorescence_340_450",
+  "best_params": {
+    "depth": 9,
+    "learning_rate": 0.03768379173169263,
+    "l2_leaf_reg": 11.044163400426562,
+    "min_data_in_leaf": 10,
+    "random_strength": 0.061434953727945205,
+    "rsm": 0.6737665610635613,
+    "bootstrap_type": "Bernoulli",
+    "pos_weight_clip": 54.12063024229159,
+    "subsample": 0.9990588438486455,
+    "best_value": 0.6355215718686494
+  }
+}

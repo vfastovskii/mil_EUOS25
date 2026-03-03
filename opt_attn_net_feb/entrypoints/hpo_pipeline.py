@@ -1733,6 +1733,26 @@ def _parse_args(argv: Any | None = None):
         ),
     )
     ap.add_argument(
+        "--family_best_params_json",
+        default=None,
+        help=(
+            "Optional JSON file with family-level best params overrides for --run_family_suite. "
+            "Families present in this file skip HPO while other selected families can still be optimized. "
+            "Supports either {'family_name': {...}} or saved payload style "
+            "{'family': 'name', 'best_params': {...}}."
+        ),
+    )
+    ap.add_argument(
+        "--catboost_task_params_jsons",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional 4 task-specific CatBoost params JSON files "
+            "(each containing task_idx + best_params). "
+            "When provided, catboost_st HPO is skipped and these params are used."
+        ),
+    )
+    ap.add_argument(
         "--run_hpo",
         action="store_true",
         help="Run Optuna CV optimization before final train.",

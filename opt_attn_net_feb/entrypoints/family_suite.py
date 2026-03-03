@@ -108,6 +108,8 @@ class FamilySuiteConfig:
     model_families: tuple[str, ...]
     calibration_method: str
     best_params_dir: str | None
+    family_best_params_json: str | None
+    catboost_task_params_jsons: tuple[str, ...]
     catboost_hpo_parallel_tasks: int
 
 
@@ -263,14 +265,150 @@ def _load_family_best_params(*, outdir: Path, family: str) -> Dict[str, Any]:
     raise ValueError(f"Invalid best params JSON for '{family}': expected object, got {type(payload).__name__}")
 
 
+def _load_family_overrides_json(path: Path) -> Dict[str, Any]:
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid family_best_params_json: expected object at top-level, got {type(payload).__name__}")
+    fam = payload.get("family")
+    if isinstance(fam, str) and isinstance(payload.get("best_params"), dict):
+        return {str(fam): dict(payload["best_params"])}
+    return dict(payload)
+
+
+def _normalize_catboost_params(value: Any) -> Dict[str, Dict[str, Any]]:
+    if isinstance(value, dict) and isinstance(value.get("best_params"), dict):
+        value = value["best_params"]
+    if not isinstance(value, dict):
+        raise ValueError("catboost_st params must be a dict")
+    if all(k in value for k in ("task_0", "task_1", "task_2", "task_3")):
+        return {f"task_{int(t)}": dict(value[f"task_{int(t)}"]) for t in range(4)}
+    # Backward-compatible shared-params fallback.
+    return {f"task_{int(t)}": dict(value) for t in range(4)}
+
+
+def _normalize_family_params(*, family: str, value: Any) -> Any:
+    if family == "catboost_st":
+        return _normalize_catboost_params(value)
+    if isinstance(value, dict) and isinstance(value.get("best_params"), dict):
+        return dict(value["best_params"])
+    if isinstance(value, dict):
+        return dict(value)
+    raise ValueError(f"Params for family '{family}' must be a dict.")
+
+
+def _load_catboost_task_overrides(paths: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for raw_path in paths:
+        p = Path(str(raw_path))
+        if not p.exists():
+            raise FileNotFoundError(f"CatBoost task params file not found: {p}")
+        payload = json.loads(p.read_text())
+        if not isinstance(payload, dict):
+            raise ValueError(f"Invalid CatBoost task params JSON {p}: expected object.")
+        if isinstance(payload.get("best_params"), dict):
+            task_idx = payload.get("task_idx", None)
+            best_params = payload.get("best_params")
+        else:
+            # Allow bare format: {"task_idx": i, ...params...}
+            task_idx = payload.get("task_idx", None)
+            best_params = {k: v for k, v in payload.items() if k != "task_idx"}
+        if task_idx is None:
+            raise ValueError(f"CatBoost task params JSON {p} is missing 'task_idx'.")
+        t = int(task_idx)
+        if t < 0 or t > 3:
+            raise ValueError(f"CatBoost task_idx in {p} must be in [0,3], got {t}.")
+        key = f"task_{t}"
+        if key in out:
+            raise ValueError(f"Duplicate CatBoost task_idx={t} across provided JSON files.")
+        if not isinstance(best_params, dict):
+            raise ValueError(f"CatBoost task params JSON {p} has invalid 'best_params'.")
+        out[key] = dict(best_params)
+    missing = [f"task_{t}" for t in range(4) if f"task_{t}" not in out]
+    if missing:
+        raise ValueError(
+            "catboost_task_params_jsons must provide all 4 tasks. "
+            f"Missing: {missing}"
+        )
+    return out
+
+
+def _mt_2d_fixed_inactive_params() -> Dict[str, Any]:
+    # 2D-only family: keep 3D/attention branch knobs fixed and explicit.
+    return {
+        "inst_hidden": 256,
+        "inst_layers": 3,
+        "inst_dropout": 0.05,
+        "attn_heads": 8,
+        "attn_dropout": 0.05,
+        "inst_embedder_name": "mlp_v3_3d",
+        "aggregator_name": "task_attention_pool",
+    }
+
+
+def _search_space_mt_2d(trial: optuna.Trial) -> Dict[str, Any]:
+    # Family-specific MIL search space for 2D-only model.
+    # Excludes inactive 3D/attention suggestions to keep trials meaningful.
+    p: Dict[str, Any] = {
+        "mol_hidden": trial.suggest_categorical("mol_hidden", [128, 256, 512]),
+        "mol_layers": trial.suggest_int("mol_layers", 2, 5),
+        "mol_dropout": trial.suggest_float("mol_dropout", 0.01, 0.25),
+        "proj_dim": trial.suggest_categorical("proj_dim", [256, 512]),
+        "mixer_hidden": trial.suggest_categorical("mixer_hidden", [128, 256, 512]),
+        "mixer_layers": trial.suggest_int("mixer_layers", 2, 5),
+        "mixer_dropout": trial.suggest_float("mixer_dropout", 0.01, 0.2),
+        "mol_embedder_name": trial.suggest_categorical("mol_embedder_name", ["mlp_v3_2d"]),
+        "predictor_name": trial.suggest_categorical("predictor_name", ["mlp_v3"]),
+        "head_num_layers": trial.suggest_int("head_num_layers", 2, 4),
+        "head_dropout": trial.suggest_float("head_dropout", 0.01, 0.2),
+        "head_fc2_gain_non_last": trial.suggest_float("head_fc2_gain_non_last", 1e-3, 1e-2),
+        "activation": trial.suggest_categorical("activation", ["GELU", "ReLU", "LeakyReLU"]),
+        "lr": trial.suggest_float("lr", 8e-5, 8e-3, log=True),
+        "weight_decay": trial.suggest_float("weight_decay", 3e-6, 3e-4, log=True),
+        "batch_size": trial.suggest_categorical("batch_size", [512, 1024, 2048]),
+        "posw_clip_t0": trial.suggest_float("posw_clip_t0", 12.0, 28.0, log=True),
+        "posw_clip_t1": trial.suggest_float("posw_clip_t1", 35.0, 90.0, log=True),
+        "posw_clip_t2": trial.suggest_float("posw_clip_t2", 3.0, 10.0, log=True),
+        "posw_clip_t3": trial.suggest_float("posw_clip_t3", 90.0, 220.0, log=True),
+        "gamma_t0": trial.suggest_float("gamma_t0", 0.5, 2.0),
+        "gamma_t1": trial.suggest_float("gamma_t1", 1.0, 3.0),
+        "gamma_t2": trial.suggest_float("gamma_t2", 0.0, 1.5),
+        "gamma_t3": trial.suggest_float("gamma_t3", 1.5, 4.0),
+        "rare_oversample_mult": trial.suggest_float("rare_oversample_mult", 2.0, 10.0),
+        "rare_target_prev": trial.suggest_float("rare_target_prev", 0.06, 0.12),
+        "sample_weight_cap": trial.suggest_float("sample_weight_cap", 6.0, 9.0),
+        "lam_t0": trial.suggest_float("lam_t0", 0.6, 1.6, log=True),
+        "lam_t1": trial.suggest_float("lam_t1", 1.0, 2.4, log=True),
+        "lam_t2": trial.suggest_float("lam_t2", 0.25, 0.9, log=True),
+        "lam_t3": trial.suggest_float("lam_t3", 1.8, 3.5, log=True),
+        "lam_floor": trial.suggest_float("lam_floor", 0.35, 0.85),
+        "lam_ceil": trial.suggest_float("lam_ceil", 1.30, 2.20),
+        "lambda_aux_abs": trial.suggest_float("lambda_aux_abs", 0.05, 0.3),
+        "lambda_aux_fluo": trial.suggest_float("lambda_aux_fluo", 0.05, 0.3),
+        "lambda_aux_bitmask": trial.suggest_float("lambda_aux_bitmask", 0.02, 0.1),
+        "reg_loss_type": trial.suggest_categorical("reg_loss_type", ["mse"]),
+        "min_w": 0.40,
+        "accumulate_grad_batches": trial.suggest_categorical("accumulate_grad_batches", [8, 16]),
+        "head_stochastic_depth": trial.suggest_float("head_stochastic_depth", 0.0, 0.1),
+    }
+    p.update(_mt_2d_fixed_inactive_params())
+    return p
+
+
+def _mil_search_space_for_family(*, trial: optuna.Trial, family: str) -> Dict[str, Any]:
+    if str(family) == "mt_2d":
+        return _search_space_mt_2d(trial)
+    return search_space(trial)
+
+
 class _MILMacroCrossValidator:
-    def __init__(self, *, data: MILCVData, run_config: CVRunConfig):
+    def __init__(self, *, data: MILCVData, run_config: CVRunConfig, family: str):
         self.data = data
         self.run_config = run_config
+        self.family = str(family)
 
     def evaluate_trial(self, trial: optuna.Trial) -> float:
-        log_event("START", "family.hpo.trial.evaluate", trial=int(trial.number))
-        params = search_space(trial)
+        log_event("START", "family.hpo.trial.evaluate", trial=int(trial.number), family=str(self.family))
+        params = _mil_search_space_for_family(trial=trial, family=str(self.family))
         # Keep fixed objective weighting across MIL-family trials.
         params["min_w"] = 0.4
         cfg = HPOConfig.from_params(params)
@@ -298,7 +436,13 @@ class _MILMacroCrossValidator:
                 raise optuna.TrialPruned()
         mean_score = float(np.mean(fold_scores))
         trial.set_user_attr("fold_detail", fold_detail)
-        log_event("DONE", "family.hpo.trial.evaluate", trial=int(trial.number), mean_score=f"{mean_score:.6f}")
+        log_event(
+            "DONE",
+            "family.hpo.trial.evaluate",
+            trial=int(trial.number),
+            family=str(self.family),
+            mean_score=f"{mean_score:.6f}",
+        )
         return mean_score
 
 
@@ -767,6 +911,10 @@ def run_family_suite(args: Any) -> None:
         model_families=tuple(str(x) for x in (args.model_families or FAMILY_CHOICES)),
         calibration_method=str(args.calibration_method),
         best_params_dir=(None if args.best_params_dir is None else str(args.best_params_dir)),
+        family_best_params_json=(
+            None if getattr(args, "family_best_params_json", None) in (None, "") else str(args.family_best_params_json)
+        ),
+        catboost_task_params_jsons=tuple(str(x) for x in (getattr(args, "catboost_task_params_jsons", None) or [])),
         catboost_hpo_parallel_tasks=int(getattr(args, "catboost_hpo_parallel_tasks", 1)),
     )
     invalid = [x for x in cfg.model_families if x not in FAMILY_CHOICES]
@@ -781,6 +929,27 @@ def run_family_suite(args: Any) -> None:
     best_params_dir.mkdir(parents=True, exist_ok=True)
     cal_dir = outdir / "calibration"
     cal_dir.mkdir(parents=True, exist_ok=True)
+    override_params: Dict[str, Any] = {}
+    if cfg.family_best_params_json:
+        override_path = Path(cfg.family_best_params_json)
+        if not override_path.exists():
+            raise FileNotFoundError(f"family_best_params_json not found: {override_path}")
+        override_params = _load_family_overrides_json(override_path)
+        log_event(
+            "INFO",
+            "family_suite.overrides.loaded",
+            path=str(override_path),
+            families=",".join(sorted([str(k) for k in override_params.keys()])),
+        )
+    if len(cfg.catboost_task_params_jsons) > 0:
+        catboost_override = _load_catboost_task_overrides(cfg.catboost_task_params_jsons)
+        override_params["catboost_st"] = catboost_override
+        log_event(
+            "INFO",
+            "family_suite.catboost_task_overrides.loaded",
+            n_files=int(len(cfg.catboost_task_params_jsons)),
+            tasks=",".join(sorted(catboost_override.keys())),
+        )
 
     with log_step("family_suite.prepare_data", families=list(cfg.model_families)):
         df_train, df_lb, ids_2d_file, X2d_file, ids_2d_cat_file, X2d_cat_file, mil_families = _prepare_family_inputs(
@@ -790,6 +959,32 @@ def run_family_suite(args: Any) -> None:
     best_params: Dict[str, Any] = {}
     if cfg.run_hpo:
         for family in cfg.model_families:
+            if family in override_params:
+                best_params[family] = _normalize_family_params(family=family, value=override_params[family])
+                log_event("INFO", "family.hpo.skipped_with_override", family=str(family))
+                if family == "catboost_st":
+                    for t in range(4):
+                        saved_path = _save_catboost_task_best_params(
+                            outdir=best_params_dir,
+                            task_idx=int(t),
+                            best_params=best_params[family][f"task_{int(t)}"],
+                            best_value=0.0,
+                        )
+                        log_event(
+                            "INFO",
+                            "family.hpo.catboost.best_params.saved",
+                            task_idx=int(t),
+                            path=str(saved_path),
+                            best_value="override",
+                        )
+                summary_path = _save_family_best_params(
+                    outdir=best_params_dir,
+                    family=family,
+                    best_params=best_params[family],
+                    best_value=0.0,
+                )
+                log_event("INFO", "family.hpo.best_params.saved", family=str(family), path=str(summary_path))
+                continue
             if family == "catboost_st":
                 try:
                     from catboost import CatBoostClassifier  # noqa: F401
@@ -979,9 +1174,10 @@ def run_family_suite(args: Any) -> None:
                     pin_memory=bool(cfg.pin_memory and torch.cuda.is_available()),
                 ),
                 ckpt_root=(outdir / f"_tmp_best_ckpts_{family}"),
+                run_tag=str(family),
             )
             run_cfg.ckpt_root.mkdir(parents=True, exist_ok=True)
-            cv = _MILMacroCrossValidator(data=cv_data, run_config=run_cfg)
+            cv = _MILMacroCrossValidator(data=cv_data, run_config=run_cfg, family=str(family))
             study_name = f"{family}_mil"
             storage = f"sqlite:///{(outdir / f'{study_name}.sqlite3').as_posix()}"
             study = optuna.create_study(
@@ -1003,6 +1199,8 @@ def run_family_suite(args: Any) -> None:
             ).to_csv(outdir / f"{study_name}_trials.csv", index=False)
             bp = dict(study.best_params)
             bp["min_w"] = 0.4
+            if str(family) == "mt_2d":
+                bp.update(_mt_2d_fixed_inactive_params())
             best_params[family] = bp
             _save_family_best_params(
                 outdir=best_params_dir,
@@ -1013,6 +1211,10 @@ def run_family_suite(args: Any) -> None:
             log_event("INFO", "family.hpo.best_params.saved", family=str(family), path=str(best_params_dir / f"{family}.json"))
     else:
         for family in cfg.model_families:
+            if family in override_params:
+                best_params[family] = _normalize_family_params(family=family, value=override_params[family])
+                log_event("INFO", "family.best_params.override_used", family=str(family))
+                continue
             if family == "catboost_st":
                 try:
                     best_params[family] = {
@@ -1022,7 +1224,7 @@ def run_family_suite(args: Any) -> None:
                 except FileNotFoundError:
                     # Backward compatibility with older shared CatBoost params format.
                     shared = _load_family_best_params(outdir=best_params_dir, family=family)
-                    best_params[family] = {f"task_{int(t)}": dict(shared) for t in range(4)}
+                    best_params[family] = _normalize_catboost_params(shared)
                     log_event(
                         "WARN",
                         "family.best_params.catboost.shared_fallback",

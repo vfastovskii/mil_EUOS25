@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=Blend
+#SBATCH --job-name=famSuite
 #SBATCH --export=ALL,MODULESHOME='',MODULEPATH=''   # Required on Debye
 #SBATCH --partition=qEPYC
 #SBATCH --gres=gpu:1
@@ -60,7 +60,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 # Keep the same layout convention as run_mil_hpo_debye.slurm
 REPO_DIR="${REPO_DIR:-/scratch/vfastovskii/opt_attn_net_feb}"
 SCRIPT="${SCRIPT:-${REPO_DIR}/opt_net_fast.py}"
-PKGDIR="${PKGDIR:-${REPO_DIR}/blend}"
+PKGDIR="${PKGDIR:-${REPO_DIR}/opt_attn_net_feb}"
 
 DATA_DIR="${DATA_DIR:-${REPO_DIR}}"
 LABELS="${LABELS:-${DATA_DIR}/master_table_labels_final_modelling_ready_1401_with_cv_split.csv}"
@@ -92,6 +92,8 @@ MODEL_FAMILIES="${MODEL_FAMILIES:-catboost_st mt_2d mt_2d3d mt_3d}"
 CALIBRATION_METHOD="${CALIBRATION_METHOD:-platt}"  # platt|isotonic|temperature
 CATBOOST_HPO_PARALLEL_TASKS="${CATBOOST_HPO_PARALLEL_TASKS:-4}"
 BEST_PARAMS_DIR="${BEST_PARAMS_DIR:-}"
+FAMILY_BEST_PARAMS_JSON="${FAMILY_BEST_PARAMS_JSON:-}"
+CATBOOST_TASK_PARAMS_JSONS="${CATBOOST_TASK_PARAMS_JSONS:-"t0.json t1.json t2.json t3.json"}"
 
 # -------------------- node-local scratch --------------------
 WORKDIR="${SLURM_TMPDIR:-/tmp}/${SLURM_JOB_ID}"
@@ -119,6 +121,8 @@ echo "[INFO] CPUs=${SLURM_CPUS_PER_TASK} | CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_D
 echo "[INFO] RUN_HPO=$RUN_HPO | HPO_ONLY=$HPO_ONLY | PRUNER_WARMUP_STEPS=$PRUNER_WARMUP_STEPS"
 echo "[INFO] MODEL_FAMILIES=$MODEL_FAMILIES | CALIBRATION_METHOD=$CALIBRATION_METHOD | CATBOOST_HPO_PARALLEL_TASKS=$CATBOOST_HPO_PARALLEL_TASKS"
 echo "[INFO] 2D sources: scaled=$FEAT2D_SCALED | catboost_raw=$FEAT2D_RAW"
+echo "[INFO] FAMILY_BEST_PARAMS_JSON=${FAMILY_BEST_PARAMS_JSON:-<none>}"
+echo "[INFO] CATBOOST_TASK_PARAMS_JSONS=${CATBOOST_TASK_PARAMS_JSONS:-<none>}"
 command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || true
 
 # fail fast
@@ -131,6 +135,20 @@ command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || true
 [[ -f "$FEAT3D_QM" ]] || { echo "[ERROR] Missing 3D QM features: $FEAT3D_QM"; exit 2; }
 if [[ "$RUN_HPO" != "1" ]]; then
   [[ -n "$BEST_PARAMS_DIR" ]] || { echo "[ERROR] RUN_HPO=0 requires BEST_PARAMS_DIR"; exit 2; }
+fi
+
+if [[ -n "$FAMILY_BEST_PARAMS_JSON" ]]; then
+  [[ -f "$FAMILY_BEST_PARAMS_JSON" ]] || { echo "[ERROR] Missing FAMILY_BEST_PARAMS_JSON: $FAMILY_BEST_PARAMS_JSON"; exit 2; }
+fi
+if [[ -n "$CATBOOST_TASK_PARAMS_JSONS" ]]; then
+  read -r -a CATBOOST_TASK_JSON_ARR <<< "$CATBOOST_TASK_PARAMS_JSONS"
+  for _p in "${CATBOOST_TASK_JSON_ARR[@]}"; do
+    [[ -f "$_p" ]] || { echo "[ERROR] Missing CATBOOST task params JSON: $_p"; exit 2; }
+  done
+fi
+if [[ -n "$FAMILY_BEST_PARAMS_JSON" && -n "$CATBOOST_TASK_PARAMS_JSONS" ]]; then
+  echo "[INFO] Both FAMILY_BEST_PARAMS_JSON and CATBOOST_TASK_PARAMS_JSONS were provided."
+  echo "[INFO] catboost_task_params_jsons will override catboost_st from family_best_params_json."
 fi
 
 echo "[INFO] Copy code + inputs to node-local scratch..."
@@ -147,6 +165,14 @@ cp -v "$FEAT2D_SCALED" "$WORKDIR/"
 cp -v "$FEAT2D_RAW" "$WORKDIR/"
 cp -v "$FEAT3D_SCALED" "$WORKDIR/"
 cp -v "$FEAT3D_QM" "$WORKDIR/"
+if [[ -n "$FAMILY_BEST_PARAMS_JSON" ]]; then
+  cp -v "$FAMILY_BEST_PARAMS_JSON" "$WORKDIR/"
+fi
+if [[ -n "$CATBOOST_TASK_PARAMS_JSONS" ]]; then
+  for _p in "${CATBOOST_TASK_JSON_ARR[@]}"; do
+    cp -v "$_p" "$WORKDIR/"
+  done
+fi
 
 export PYTHONPATH="$WORKDIR:${PYTHONPATH:-}"
 python3 -c "import opt_attn_net_feb; print('[INFO] opt_attn_net_feb import OK from', opt_attn_net_feb.__file__)"
@@ -189,6 +215,17 @@ if [[ "$RUN_HPO" == "1" ]]; then
   fi
 else
   CMD+=(--best_params_dir "$BEST_PARAMS_DIR")
+fi
+
+if [[ -n "$FAMILY_BEST_PARAMS_JSON" ]]; then
+  CMD+=(--family_best_params_json "$WORKDIR/$(basename "$FAMILY_BEST_PARAMS_JSON")")
+fi
+if [[ -n "$CATBOOST_TASK_PARAMS_JSONS" ]]; then
+  _task_json_args=()
+  for _p in "${CATBOOST_TASK_JSON_ARR[@]}"; do
+    _task_json_args+=("$WORKDIR/$(basename "$_p")")
+  done
+  CMD+=(--catboost_task_params_jsons "${_task_json_args[@]}")
 fi
 
 printf '[INFO] CMD: %q ' "${CMD[@]}"; echo

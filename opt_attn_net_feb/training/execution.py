@@ -576,6 +576,7 @@ class CVRunConfig:
     trainer: TrainerSystemConfig
     loader: LoaderConfig
     ckpt_root: Path
+    run_tag: str = "mil"
 
 
 @dataclass(frozen=True)
@@ -831,6 +832,7 @@ class MILFoldTrainer:
         fold_id: int,
     ) -> Tuple[float, Dict[str, Any]]:
         cfg = self.hpo_config
+        run_tag = self._run_tag()
         log_event(
             "START",
             "hpo.fold.run",
@@ -838,6 +840,7 @@ class MILFoldTrainer:
             fold=int(fold_id),
             n_train=int(len(train_idx)),
             n_val=int(len(val_idx)),
+            run_tag=str(run_tag),
         )
 
         set_all_seeds(int(self.run_config.seed) + 5000 * int(fold_id) + int(self.trial.number))
@@ -875,6 +878,7 @@ class MILFoldTrainer:
             fold=int(fold_id),
             n_train_ids=int(len(ids_tr)),
             n_val_ids=int(len(ids_va)),
+            run_tag=str(run_tag),
         )
         ds_tr = MILTrainDataset(
             ids_tr,
@@ -920,6 +924,7 @@ class MILFoldTrainer:
             fold=int(fold_id),
             batch_size=int(cfg.runtime.batch_size),
             balanced_sampler=bool(cfg.sampler.use_balanced_batch_sampler),
+            run_tag=str(run_tag),
         )
         if bool(cfg.sampler.use_balanced_batch_sampler):
             batch_sampler = make_balanced_batch_sampler(
@@ -971,7 +976,13 @@ class MILFoldTrainer:
             class_weight_cap=float(cfg.loss.bitmask_group_weight_cap),
         )
 
-        log_event("INFO", "hpo.fold.build_model", trial=int(self.trial.number), fold=int(fold_id))
+        log_event(
+            "INFO",
+            "hpo.fold.build_model",
+            trial=int(self.trial.number),
+            fold=int(fold_id),
+            run_tag=str(run_tag),
+        )
         model = MILModelBuilder.build(
             config=cfg,
             mol_dim=int(self.data.X2d_scaled.shape[1]),
@@ -1003,7 +1014,7 @@ class MILFoldTrainer:
             ckpt_dir=str(fold_ckpt_dir),
             trial=self.trial,
         )
-        with log_step("hpo.fold.fit", trial=int(self.trial.number), fold=int(fold_id)):
+        with log_step("hpo.fold.fit", trial=int(self.trial.number), fold=int(fold_id), run_tag=str(run_tag)):
             trainer.fit(model, dl_tr, dl_va)
 
         epochs_trained = int(trainer.current_epoch) + 1
@@ -1034,15 +1045,18 @@ class MILFoldTrainer:
                 )
 
         evaluator = ModelEvaluator(device=self.eval_device)
-        with log_step("hpo.fold.eval", trial=int(self.trial.number), fold=int(fold_id)):
+        with log_step("hpo.fold.eval", trial=int(self.trial.number), fold=int(fold_id), run_tag=str(run_tag)):
             best_macro, best_aps, best_macro_auc, best_aucs = evaluator.eval_best_epoch(model, dl_va)
         best_min = float(np.min(best_aps))
 
         min_w = float(cfg.objective.min_w)
         fold_score = float((1.0 - min_w) * float(best_macro) + min_w * best_min)
 
+        banner = str(run_tag).strip().replace("_", "-").upper()
+        if not banner:
+            banner = "MIL"
         print(
-            f"[MIL-TASK-ATTN] trial={self.trial.number} fold={fold_id} trained_epochs={epochs_trained} "
+            f"[{banner}] trial={self.trial.number} fold={fold_id} trained_epochs={epochs_trained} "
             f"best_epoch={best_epoch} best_macro_pr_auc={best_macro:.6f} min_pr_auc={best_min:.6f} "
             f"best_macro_roc_auc={best_macro_auc:.6f} pr_aucs={best_aps} roc_aucs={best_aucs} "
             f"score={fold_score:.6f} mode={cfg.objective.mode} min_w={min_w:.2f}"
@@ -1056,6 +1070,7 @@ class MILFoldTrainer:
             macro_pr_auc=f"{best_macro:.6f}",
             macro_roc_auc=f"{best_macro_auc:.6f}",
             min_pr_auc=f"{best_min:.6f}",
+            run_tag=str(run_tag),
         )
 
         detail = {
@@ -1101,8 +1116,23 @@ class MILFoldTrainer:
             trial=int(self.trial.number),
             fold=int(fold_id),
             score=f"{fold_score:.6f}",
+            run_tag=str(run_tag),
         )
         return fold_score, detail
+
+    def _run_tag(self) -> str:
+        raw = str(getattr(self.run_config, "run_tag", "") or "").strip()
+        if raw and raw.lower() != "mil":
+            return raw
+        has_2d = int(self.data.X2d_scaled.shape[1]) > 0
+        has_3d = int(max(0, self.data.inst_geom_dim) + max(0, self.data.inst_qm_dim)) > 0
+        if has_2d and has_3d:
+            return "mt_2d3d"
+        if has_2d:
+            return "mt_2d"
+        if has_3d:
+            return "mt_3d"
+        return "mil"
 
 
 def _persist_trial_best_epoch_artifacts(

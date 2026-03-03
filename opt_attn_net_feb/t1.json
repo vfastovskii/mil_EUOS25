@@ -1,0 +1,17 @@
+{
+  "family": "catboost_st",
+  "task_idx": 1,
+  "task_name": "Transmittance_340",
+  "best_params": {
+    "depth": 4,
+    "learning_rate": 0.015575129996659278,
+    "l2_leaf_reg": 11.823225071467576,
+    "min_data_in_leaf": 33,
+    "random_strength": 1.444248676510365,
+    "rsm": 0.9019834476903681,
+    "bootstrap_type": "Bayesian",
+    "pos_weight_clip": 192.5338445734492,
+    "bagging_temperature": 1.941401089354799,
+    "best_value": 0.03150302441878799
+  }
+}
