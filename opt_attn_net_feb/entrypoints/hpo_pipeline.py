@@ -1655,6 +1655,14 @@ def _parse_args(argv: Any | None = None):
 
     ap.add_argument("--labels", required=True)
     ap.add_argument("--feat2d_scaled", required=True)
+    ap.add_argument(
+        "--feat2d_raw",
+        default=None,
+        help=(
+            "Optional raw 2D feature table (same structure as --feat2d_scaled). "
+            "Used by --run_family_suite for catboost_st only; MIL families keep --feat2d_scaled."
+        ),
+    )
     ap.add_argument("--feat3d_scaled", required=True)
     ap.add_argument("--feat3d_qm_scaled", required=True)
     ap.add_argument(

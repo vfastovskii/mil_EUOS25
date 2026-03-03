@@ -91,7 +91,9 @@ def search_space(trial: Trial) -> Dict[str, Any]:
         "lambda_aux_fluo": trial.suggest_float("lambda_aux_fluo", 0.05, 0.3),
         "lambda_aux_bitmask": trial.suggest_float("lambda_aux_bitmask", 0.02, 0.1),
         "reg_loss_type": trial.suggest_categorical("reg_loss_type", ["mse"]),
-         "min_w": trial.suggest_float("min_w", 0.1, 0.6),
+         # Fixed objective mixing weight across all MIL trials to keep trials comparable
+         # and consistently push optimization toward the weakest task.
+         "min_w": 0.40,
          "accumulate_grad_batches": trial.suggest_categorical("accumulate_grad_batches", [8, 16]),
          "head_stochastic_depth": trial.suggest_float("head_stochastic_depth", 0.0, 0.1)}
 

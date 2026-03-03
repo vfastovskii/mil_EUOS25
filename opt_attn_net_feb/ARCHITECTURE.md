@@ -5,7 +5,8 @@ This document is the authoritative, code-aligned architecture spec for the curre
 Scope:
 - Package: `opt_attn_net_feb/`
 - Root wrapper entrypoint: `../opt_net_fast.py`
-- Main pipeline entrypoint implementation: `entrypoints/hpo_pipeline.py`
+- Main entrypoint implementation: `entrypoints/hpo_pipeline.py`
+- Family-suite implementation (dispatched by CLI flag): `entrypoints/family_suite.py`
 
 Everything below is synchronized to the current code, including constants, defaults, heuristics, and fallback behavior.
 
@@ -13,7 +14,11 @@ Everything below is synchronized to the current code, including constants, defau
 
 ## 1. System Overview
 
-The system is a multimodal MIL (Multiple Instance Learning) pipeline for 4-task classification with auxiliary regression heads, plus integrated explainability:
+The system supports two training/evaluation modes:
+- default MIL mode (single family)
+- multi-family suite mode (`--run_family_suite`)
+
+Core modeling target is 4-task classification with auxiliary regression heads, plus integrated explainability:
 - Core model: `MILTaskAttnMixerWithAux`
 - HPO: Optuna over CV on predefined train folds
 - Final stage: train on split `train`, validate on split `leaderboard` (or custom `--leaderboard_split`)
@@ -22,7 +27,7 @@ The system is a multimodal MIL (Multiple Instance Learning) pipeline for 4-task 
   - Lambda-Vol (concept-pressure dynamics across epochs)
   - Concept-guided RL controller (final training only)
 
-High-level flow:
+High-level flow (default MIL mode):
 1. Parse CLI + build typed config objects.
 2. Load labels + 2D + 3D/QM features.
 3. Build HPO dataset from `--use_splits` and predefined fold column.
@@ -32,6 +37,14 @@ High-level flow:
    - evaluate on split `leaderboard`
    - export leaderboard attention/predictions CSV
    - optional explainability outputs and optional concept-guided RL control.
+
+High-level flow (`--run_family_suite` mode):
+1. Build shared train/leaderboard data contracts once.
+2. Optimize each selected family independently on train CV.
+3. Save best params JSON per family.
+4. Refit each family on train and evaluate on leaderboard.
+5. Calibrate leaderboard probabilities per family.
+6. Blend calibrated probabilities across families and report final metrics.
 
 ---
 
@@ -292,13 +305,13 @@ Inputs:
 - `x3d_pad`: `[B, N, F3]`
 - `key_padding_mask`: `[B, N]`, `True=PAD`
 
-Branch A (2D molecule-level):
+Branch A (2D molecule-level, optional when `mol_dim > 0`):
 1. `mol_enc(x2d)` -> `[B, mol_hidden]`
 2. `mol_post_embed_norm` (`LayerNorm(mol_hidden)`)
 3. `proj2d = Linear(mol_hidden->proj_dim) + LayerNorm(proj_dim)` -> `e2d [B, proj_dim]`
 4. Repeat per task: `e2d_rep = e2d.unsqueeze(1).expand(-1,4,-1)` -> `[B,4,proj_dim]`
 
-Branch B1 (3D geometry instance-level):
+Branch B1 (3D geometry instance-level, optional when `inst_geom_dim > 0`):
 1. Split `x3d_pad` by configured dims into `x3d_geom [B,N,F3_geom]` and `x3d_qm [B,N,F3_qm]`.
 2. Flatten geometry instances: `[B*N, F3_geom]`
 3. `inst_geom_enc` -> `[B*N, inst_hidden]`
@@ -308,7 +321,7 @@ Branch B1 (3D geometry instance-level):
 7. `agg_geom_post_norm` (`LayerNorm(inst_hidden)`)
 8. `proj3d_geom` (`Linear+LayerNorm`) -> `e3d_geom [B,4,proj_dim]`
 
-Branch B2 (3D quantum instance-level):
+Branch B2 (3D quantum instance-level, optional when `inst_qm_dim > 0`):
 1. Flatten quantum instances: `[B*N, F3_qm]`
 2. `inst_qm_enc` -> `[B*N, inst_hidden]`
 3. Reshape `[B,N,inst_hidden]`
@@ -321,12 +334,13 @@ Attention compatibility note:
 - If both 3D branches are present and `return_attn=True`, exported attention is `mean(attn_geom, attn_qm)`.
 - If only one 3D branch is present, that branch attention is returned.
 
-Fusion + mixer:
-1. Concat: `concat([e2d_rep,e3d_geom,e3d_qm], dim=-1)` -> `[B,4,3*proj_dim]`
-2. Flatten task axis: `[B*4, 3*proj_dim]`
-3. `mixer` residual MLP -> `[B*4, mixer_hidden]`
-4. Reshape `[B,4,mixer_hidden]`
-5. `mixer_post_norm` (`LayerNorm(mixer_hidden)`) -> `z_tasks`
+Fusion + mixer (dynamic by active modalities):
+1. Build modality list `mix_parts` from enabled projections in `{2d, 3d_geom, 3d_qm}`.
+2. Concat only active parts: `concat(mix_parts, dim=-1)` -> `[B,4,K*proj_dim]`, where `K = len(active_modalities)` and `K in {1,2,3}`.
+3. Flatten task axis: `[B*4, K*proj_dim]`.
+4. `mixer` residual MLP -> `[B*4, mixer_hidden]`.
+5. Reshape `[B,4,mixer_hidden]`.
+6. `mixer_post_norm` (`LayerNorm(mixer_hidden)`) -> `z_tasks`.
 
 Heads:
 - Classification: one head per task, input `z_tasks[:,t,:]` -> logits `[B,4]`
@@ -652,11 +666,14 @@ Given search space:
 - 2D encoder hidden width <= 256
 - 3D encoder hidden width <= 256
 - projection dim <= 512
-- mixer input dim = `3 * proj_dim` <= 1536
+- mixer input dim = `K * proj_dim`, with `K in {1,2,3}` depending on enabled modalities
+  - 2D-only: `K=1`, max mixer input `512`
+  - 3D-only (geom+qm active): `K=2`, max mixer input `1024`
+  - full multimodal: `K=3`, max mixer input `1536`
 - mixer hidden width <= 256
 - head input dim = mixer hidden <= 256
 
-So current search space keeps encoder/head widths compact (<=1024) while the fused mixer input is wider due to three modalities.
+This keeps encoder/head widths compact while allowing modality-dependent fusion width.
 
 ---
 
@@ -699,9 +716,20 @@ Final run (`MILFinalTrainer`):
 
 ---
 
-## 12. Pipeline Orchestration (HPO + Final)
+## 12. Pipeline Orchestration
 
-Main orchestrator: `entrypoints/hpo_pipeline.py::MILPipelineOrchestrator`
+Two orchestration paths are implemented in the same CLI entrypoint (`entrypoints/hpo_pipeline.py`):
+- default MIL orchestrator: `MILPipelineOrchestrator`
+- family-suite dispatch (`--run_family_suite`): `entrypoints/family_suite.py::run_family_suite`
+
+### 12.0 Dispatch rules
+
+- If `--run_family_suite` is set:
+  - parser still validates base data/runtime args
+  - execution is dispatched to family-suite runner
+  - default MIL orchestrator path is skipped
+- Else:
+  - default MIL pipeline runs (HPO + final) as described below.
 
 ### 12.1 Environment setup
 
@@ -1207,6 +1235,11 @@ Payload includes paths for Chem-ACE, Lambda-Vol, and Concept-RL artifacts (when 
 Main parser: `entrypoints/hpo_pipeline.py`
 
 Key controls:
+- Family suite:
+  - `--run_family_suite`
+  - `--model_families catboost_st mt_2d mt_2d3d mt_3d`
+  - `--calibration_method {platt,isotonic,temperature}`
+  - `--best_params_dir <dir>`
 - HPO:
   - `--run_hpo`
   - `--best_params_json`
@@ -1353,6 +1386,29 @@ In `--study_dir`:
   - `final_best_train_vs_leaderboard/leaderboard_auc_per_task.csv`
   - `leaderboard_attn.csv` (or custom `--attn_out`)
   - optional `final_best_train_vs_leaderboard/explainability_artifacts.json`
+
+If `--run_family_suite` is enabled:
+- per-family HPO sqlite/trials artifacts:
+  - `catboost_st.sqlite3`, `catboost_st_trials.csv`
+  - `mt_2d_mil.sqlite3`, `mt_2d_mil_trials.csv`
+  - `mt_2d3d_mil.sqlite3`, `mt_2d3d_mil_trials.csv`
+  - `mt_3d_mil.sqlite3`, `mt_3d_mil_trials.csv`
+- best params directory:
+  - `best_params/catboost_st.json`
+  - `best_params/mt_2d.json`
+  - `best_params/mt_2d3d.json`
+  - `best_params/mt_3d.json`
+- per-family leaderboard metrics/predictions:
+  - `leaderboard_metrics_<family>.csv`
+  - `leaderboard_preds_<family>.csv`
+  - `leaderboard_metrics_<family>_calibrated.csv`
+  - `leaderboard_preds_<family>_calibrated.csv`
+- calibration metadata:
+  - `calibration/<family>_calib.json`
+- blended outputs:
+  - `leaderboard_metrics_blend.csv`
+  - `leaderboard_preds_blend.csv`
+  - `blend_weights.json`
 
 If Chem-ACE enabled:
 - Chem-ACE output dir with DB, cache, and pipeline summary.
@@ -1508,6 +1564,10 @@ Runtime/HPO:
 - `--patience 20`
 - `--trials 50`
 - `--trials_mil None` (compatibility alias to `--trials`)
+- `--run_family_suite False`
+- `--model_families catboost_st mt_2d mt_2d3d mt_3d`
+- `--calibration_method platt`
+- `--best_params_dir None` (defaults to `<study_dir>/best_params` in family-suite mode)
 - `--seed 0`
 - `--nn_accelerator gpu`
 - `--nn_devices 1`
@@ -1590,6 +1650,33 @@ python ../opt_net_fast.py \
   --best_params_json <multimodal_mil_aux_gpu_best_params.json>
 ```
 
+Run 4-family suite (HPO + refit + calibration + blend):
+```bash
+python ../opt_net_fast.py \
+  --labels <labels.csv> \
+  --feat2d_scaled <scaled_2d.csv> \
+  --feat3d_scaled <scaled_3d.csv> \
+  --feat3d_qm_scaled <scaled_3d_quantum.csv> \
+  --study_dir <out_dir> \
+  --use_splits train \
+  --leaderboard_split leaderboard \
+  --run_family_suite \
+  --run_hpo \
+  --trials 50
+```
+
+Run 4-family suite without HPO (reuse per-family JSONs):
+```bash
+python ../opt_net_fast.py \
+  --labels <labels.csv> \
+  --feat2d_scaled <scaled_2d.csv> \
+  --feat3d_scaled <scaled_3d.csv> \
+  --feat3d_qm_scaled <scaled_3d_quantum.csv> \
+  --study_dir <out_dir> \
+  --run_family_suite \
+  --best_params_dir <out_dir>/best_params
+```
+
 `--feat3d_raw` and `--feat3d_qm_raw` are optional and should be supplied together.
 
 Enable explainability in final run:
@@ -1598,6 +1685,133 @@ python ../opt_net_fast.py ... --run_hpo --run_lambda_vol
 ```
 
 (`--run_lambda_vol` auto-enables Chem-ACE.)
+
+## 25. Multi-Family Optimization + Calibration + Blending Suite
+
+Implementation:
+- runner: `entrypoints/family_suite.py`
+- trigger: `--run_family_suite`
+- supported families (`FAMILY_CHOICES`):
+  - `catboost_st`
+  - `mt_2d`
+  - `mt_2d3d`
+  - `mt_3d`
+
+### 25.1 Family definitions
+
+- `catboost_st`:
+  - single-task CatBoost classifier per endpoint (`4` models total)
+  - input: 2D features only
+  - independent per-task training/prediction
+- `mt_2d`:
+  - uses `MILTaskAttnMixerWithAux` with only 2D modality active
+  - instance bags are synthetic one-instance dummy bags to keep dataset/trainer contracts unchanged
+- `mt_2d3d`:
+  - full current MIL model path
+  - input: 2D + 3D geometry + 3D QM
+- `mt_3d`:
+  - uses `MILTaskAttnMixerWithAux` with 3D geometry + 3D QM active and `mol_dim=0`
+  - input: 3D only
+
+### 25.2 HPO protocol (train CV)
+
+Common CV contract:
+- folds from `--fold_col` inside rows selected by `--use_splits`
+- trial objective is CV mean macro PR-AUC:
+  - per fold: `macro_pr_auc = mean(AP_task0..AP_task3)`
+  - trial value: mean of fold macro PR-AUC
+
+MIL-family HPO details:
+- search space: shared `training/search_space.py`
+- family objective enforces pure macro PR-AUC (`min_w` overridden to `0.0` in family-suite CV)
+- training engine: same Lightning fold trainer stack (`MILFoldTrainer`)
+- pruning: Optuna percentile pruner with configured warmup (`--pruner_warmup_steps`)
+
+CatBoost-family HPO details:
+- search space is CatBoost-specific in `family_suite.py`
+- one parameter set is optimized jointly across 4 tasks using macro PR-AUC over tasks/folds
+- model fit remains per-task
+
+Best-params artifacts:
+- directory: `<study_dir>/best_params/` (or `--best_params_dir`)
+- file per family: `<family>.json`
+- payload includes:
+  - `family`
+  - `best_params`
+  - `best_value_macro_ap_cv`
+
+### 25.3 Final refit + leaderboard evaluation
+
+For each selected family:
+1. Rebuild family-specific train/leaderboard tensors from same source tables.
+2. Refit model(s) on train split with best params.
+3. Predict probabilities on leaderboard split.
+4. Save metrics:
+   - per-task PR-AUC
+   - per-task ROC-AUC
+   - per-task NLL
+   - per-task Brier
+   - macro row over tasks
+
+Outputs per family:
+- `leaderboard_preds_<family>.csv`
+- `leaderboard_metrics_<family>.csv`
+- for MIL families also `/<study_dir>/<family>/leaderboard_eval.json`
+
+### 25.4 Post-hoc calibration stage (leaderboard-fitted)
+
+Calibration is applied independently per `(family, task)` on leaderboard predictions:
+- supported methods:
+  - `platt` (default)
+  - `isotonic`
+  - `temperature`
+- selected by `--calibration_method`
+
+Important contract:
+- calibrators are explicitly fit on leaderboard for post-hoc evaluation/ensembling quality.
+- this is evaluation-time calibration; not a leakage-safe deployment protocol.
+
+Saved calibration artifacts:
+- `calibration/<family>_calib.json` with per-task calibrator parameters
+- `leaderboard_preds_<family>_calibrated.csv`
+- `leaderboard_metrics_<family>_calibrated.csv`
+
+### 25.5 Blending/ensemble stage
+
+Input to blend stage:
+- calibrated probabilities from all selected families
+- common leaderboard ID intersection across families
+
+Blend model:
+- per task logistic stacking:
+  - features: calibrated family probabilities for that task
+  - target: task label on leaderboard
+  - learned coefficients and intercept stored per task
+- single-class fallback uses uniform averaging
+
+Blend outputs:
+- `leaderboard_preds_blend.csv`
+- `leaderboard_metrics_blend.csv`
+- `blend_weights.json`:
+  - family list
+  - per-task coefficients
+  - per-task intercept
+  - fallback metadata where applicable
+
+### 25.6 Unified artifact contract (requested outputs)
+
+The family-suite run provides the requested artifact classes:
+- `best_params/<family>.json`
+- `leaderboard_metrics_<family>.csv`
+- `calibration/<family>_calib.json`
+- `leaderboard_metrics_blend.csv`
+- `blend_weights.json`
+
+Additional useful artifacts produced by implementation:
+- `leaderboard_preds_<family>.csv`
+- `leaderboard_preds_<family>_calibrated.csv`
+- `leaderboard_preds_blend.csv`
+ 
 ## Ricci Geometry Layer (Lambda-Vol Integration)
 
 Detailed Ricci reference:

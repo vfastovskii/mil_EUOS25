@@ -12,7 +12,7 @@ import pandas as pd
 import torch
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import brier_score_loss, log_loss
+from sklearn.metrics import average_precision_score, brier_score_loss, log_loss
 
 from ..data.collate import collate_train
 from ..data.datasets import MILTrainDataset
@@ -58,6 +58,7 @@ FAMILY_CHOICES: tuple[str, ...] = ("catboost_st", "mt_2d", "mt_2d3d", "mt_3d")
 class FamilySuiteConfig:
     labels: str
     feat2d_scaled: str
+    feat2d_raw: str | None
     feat3d_scaled: str
     feat3d_qm_scaled: str
     study_dir: str
@@ -189,6 +190,40 @@ def _save_family_best_params(*, outdir: Path, family: str, best_params: Mapping[
     return path
 
 
+def _save_catboost_task_best_params(
+    *,
+    outdir: Path,
+    task_idx: int,
+    best_params: Mapping[str, Any],
+    best_value: float,
+) -> Path:
+    outdir.mkdir(parents=True, exist_ok=True)
+    path = outdir / f"catboost_st_t{int(task_idx)}.json"
+    payload = {
+        "family": "catboost_st",
+        "task_idx": int(task_idx),
+        "task_name": str(TASK_COLS[int(task_idx)]),
+        "best_params": dict(best_params),
+        "best_value_pr_auc_cv": float(best_value),
+    }
+    path.write_text(json.dumps(payload, indent=2))
+    return path
+
+
+def _load_catboost_task_best_params(*, outdir: Path, task_idx: int) -> Dict[str, Any]:
+    path = outdir / f"catboost_st_t{int(task_idx)}.json"
+    if not path.exists():
+        raise FileNotFoundError(f"CatBoost best params file not found for task {task_idx}: {path}")
+    payload = json.loads(path.read_text())
+    if isinstance(payload, dict) and isinstance(payload.get("best_params"), dict):
+        return dict(payload["best_params"])
+    if isinstance(payload, dict):
+        return dict(payload)
+    raise ValueError(
+        f"Invalid CatBoost best params JSON for task {task_idx}: expected object, got {type(payload).__name__}"
+    )
+
+
 def _load_family_best_params(*, outdir: Path, family: str) -> Dict[str, Any]:
     path = outdir / f"{family}.json"
     if not path.exists():
@@ -209,7 +244,8 @@ class _MILMacroCrossValidator:
     def evaluate_trial(self, trial: optuna.Trial) -> float:
         log_event("START", "family.hpo.trial.evaluate", trial=int(trial.number))
         params = search_space(trial)
-        params["min_w"] = 0.0  # family objective is pure mean PR-AUC across tasks.
+        # Keep fixed objective weighting across MIL-family trials.
+        params["min_w"] = 0.4
         cfg = HPOConfig.from_params(params)
 
         fold_runner = MILFoldTrainer(
@@ -538,7 +574,9 @@ def _run_mil_final_train_and_predict(
     return df_pred
 
 
-def _prepare_family_inputs(cfg: FamilySuiteConfig) -> tuple[pd.DataFrame, pd.DataFrame, List[str], np.ndarray, Dict[str, _MILFamilyData]]:
+def _prepare_family_inputs(
+    cfg: FamilySuiteConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame, List[str], np.ndarray, List[str], np.ndarray, Dict[str, _MILFamilyData]]:
     df_full = load_labels(cfg.labels, id_col=cfg.id_col)
     df_full[cfg.id_col] = df_full[cfg.id_col].astype(str)
     df_full[cfg.split_col] = df_full[cfg.split_col].astype(str)
@@ -551,10 +589,24 @@ def _prepare_family_inputs(cfg: FamilySuiteConfig) -> tuple[pd.DataFrame, pd.Dat
         raise ValueError(f"No rows with split == '{cfg.leaderboard_split}'")
 
     ids_2d_file, X2d_file = load_2d(cfg.feat2d_scaled, id_col=cfg.id_col)
+    if cfg.feat2d_raw:
+        ids_2d_cat_file, X2d_cat_file = load_2d(cfg.feat2d_raw, id_col=cfg.id_col)
+        cat_source = "raw"
+    else:
+        ids_2d_cat_file, X2d_cat_file = ids_2d_file, X2d_file
+        cat_source = "scaled_fallback"
     ids_train_all = df_train[cfg.id_col].astype(str).tolist()
     ids_lb_all = df_lb[cfg.id_col].astype(str).tolist()
     _ = align_by_id(ids_2d_file, X2d_file, ids_train_all)
     _ = align_by_id(ids_2d_file, X2d_file, ids_lb_all)
+    _ = align_by_id(ids_2d_cat_file, X2d_cat_file, ids_train_all)
+    _ = align_by_id(ids_2d_cat_file, X2d_cat_file, ids_lb_all)
+    log_event(
+        "INFO",
+        "family_suite.prepare_data.features_2d",
+        mil_source="scaled",
+        catboost_source=cat_source,
+    )
 
     allowed = set(ids_train_all) | set(ids_lb_all)
     ids_conf, conf_ids, Xinst, inst_meta = load_and_merge_instances(
@@ -645,13 +697,14 @@ def _prepare_family_inputs(cfg: FamilySuiteConfig) -> tuple[pd.DataFrame, pd.Dat
         )
 
     fam_data = {f: _make_mil_family(f) for f in ("mt_2d", "mt_2d3d", "mt_3d")}
-    return df_train, df_lb, ids_2d_file, X2d_file, fam_data
+    return df_train, df_lb, ids_2d_file, X2d_file, ids_2d_cat_file, X2d_cat_file, fam_data
 
 
 def run_family_suite(args: Any) -> None:
     cfg = FamilySuiteConfig(
         labels=str(args.labels),
         feat2d_scaled=str(args.feat2d_scaled),
+        feat2d_raw=(None if getattr(args, "feat2d_raw", None) in (None, "") else str(args.feat2d_raw)),
         feat3d_scaled=str(args.feat3d_scaled),
         feat3d_qm_scaled=str(args.feat3d_qm_scaled),
         study_dir=str(args.study_dir),
@@ -692,9 +745,11 @@ def run_family_suite(args: Any) -> None:
     cal_dir.mkdir(parents=True, exist_ok=True)
 
     with log_step("family_suite.prepare_data", families=list(cfg.model_families)):
-        df_train, df_lb, ids_2d_file, X2d_file, mil_families = _prepare_family_inputs(cfg)
+        df_train, df_lb, ids_2d_file, X2d_file, ids_2d_cat_file, X2d_cat_file, mil_families = _prepare_family_inputs(
+            cfg
+        )
 
-    best_params: Dict[str, Dict[str, Any]] = {}
+    best_params: Dict[str, Any] = {}
     if cfg.run_hpo:
         for family in cfg.model_families:
             if family == "catboost_st":
@@ -705,79 +760,102 @@ def run_family_suite(args: Any) -> None:
                 folds = sorted(df_train[cfg.fold_col].dropna().astype(int).unique().tolist())
                 folds_info = fold_indices(df_train, cfg.fold_col, folds)
                 ids_tr = df_train[cfg.id_col].astype(str).tolist()
-                X2d_tr = align_by_id(ids_2d_file, X2d_file, ids_tr)
+                X2d_tr = align_by_id(ids_2d_cat_file, X2d_cat_file, ids_tr)
                 y_tr = coerce_binary_labels(df_train)
                 w_tr = build_task_weights(df_train)
+                catboost_params_by_task: Dict[str, Dict[str, Any]] = {}
+                best_values_by_task: Dict[str, float] = {}
+                for t in range(4):
+                    study_name = f"catboost_st_t{int(t)}"
 
-                def objective(trial: optuna.Trial) -> float:
-                    from catboost import CatBoostClassifier
+                    def objective(trial: optuna.Trial, task_idx: int = int(t)) -> float:
+                        from catboost import CatBoostClassifier
 
-                    p = _catboost_search_space(trial)
-                    fold_scores: List[float] = []
-                    for step, (tr, va, _f) in enumerate(folds_info):
-                        pred = np.zeros((len(va), 4), dtype=np.float64)
-                        for t in range(4):
-                            pos = float(y_tr[tr, t].sum())
+                        p = _catboost_search_space(trial)
+                        fold_scores: List[float] = []
+                        for step, (tr, va, _f) in enumerate(folds_info):
+                            pos = float(y_tr[tr, task_idx].sum())
                             neg = float(len(tr) - pos)
                             spw = min(neg / max(pos, 1.0), float(p["pos_weight_clip"]))
                             cb = CatBoostClassifier(
                                 **_catboost_common_params(
                                     params=p,
-                                    seed=int(cfg.seed) + 97 * int(t) + 7919 * int(trial.number),
+                                    seed=int(cfg.seed) + 97 * int(task_idx) + 7919 * int(trial.number),
                                     threads=max(1, int(cfg.cpu_workers)),
                                     scale_pos_weight=float(spw),
                                 )
                             )
-                            sw = (w_tr[tr, t] if t in (0, 1) else None)
+                            sw = (w_tr[tr, task_idx] if task_idx in (0, 1) else None)
                             cb.fit(
                                 X2d_tr[tr],
-                                y_tr[tr, t],
+                                y_tr[tr, task_idx],
                                 sample_weight=sw,
-                                eval_set=(X2d_tr[va], y_tr[va, t]),
+                                eval_set=(X2d_tr[va], y_tr[va, task_idx]),
                                 use_best_model=True,
                                 early_stopping_rounds=200,
                                 verbose=False,
                             )
-                            pred[:, t] = cb.predict_proba(X2d_tr[va])[:, 1]
-                        aps = ap_per_task(
-                            y_tr[va],
-                            pred,
-                            w_cls=w_tr[va],
-                            weighted_tasks=(0, 1),
-                        )
-                        fold_scores.append(float(np.mean(aps)))
-                        trial.report(float(np.mean(fold_scores)), step=int(step))
-                        if trial.should_prune():
-                            raise optuna.TrialPruned()
-                    return float(np.mean(fold_scores))
+                            p_va = cb.predict_proba(X2d_tr[va])[:, 1]
+                            p_va = np.clip(np.nan_to_num(p_va, nan=0.5, posinf=1.0, neginf=0.0), 0.0, 1.0)
+                            sw_va = (w_tr[va, task_idx] if task_idx in (0, 1) else None)
+                            try:
+                                ap_t = float(average_precision_score(y_tr[va, task_idx], p_va, sample_weight=sw_va))
+                            except ValueError:
+                                ap_t = 0.0
+                            fold_scores.append(ap_t)
+                            trial.report(float(np.mean(fold_scores)), step=int(step))
+                            if trial.should_prune():
+                                raise optuna.TrialPruned()
+                        return float(np.mean(fold_scores))
 
-                study_name = "catboost_st"
-                storage = f"sqlite:///{(outdir / f'{study_name}.sqlite3').as_posix()}"
-                study = optuna.create_study(
-                    study_name=study_name,
-                    direction="maximize",
-                    sampler=optuna.samplers.TPESampler(seed=int(cfg.seed)),
-                    pruner=optuna.pruners.PercentilePruner(
-                        percentile=25.0,
-                        n_startup_trials=10,
-                        n_warmup_steps=int(cfg.pruner_warmup_steps),
-                    ),
-                    storage=storage,
-                    load_if_exists=True,
-                )
-                with log_step("family.hpo.catboost.optimize", n_trials=int(cfg.trials)):
-                    study.optimize(objective, n_trials=int(cfg.trials), gc_after_trial=True)
-                pd.DataFrame(
-                    study.trials_dataframe(attrs=("number", "value", "state", "params", "user_attrs"))
-                ).to_csv(outdir / f"{study_name}_trials.csv", index=False)
-                bp = dict(study.best_params)
-                best_params[family] = bp
-                _save_family_best_params(
+                    storage = f"sqlite:///{(outdir / f'{study_name}.sqlite3').as_posix()}"
+                    study = optuna.create_study(
+                        study_name=study_name,
+                        direction="maximize",
+                        sampler=optuna.samplers.TPESampler(seed=int(cfg.seed) + 113 * int(t)),
+                        pruner=optuna.pruners.PercentilePruner(
+                            percentile=25.0,
+                            n_startup_trials=10,
+                            n_warmup_steps=int(cfg.pruner_warmup_steps),
+                        ),
+                        storage=storage,
+                        load_if_exists=True,
+                    )
+                    with log_step("family.hpo.catboost.optimize", task_idx=int(t), n_trials=int(cfg.trials)):
+                        study.optimize(objective, n_trials=int(cfg.trials), gc_after_trial=True)
+                    pd.DataFrame(
+                        study.trials_dataframe(attrs=("number", "value", "state", "params", "user_attrs"))
+                    ).to_csv(outdir / f"{study_name}_trials.csv", index=False)
+
+                    bp_t = dict(study.best_params)
+                    catboost_params_by_task[f"task_{int(t)}"] = bp_t
+                    saved_path = _save_catboost_task_best_params(
+                        outdir=best_params_dir,
+                        task_idx=int(t),
+                        best_params=bp_t,
+                        best_value=float(study.best_value),
+                    )
+                    best_values_by_task[f"task_{int(t)}"] = float(study.best_value)
+                    log_event(
+                        "INFO",
+                        "family.hpo.catboost.best_params.saved",
+                        task_idx=int(t),
+                        path=str(saved_path),
+                        best_value=f"{float(study.best_value):.6f}",
+                    )
+                summary_path = _save_family_best_params(
                     outdir=best_params_dir,
                     family=family,
-                    best_params=bp,
-                    best_value=float(study.best_value),
+                    best_params=catboost_params_by_task,
+                    best_value=float(np.mean([v for v in best_values_by_task.values()] or [0.0])),
                 )
+                log_event(
+                    "INFO",
+                    "family.hpo.best_params.saved",
+                    family=str(family),
+                    path=str(summary_path),
+                )
+                best_params[family] = catboost_params_by_task
                 continue
 
             data = mil_families[family]
@@ -837,7 +915,7 @@ def run_family_suite(args: Any) -> None:
                 study.trials_dataframe(attrs=("number", "value", "state", "params", "user_attrs"))
             ).to_csv(outdir / f"{study_name}_trials.csv", index=False)
             bp = dict(study.best_params)
-            bp["min_w"] = 0.0
+            bp["min_w"] = 0.4
             best_params[family] = bp
             _save_family_best_params(
                 outdir=best_params_dir,
@@ -845,9 +923,26 @@ def run_family_suite(args: Any) -> None:
                 best_params=bp,
                 best_value=float(study.best_value),
             )
+            log_event("INFO", "family.hpo.best_params.saved", family=str(family), path=str(best_params_dir / f"{family}.json"))
     else:
         for family in cfg.model_families:
-            best_params[family] = _load_family_best_params(outdir=best_params_dir, family=family)
+            if family == "catboost_st":
+                try:
+                    best_params[family] = {
+                        f"task_{int(t)}": _load_catboost_task_best_params(outdir=best_params_dir, task_idx=int(t))
+                        for t in range(4)
+                    }
+                except FileNotFoundError:
+                    # Backward compatibility with older shared CatBoost params format.
+                    shared = _load_family_best_params(outdir=best_params_dir, family=family)
+                    best_params[family] = {f"task_{int(t)}": dict(shared) for t in range(4)}
+                    log_event(
+                        "WARN",
+                        "family.best_params.catboost.shared_fallback",
+                        path=str(best_params_dir / f"{family}.json"),
+                    )
+            else:
+                best_params[family] = _load_family_best_params(outdir=best_params_dir, family=family)
 
     if cfg.hpo_only:
         log_event("INFO", "family_suite.hpo_only.completed", n_families=int(len(cfg.model_families)))
@@ -860,15 +955,21 @@ def run_family_suite(args: Any) -> None:
 
             ids_tr = df_train[cfg.id_col].astype(str).tolist()
             ids_lb = df_lb[cfg.id_col].astype(str).tolist()
-            X2d_tr = align_by_id(ids_2d_file, X2d_file, ids_tr)
-            X2d_lb = align_by_id(ids_2d_file, X2d_file, ids_lb)
+            X2d_tr = align_by_id(ids_2d_cat_file, X2d_cat_file, ids_tr)
+            X2d_lb = align_by_id(ids_2d_cat_file, X2d_cat_file, ids_lb)
             y_tr = coerce_binary_labels(df_train)
             y_lb = coerce_binary_labels(df_lb)
             w_tr = build_task_weights(df_train)
             w_lb = build_task_weights(df_lb)
-            p = dict(best_params[family])
+            catboost_task_params = dict(best_params[family])
             pred = np.zeros((len(ids_lb), 4), dtype=np.float64)
             for t in range(4):
+                if f"task_{int(t)}" not in catboost_task_params:
+                    raise KeyError(
+                        f"Missing CatBoost params for task_{t}. "
+                        "Expected task-wise JSONs: catboost_st_t0..catboost_st_t3."
+                    )
+                p = dict(catboost_task_params[f"task_{int(t)}"])
                 pos = float(y_tr[:, t].sum())
                 neg = float(len(y_tr) - pos)
                 spw = min(neg / max(pos, 1.0), float(p.get("pos_weight_clip", 100.0)))
