@@ -275,16 +275,26 @@ class _MILMacroCrossValidator:
         return mean_score
 
 
-def _catboost_search_space(trial: optuna.Trial) -> Dict[str, Any]:
+def _catboost_search_space(trial: optuna.Trial, *, task_idx: int) -> Dict[str, Any]:
+    # Prevalence-aware clipping ranges for scale_pos_weight:
+    # t0~5.6%, t1~1.5%, t2~16.7%, t3~0.24%.
+    if int(task_idx) == 0:
+        posw_lo, posw_hi = 8.0, 35.0
+    elif int(task_idx) == 1:
+        posw_lo, posw_hi = 30.0, 120.0
+    elif int(task_idx) == 2:
+        posw_lo, posw_hi = 2.0, 12.0
+    else:  # t3
+        posw_lo, posw_hi = 120.0, 500.0
     p = {
         "depth": trial.suggest_int("depth", 4, 10),
         "learning_rate": trial.suggest_float("learning_rate", 1e-2, 2e-1, log=True),
         "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 30.0, log=True),
-        "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 1, 100),
+        "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 2, 80),
         "random_strength": trial.suggest_float("random_strength", 0.0, 2.0),
         "rsm": trial.suggest_float("rsm", 0.5, 1.0),
         "bootstrap_type": trial.suggest_categorical("bootstrap_type", ["Bayesian", "Bernoulli"]),
-        "pos_weight_clip": trial.suggest_float("pos_weight_clip", 30.0, 200.0, log=True),
+        "pos_weight_clip": trial.suggest_float("pos_weight_clip", posw_lo, posw_hi, log=True),
     }
     if p["bootstrap_type"] == "Bayesian":
         p["bagging_temperature"] = trial.suggest_float("bagging_temperature", 0.0, 10.0)
@@ -771,7 +781,7 @@ def run_family_suite(args: Any) -> None:
                     def objective(trial: optuna.Trial, task_idx: int = int(t)) -> float:
                         from catboost import CatBoostClassifier
 
-                        p = _catboost_search_space(trial)
+                        p = _catboost_search_space(trial, task_idx=int(task_idx))
                         fold_scores: List[float] = []
                         for step, (tr, va, _f) in enumerate(folds_info):
                             pos = float(y_tr[tr, task_idx].sum())
