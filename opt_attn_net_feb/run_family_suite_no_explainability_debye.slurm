@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --time=23:59:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=6
+#SBATCH --cpus-per-task=64
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
@@ -81,8 +81,8 @@ MAX_EPOCHS="${MAX_EPOCHS:-150}"
 PATIENCE="${PATIENCE:-15}"
 SEED="${SEED:-0}"
 PRECISION="${PRECISION:-16-mixed}"
-NUM_WORKERS="${NUM_WORKERS:-6}"
-CPU_WORKERS="${CPU_WORKERS:-6}"
+NUM_WORKERS="${NUM_WORKERS:-16}"
+CPU_WORKERS="${CPU_WORKERS:-64}"
 PIN_MEMORY="${PIN_MEMORY:-0}"
 
 LEADERBOARD_SPLIT="${LEADERBOARD_SPLIT:-leaderboard}"
@@ -90,6 +90,7 @@ LEADERBOARD_SPLIT="${LEADERBOARD_SPLIT:-leaderboard}"
 # Family-suite controls
 MODEL_FAMILIES="${MODEL_FAMILIES:-catboost_st mt_2d mt_2d3d mt_3d}"
 CALIBRATION_METHOD="${CALIBRATION_METHOD:-platt}"  # platt|isotonic|temperature
+CATBOOST_HPO_PARALLEL_TASKS="${CATBOOST_HPO_PARALLEL_TASKS:-4}"
 BEST_PARAMS_DIR="${BEST_PARAMS_DIR:-}"
 
 # -------------------- node-local scratch --------------------
@@ -105,7 +106,7 @@ echo "[INFO] Study dir (node-local): $STUDY_DIR"
 echo "[INFO] Output dir: $OUTDIR"
 echo "[INFO] CPUs=${SLURM_CPUS_PER_TASK} | CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "[INFO] RUN_HPO=$RUN_HPO | HPO_ONLY=$HPO_ONLY | PRUNER_WARMUP_STEPS=$PRUNER_WARMUP_STEPS"
-echo "[INFO] MODEL_FAMILIES=$MODEL_FAMILIES | CALIBRATION_METHOD=$CALIBRATION_METHOD"
+echo "[INFO] MODEL_FAMILIES=$MODEL_FAMILIES | CALIBRATION_METHOD=$CALIBRATION_METHOD | CATBOOST_HPO_PARALLEL_TASKS=$CATBOOST_HPO_PARALLEL_TASKS"
 echo "[INFO] 2D sources: scaled=$FEAT2D_SCALED | catboost_raw=$FEAT2D_RAW"
 command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || true
 
@@ -155,6 +156,7 @@ CMD=(
   --run_family_suite
   --model_families "${MODEL_FAMILIES_ARR[@]}"
   --calibration_method "$CALIBRATION_METHOD"
+  --catboost_hpo_parallel_tasks "$CATBOOST_HPO_PARALLEL_TASKS"
   --max_epochs "$MAX_EPOCHS"
   --patience "$PATIENCE"
   --seed "$SEED"

@@ -1716,6 +1716,15 @@ def _parse_args(argv: Any | None = None):
         help="Post-hoc calibration method for family probabilities on leaderboard.",
     )
     ap.add_argument(
+        "--catboost_hpo_parallel_tasks",
+        type=int,
+        default=1,
+        help=(
+            "Parallel CatBoost task-HPO workers in --run_family_suite mode. "
+            "Use 4 to optimize tasks t0..t3 concurrently."
+        ),
+    )
+    ap.add_argument(
         "--best_params_dir",
         default=None,
         help=(

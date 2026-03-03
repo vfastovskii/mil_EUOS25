@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import gc
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import optuna
@@ -12,7 +13,7 @@ import pandas as pd
 import torch
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import average_precision_score, brier_score_loss, log_loss
+from sklearn.metrics import average_precision_score, brier_score_loss, log_loss, roc_auc_score
 
 from ..data.collate import collate_train
 from ..data.datasets import MILTrainDataset
@@ -84,6 +85,7 @@ class FamilySuiteConfig:
     model_families: tuple[str, ...]
     calibration_method: str
     best_params_dir: str | None
+    catboost_hpo_parallel_tasks: int
 
 
 @dataclass(frozen=True)
@@ -740,6 +742,7 @@ def run_family_suite(args: Any) -> None:
         model_families=tuple(str(x) for x in (args.model_families or FAMILY_CHOICES)),
         calibration_method=str(args.calibration_method),
         best_params_dir=(None if args.best_params_dir is None else str(args.best_params_dir)),
+        catboost_hpo_parallel_tasks=int(getattr(args, "catboost_hpo_parallel_tasks", 1)),
     )
     invalid = [x for x in cfg.model_families if x not in FAMILY_CHOICES]
     if invalid:
@@ -775,54 +778,91 @@ def run_family_suite(args: Any) -> None:
                 w_tr = build_task_weights(df_train)
                 catboost_params_by_task: Dict[str, Dict[str, Any]] = {}
                 best_values_by_task: Dict[str, float] = {}
-                for t in range(4):
-                    study_name = f"catboost_st_t{int(t)}"
+                task_parallel = int(max(1, min(4, int(cfg.catboost_hpo_parallel_tasks))))
+                threads_per_task = int(max(1, int(cfg.cpu_workers) // task_parallel))
+                log_event(
+                    "INFO",
+                    "family.hpo.catboost.parallel_config",
+                    task_parallel=int(task_parallel),
+                    cpu_workers=int(cfg.cpu_workers),
+                    threads_per_task=int(threads_per_task),
+                )
 
-                    def objective(trial: optuna.Trial, task_idx: int = int(t)) -> float:
+                def _run_catboost_task_hpo(task_idx: int) -> tuple[str, Dict[str, Any], float]:
+                    study_name = f"catboost_st_t{int(task_idx)}"
+
+                    def objective(trial: optuna.Trial, task_idx_inner: int = int(task_idx)) -> float:
                         from catboost import CatBoostClassifier
 
-                        p = _catboost_search_space(trial, task_idx=int(task_idx))
-                        fold_scores: List[float] = []
-                        for step, (tr, va, _f) in enumerate(folds_info):
-                            pos = float(y_tr[tr, task_idx].sum())
+                        p = _catboost_search_space(trial, task_idx=int(task_idx_inner))
+                        fold_pr_scores: List[float] = []
+                        fold_roc_scores: List[float] = []
+                        for fold_step, (tr, va, fold_id) in enumerate(folds_info):
+                            pos = float(y_tr[tr, task_idx_inner].sum())
                             neg = float(len(tr) - pos)
                             spw = min(neg / max(pos, 1.0), float(p["pos_weight_clip"]))
                             cb = CatBoostClassifier(
                                 **_catboost_common_params(
                                     params=p,
-                                    seed=int(cfg.seed) + 97 * int(task_idx) + 7919 * int(trial.number),
-                                    threads=max(1, int(cfg.cpu_workers)),
+                                    seed=int(cfg.seed) + 97 * int(task_idx_inner) + 7919 * int(trial.number),
+                                    threads=int(threads_per_task),
                                     scale_pos_weight=float(spw),
                                 )
                             )
-                            sw = (w_tr[tr, task_idx] if task_idx in (0, 1) else None)
+                            sw = (w_tr[tr, task_idx_inner] if task_idx_inner in (0, 1) else None)
                             cb.fit(
                                 X2d_tr[tr],
-                                y_tr[tr, task_idx],
+                                y_tr[tr, task_idx_inner],
                                 sample_weight=sw,
-                                eval_set=(X2d_tr[va], y_tr[va, task_idx]),
+                                eval_set=(X2d_tr[va], y_tr[va, task_idx_inner]),
                                 use_best_model=True,
                                 early_stopping_rounds=200,
                                 verbose=False,
                             )
                             p_va = cb.predict_proba(X2d_tr[va])[:, 1]
                             p_va = np.clip(np.nan_to_num(p_va, nan=0.5, posinf=1.0, neginf=0.0), 0.0, 1.0)
-                            sw_va = (w_tr[va, task_idx] if task_idx in (0, 1) else None)
+                            sw_va = (w_tr[va, task_idx_inner] if task_idx_inner in (0, 1) else None)
                             try:
-                                ap_t = float(average_precision_score(y_tr[va, task_idx], p_va, sample_weight=sw_va))
+                                ap_t = float(average_precision_score(y_tr[va, task_idx_inner], p_va, sample_weight=sw_va))
                             except ValueError:
                                 ap_t = 0.0
-                            fold_scores.append(ap_t)
-                            trial.report(float(np.mean(fold_scores)), step=int(step))
+                            try:
+                                roc_t = float(roc_auc_score(y_tr[va, task_idx_inner], p_va, sample_weight=sw_va))
+                            except ValueError:
+                                roc_t = 0.5
+                            fold_pr_scores.append(ap_t)
+                            fold_roc_scores.append(roc_t)
+                            trial.report(float(np.mean(fold_pr_scores)), step=int(fold_step))
                             if trial.should_prune():
                                 raise optuna.TrialPruned()
-                        return float(np.mean(fold_scores))
+                            log_event(
+                                "INFO",
+                                "family.hpo.catboost.trial.fold",
+                                task_idx=int(task_idx_inner),
+                                trial=int(trial.number),
+                                fold_id=int(fold_id),
+                                pr_auc=f"{ap_t:.6f}",
+                                roc_auc=f"{roc_t:.6f}",
+                            )
+                        mean_pr = float(np.mean(fold_pr_scores)) if fold_pr_scores else 0.0
+                        mean_roc = float(np.mean(fold_roc_scores)) if fold_roc_scores else 0.5
+                        trial.set_user_attr("cv_pr_auc", mean_pr)
+                        trial.set_user_attr("cv_roc_auc", mean_roc)
+                        log_event(
+                            "INFO",
+                            "family.hpo.catboost.trial.done",
+                            task_idx=int(task_idx_inner),
+                            trial=int(trial.number),
+                            cv_pr_auc=f"{mean_pr:.6f}",
+                            cv_roc_auc=f"{mean_roc:.6f}",
+                        )
+                        return mean_pr
 
                     storage = f"sqlite:///{(outdir / f'{study_name}.sqlite3').as_posix()}"
                     study = optuna.create_study(
                         study_name=study_name,
                         direction="maximize",
-                        sampler=optuna.samplers.TPESampler(seed=int(cfg.seed) + 113 * int(t)),
+                        sampler=optuna.samplers.TPESampler(seed=int(cfg.seed) + 113 * int(task_idx)),
                         pruner=optuna.pruners.PercentilePruner(
                             percentile=25.0,
                             n_startup_trials=10,
@@ -831,28 +871,40 @@ def run_family_suite(args: Any) -> None:
                         storage=storage,
                         load_if_exists=True,
                     )
-                    with log_step("family.hpo.catboost.optimize", task_idx=int(t), n_trials=int(cfg.trials)):
+                    with log_step("family.hpo.catboost.optimize", task_idx=int(task_idx), n_trials=int(cfg.trials)):
                         study.optimize(objective, n_trials=int(cfg.trials), gc_after_trial=True)
                     pd.DataFrame(
                         study.trials_dataframe(attrs=("number", "value", "state", "params", "user_attrs"))
                     ).to_csv(outdir / f"{study_name}_trials.csv", index=False)
 
                     bp_t = dict(study.best_params)
-                    catboost_params_by_task[f"task_{int(t)}"] = bp_t
                     saved_path = _save_catboost_task_best_params(
                         outdir=best_params_dir,
-                        task_idx=int(t),
+                        task_idx=int(task_idx),
                         best_params=bp_t,
                         best_value=float(study.best_value),
                     )
-                    best_values_by_task[f"task_{int(t)}"] = float(study.best_value)
                     log_event(
                         "INFO",
                         "family.hpo.catboost.best_params.saved",
-                        task_idx=int(t),
+                        task_idx=int(task_idx),
                         path=str(saved_path),
                         best_value=f"{float(study.best_value):.6f}",
                     )
+                    return f"task_{int(task_idx)}", bp_t, float(study.best_value)
+
+                if int(task_parallel) <= 1:
+                    for t in range(4):
+                        key, bp_t, best_v = _run_catboost_task_hpo(int(t))
+                        catboost_params_by_task[key] = bp_t
+                        best_values_by_task[key] = float(best_v)
+                else:
+                    with ThreadPoolExecutor(max_workers=int(task_parallel)) as pool:
+                        futures = [pool.submit(_run_catboost_task_hpo, int(t)) for t in range(4)]
+                        for fut in as_completed(futures):
+                            key, bp_t, best_v = fut.result()
+                            catboost_params_by_task[key] = bp_t
+                            best_values_by_task[key] = float(best_v)
                 summary_path = _save_family_best_params(
                     outdir=best_params_dir,
                     family=family,
