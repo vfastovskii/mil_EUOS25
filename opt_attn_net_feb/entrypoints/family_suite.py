@@ -306,13 +306,13 @@ def _catboost_search_space(trial: optuna.Trial, *, task_idx: int) -> Dict[str, A
     # Prevalence-aware clipping ranges for scale_pos_weight:
     # t0~5.6%, t1~1.5%, t2~16.7%, t3~0.24%.
     if int(task_idx) == 0:
-        posw_lo, posw_hi = 8.0, 35.0
+        posw_lo, posw_hi = 10.0, 70.0
     elif int(task_idx) == 1:
-        posw_lo, posw_hi = 30.0, 120.0
+        posw_lo, posw_hi = 90.0, 250.0
     elif int(task_idx) == 2:
-        posw_lo, posw_hi = 2.0, 12.0
+        posw_lo, posw_hi = 10.0, 70.0
     else:  # t3
-        posw_lo, posw_hi = 120.0, 500.0
+        posw_lo, posw_hi = 90.0, 300.0
     p = {
         "depth": trial.suggest_int("depth", 4, 10),
         "learning_rate": trial.suggest_float("learning_rate", 1e-2, 2e-1, log=True),
