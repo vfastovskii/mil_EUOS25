@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=Blend
 #SBATCH --export=ALL,MODULESHOME='',MODULEPATH=''   # Required on Debye
-#SBATCH --partition=qGPUr
+#SBATCH --partition=qEPYC
 #SBATCH --gres=gpu:1
 #SBATCH --time=23:59:00
 #SBATCH --ntasks=1
@@ -99,11 +99,22 @@ STUDY_DIR="${WORKDIR}/study_${SLURM_JOB_ID}"
 OUTDIR="${OUTDIR:-${REPO_DIR}/study_${SLURM_JOB_ID}}"
 mkdir -p "$WORKDIR" "$STUDY_DIR" "$OUTDIR"
 
+# Mirror best params immediately during HPO to persistent storage.
+export FAMILY_SUITE_BEST_PARAMS_MIRROR_DIR="${FAMILY_SUITE_BEST_PARAMS_MIRROR_DIR:-${OUTDIR}/best_params}"
+mkdir -p "$FAMILY_SUITE_BEST_PARAMS_MIRROR_DIR"
+
+copy_back_partial() {
+  echo "[INFO] EXIT trap: syncing partial results back..."
+  rsync -av "$STUDY_DIR/" "$OUTDIR/" || true
+}
+trap copy_back_partial EXIT
+
 echo "[INFO] JobID: ${SLURM_JOB_ID}"
 echo "[INFO] Host: $(hostname)"
 echo "[INFO] Workdir: $WORKDIR"
 echo "[INFO] Study dir (node-local): $STUDY_DIR"
 echo "[INFO] Output dir: $OUTDIR"
+echo "[INFO] Best params mirror dir: $FAMILY_SUITE_BEST_PARAMS_MIRROR_DIR"
 echo "[INFO] CPUs=${SLURM_CPUS_PER_TASK} | CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "[INFO] RUN_HPO=$RUN_HPO | HPO_ONLY=$HPO_ONLY | PRUNER_WARMUP_STEPS=$PRUNER_WARMUP_STEPS"
 echo "[INFO] MODEL_FAMILIES=$MODEL_FAMILIES | CALIBRATION_METHOD=$CALIBRATION_METHOD | CATBOOST_HPO_PARALLEL_TASKS=$CATBOOST_HPO_PARALLEL_TASKS"

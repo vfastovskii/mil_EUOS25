@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import gc
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -53,6 +54,28 @@ from ..utils.ops import (
 from ..utils.progress import log_event, log_step
 
 FAMILY_CHOICES: tuple[str, ...] = ("catboost_st", "mt_2d", "mt_2d3d", "mt_3d")
+
+
+def _maybe_mirror_best_params(path: Path) -> None:
+    """
+    Mirror best-params artifact to persistent storage immediately if configured.
+
+    Set env var `FAMILY_SUITE_BEST_PARAMS_MIRROR_DIR` to enable.
+    """
+    mirror_dir = str(os.environ.get("FAMILY_SUITE_BEST_PARAMS_MIRROR_DIR", "")).strip()
+    if not mirror_dir:
+        return
+    src = Path(path)
+    try:
+        dst_dir = Path(mirror_dir)
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst = dst_dir / src.name
+        tmp = dst.with_suffix(dst.suffix + ".tmp")
+        tmp.write_bytes(src.read_bytes())
+        tmp.replace(dst)
+        log_event("INFO", "family.hpo.best_params.mirrored", src=str(src), dst=str(dst))
+    except Exception as exc:
+        log_event("WARN", "family.hpo.best_params.mirror_failed", src=str(src), error=repr(exc))
 
 
 @dataclass(frozen=True)
@@ -189,6 +212,7 @@ def _save_family_best_params(*, outdir: Path, family: str, best_params: Mapping[
         "best_value_macro_ap_cv": float(best_value),
     }
     path.write_text(json.dumps(payload, indent=2))
+    _maybe_mirror_best_params(path)
     return path
 
 
@@ -209,6 +233,7 @@ def _save_catboost_task_best_params(
         "best_value_pr_auc_cv": float(best_value),
     }
     path.write_text(json.dumps(payload, indent=2))
+    _maybe_mirror_best_params(path)
     return path
 
 
