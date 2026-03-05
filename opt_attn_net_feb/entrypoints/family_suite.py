@@ -110,6 +110,9 @@ class FamilySuiteConfig:
     best_params_dir: str | None
     family_best_params_json: str | None
     catboost_task_params_jsons: tuple[str, ...]
+    mt_2d_params_json: str | None
+    mt_2d3d_params_json: str | None
+    mt_3d_params_json: str | None
     catboost_hpo_parallel_tasks: int
 
 
@@ -275,6 +278,26 @@ def _load_family_overrides_json(path: Path) -> Dict[str, Any]:
     return dict(payload)
 
 
+def _load_single_family_override_json(*, path: Path, family: str) -> Any:
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"Invalid params JSON for family '{family}': expected object, got {type(payload).__name__}"
+        )
+    payload_family = payload.get("family")
+    if isinstance(payload_family, str) and str(payload_family) != str(family):
+        raise ValueError(
+            f"Family mismatch in {path}: expected '{family}', got '{payload_family}'"
+        )
+    value: Any = payload.get("best_params") if isinstance(payload.get("best_params"), dict) else payload
+    if not isinstance(value, dict):
+        raise ValueError(f"Invalid params JSON for family '{family}' in {path}: best_params must be a dict.")
+    # Remove metadata keys if a bare object with metadata was provided.
+    if "best_params" not in payload:
+        value = {k: v for k, v in value.items() if k not in {"family", "best_value_macro_ap_cv"}}
+    return _normalize_family_params(family=family, value=value)
+
+
 def _normalize_catboost_params(value: Any) -> Dict[str, Dict[str, Any]]:
     if isinstance(value, dict) and isinstance(value.get("best_params"), dict):
         value = value["best_params"]
@@ -364,7 +387,7 @@ def _search_space_mt_2d(trial: optuna.Trial) -> Dict[str, Any]:
         "activation": trial.suggest_categorical("activation", ["GELU", "ReLU", "LeakyReLU"]),
         "lr": trial.suggest_float("lr", 8e-5, 8e-3, log=True),
         "weight_decay": trial.suggest_float("weight_decay", 3e-6, 3e-4, log=True),
-        "batch_size": trial.suggest_categorical("batch_size", [512, 1024, 2048]),
+        "batch_size": trial.suggest_categorical("batch_size", [128, 256, 512, 1024]),
         "posw_clip_t0": trial.suggest_float("posw_clip_t0", 12.0, 28.0, log=True),
         "posw_clip_t1": trial.suggest_float("posw_clip_t1", 35.0, 90.0, log=True),
         "posw_clip_t2": trial.suggest_float("posw_clip_t2", 3.0, 10.0, log=True),
@@ -397,7 +420,10 @@ def _search_space_mt_2d(trial: optuna.Trial) -> Dict[str, Any]:
 def _mil_search_space_for_family(*, trial: optuna.Trial, family: str) -> Dict[str, Any]:
     if str(family) == "mt_2d":
         return _search_space_mt_2d(trial)
-    return search_space(trial)
+    if str(family) in {"mt_2d3d", "mt_3d"}:
+        # 3D-bearing families are the most memory intensive; keep per-step batch conservative.
+        return search_space(trial, batch_choices=(128, 256, 512))
+    return search_space(trial, batch_choices=(256, 512, 1024))
 
 
 class _MILMacroCrossValidator:
@@ -422,11 +448,45 @@ class _MILMacroCrossValidator:
         fold_scores: List[float] = []
         fold_detail: Dict[str, Any] = {}
         for step, (tr, va, fold_id) in enumerate(self.data.folds_info):
-            _unused_score, detail = fold_runner.run_fold(
-                train_idx=np.asarray(tr, dtype=np.int64),
-                val_idx=np.asarray(va, dtype=np.int64),
-                fold_id=int(fold_id),
-            )
+            try:
+                _unused_score, detail = fold_runner.run_fold(
+                    train_idx=np.asarray(tr, dtype=np.int64),
+                    val_idx=np.asarray(va, dtype=np.int64),
+                    fold_id=int(fold_id),
+                )
+            except torch.cuda.OutOfMemoryError as exc:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+                log_event(
+                    "WARN",
+                    "family.hpo.trial.pruned_oom",
+                    trial=int(trial.number),
+                    family=str(self.family),
+                    fold=int(fold_id),
+                    error=repr(exc),
+                )
+                raise optuna.TrialPruned(
+                    f"OOM in family={self.family} trial={int(trial.number)} fold={int(fold_id)}"
+                ) from exc
+            except RuntimeError as exc:
+                msg = str(exc).lower()
+                if ("out of memory" in msg) and ("cuda" in msg):
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                    log_event(
+                        "WARN",
+                        "family.hpo.trial.pruned_oom",
+                        trial=int(trial.number),
+                        family=str(self.family),
+                        fold=int(fold_id),
+                        error=repr(exc),
+                    )
+                    raise optuna.TrialPruned(
+                        f"OOM in family={self.family} trial={int(trial.number)} fold={int(fold_id)}"
+                    ) from exc
+                raise
             fold_macro = float(detail.get("macro_pr_auc_best_epoch", detail.get("macro_ap_best_epoch", 0.0)))
             fold_scores.append(fold_macro)
             detail["objective_macro_ap"] = float(fold_macro)
@@ -915,6 +975,15 @@ def run_family_suite(args: Any) -> None:
             None if getattr(args, "family_best_params_json", None) in (None, "") else str(args.family_best_params_json)
         ),
         catboost_task_params_jsons=tuple(str(x) for x in (getattr(args, "catboost_task_params_jsons", None) or [])),
+        mt_2d_params_json=(
+            None if getattr(args, "mt_2d_params_json", None) in (None, "") else str(args.mt_2d_params_json)
+        ),
+        mt_2d3d_params_json=(
+            None if getattr(args, "mt_2d3d_params_json", None) in (None, "") else str(args.mt_2d3d_params_json)
+        ),
+        mt_3d_params_json=(
+            None if getattr(args, "mt_3d_params_json", None) in (None, "") else str(args.mt_3d_params_json)
+        ),
         catboost_hpo_parallel_tasks=int(getattr(args, "catboost_hpo_parallel_tasks", 1)),
     )
     invalid = [x for x in cfg.model_families if x not in FAMILY_CHOICES]
@@ -949,6 +1018,32 @@ def run_family_suite(args: Any) -> None:
             "family_suite.catboost_task_overrides.loaded",
             n_files=int(len(cfg.catboost_task_params_jsons)),
             tasks=",".join(sorted(catboost_override.keys())),
+        )
+    per_family_override_paths: Dict[str, str] = {
+        "mt_2d": str(cfg.mt_2d_params_json) if cfg.mt_2d_params_json else "",
+        "mt_2d3d": str(cfg.mt_2d3d_params_json) if cfg.mt_2d3d_params_json else "",
+        "mt_3d": str(cfg.mt_3d_params_json) if cfg.mt_3d_params_json else "",
+    }
+    for fam, raw_path in per_family_override_paths.items():
+        if not raw_path:
+            continue
+        p = Path(raw_path)
+        if not p.exists():
+            raise FileNotFoundError(f"{fam} params JSON not found: {p}")
+        if fam in override_params:
+            log_event(
+                "INFO",
+                "family_suite.family_override.replaced_existing",
+                family=str(fam),
+                previous_source="family_best_params_json",
+                new_source="family_specific_flag",
+            )
+        override_params[fam] = _load_single_family_override_json(path=p, family=fam)
+        log_event(
+            "INFO",
+            "family_suite.family_override.loaded",
+            family=str(fam),
+            path=str(p),
         )
 
     with log_step("family_suite.prepare_data", families=list(cfg.model_families)):

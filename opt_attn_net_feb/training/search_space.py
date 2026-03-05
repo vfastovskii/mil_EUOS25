@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Iterable
 
 import optuna
 from optuna.trial import Trial
 
 
-def search_space(trial: Trial) -> Dict[str, Any]:
+def search_space(
+    trial: Trial,
+    *,
+    batch_choices: Iterable[int] | None = None,
+) -> Dict[str, Any]:
     """
     Generates a dictionary defining a hyperparameter search space for optimization.
 
@@ -35,6 +39,9 @@ def search_space(trial: Trial) -> Dict[str, Any]:
         A dictionary containing the suggested values for each parameter within the
         specified hyperparameter search space.
     """
+    batch_values = [512, 1024, 2048] if batch_choices is None else [int(x) for x in batch_choices]
+    if len(batch_values) == 0:
+        raise ValueError("batch_choices must contain at least one value.")
     p = {"mol_hidden": trial.suggest_categorical("mol_hidden", [128, 256, 512]),
          "mol_layers": trial.suggest_int("mol_layers", 2, 5),
          "mol_dropout": trial.suggest_float("mol_dropout", 0.01, 0.25),
@@ -57,7 +64,7 @@ def search_space(trial: Trial) -> Dict[str, Any]:
          "activation": trial.suggest_categorical("activation", ["GELU", "ReLU", "LeakyReLU"]),
          "lr": trial.suggest_float("lr", 8e-5, 8e-3, log=True),
          "weight_decay": trial.suggest_float("weight_decay", 3e-6, 3e-4, log=True),
-         "batch_size": trial.suggest_categorical("batch_size", [512, 1024, 2048]),
+         "batch_size": trial.suggest_categorical("batch_size", batch_values),
 
          # Task mapping
          # t0 -> Transmittance_340

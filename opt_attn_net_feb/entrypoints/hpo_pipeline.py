@@ -1753,6 +1753,30 @@ def _parse_args(argv: Any | None = None):
         ),
     )
     ap.add_argument(
+        "--mt_2d_params_json",
+        default=None,
+        help=(
+            "Optional best-params JSON override for mt_2d in --run_family_suite mode. "
+            "When provided, mt_2d HPO is skipped and these params are used."
+        ),
+    )
+    ap.add_argument(
+        "--mt_2d3d_params_json",
+        default=None,
+        help=(
+            "Optional best-params JSON override for mt_2d3d in --run_family_suite mode. "
+            "When provided, mt_2d3d HPO is skipped and these params are used."
+        ),
+    )
+    ap.add_argument(
+        "--mt_3d_params_json",
+        default=None,
+        help=(
+            "Optional best-params JSON override for mt_3d in --run_family_suite mode. "
+            "When provided, mt_3d HPO is skipped and these params are used."
+        ),
+    )
+    ap.add_argument(
         "--run_hpo",
         action="store_true",
         help="Run Optuna CV optimization before final train.",

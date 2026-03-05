@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=famSuite
+#SBATCH --job-name=Blend04
 #SBATCH --export=ALL,MODULESHOME='',MODULEPATH=''   # Required on Debye
-#SBATCH --partition=qEPYC
+#SBATCH --partition=qGPU
 #SBATCH --gres=gpu:1
 #SBATCH --time=23:59:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=6
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
@@ -48,6 +48,7 @@ PY
 # -------------------- python/thread hygiene --------------------
 export PYTHONUNBUFFERED=1
 export PYTHONDONTWRITEBYTECODE=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:128,garbage_collection_threshold:0.8}"
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -58,7 +59,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 # -------------------- paths --------------------
 # Keep the same layout convention as run_mil_hpo_debye.slurm
-REPO_DIR="${REPO_DIR:-/scratch/vfastovskii/opt_attn_net_feb}"
+REPO_DIR="${REPO_DIR:-/scratch/vfastovskii/opt_attn_net_feb/blend_preopt}"
 SCRIPT="${SCRIPT:-${REPO_DIR}/opt_net_fast.py}"
 PKGDIR="${PKGDIR:-${REPO_DIR}/opt_attn_net_feb}"
 
@@ -81,8 +82,8 @@ MAX_EPOCHS="${MAX_EPOCHS:-150}"
 PATIENCE="${PATIENCE:-15}"
 SEED="${SEED:-0}"
 PRECISION="${PRECISION:-16-mixed}"
-NUM_WORKERS="${NUM_WORKERS:-16}"
-CPU_WORKERS="${CPU_WORKERS:-64}"
+NUM_WORKERS="${NUM_WORKERS:-6}"
+CPU_WORKERS="${CPU_WORKERS:-6}"
 PIN_MEMORY="${PIN_MEMORY:-0}"
 
 LEADERBOARD_SPLIT="${LEADERBOARD_SPLIT:-leaderboard}"
@@ -93,7 +94,10 @@ CALIBRATION_METHOD="${CALIBRATION_METHOD:-platt}"  # platt|isotonic|temperature
 CATBOOST_HPO_PARALLEL_TASKS="${CATBOOST_HPO_PARALLEL_TASKS:-4}"
 BEST_PARAMS_DIR="${BEST_PARAMS_DIR:-}"
 FAMILY_BEST_PARAMS_JSON="${FAMILY_BEST_PARAMS_JSON:-}"
-CATBOOST_TASK_PARAMS_JSONS="${CATBOOST_TASK_PARAMS_JSONS:-"t0.json t1.json t2.json t3.json"}"
+CATBOOST_TASK_PARAMS_JSONS="${CATBOOST_TASK_PARAMS_JSONS:-"${DATA_DIR}/t0.json ${DATA_DIR}/t1.json ${DATA_DIR}/t2.json ${DATA_DIR}/t3.json"}"
+MT_2D_PARAMS_JSON="${MT_2D_PARAMS_JSON:-"${DATA_DIR}/mt_2d.json"}"
+#MT_2D3D_PARAMS_JSON="${MT_2D3D_PARAMS_JSON:-}"
+#MT_3D_PARAMS_JSON="${MT_3D_PARAMS_JSON:-}"
 
 # -------------------- node-local scratch --------------------
 WORKDIR="${SLURM_TMPDIR:-/tmp}/${SLURM_JOB_ID}"
@@ -123,6 +127,9 @@ echo "[INFO] MODEL_FAMILIES=$MODEL_FAMILIES | CALIBRATION_METHOD=$CALIBRATION_ME
 echo "[INFO] 2D sources: scaled=$FEAT2D_SCALED | catboost_raw=$FEAT2D_RAW"
 echo "[INFO] FAMILY_BEST_PARAMS_JSON=${FAMILY_BEST_PARAMS_JSON:-<none>}"
 echo "[INFO] CATBOOST_TASK_PARAMS_JSONS=${CATBOOST_TASK_PARAMS_JSONS:-<none>}"
+echo "[INFO] MT_2D_PARAMS_JSON=${MT_2D_PARAMS_JSON:-<none>}"
+echo "[INFO] MT_2D3D_PARAMS_JSON=${MT_2D3D_PARAMS_JSON:-<none>}"
+echo "[INFO] MT_3D_PARAMS_JSON=${MT_3D_PARAMS_JSON:-<none>}"
 command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || true
 
 # fail fast
@@ -145,6 +152,15 @@ if [[ -n "$CATBOOST_TASK_PARAMS_JSONS" ]]; then
   for _p in "${CATBOOST_TASK_JSON_ARR[@]}"; do
     [[ -f "$_p" ]] || { echo "[ERROR] Missing CATBOOST task params JSON: $_p"; exit 2; }
   done
+fi
+if [[ -n "$MT_2D_PARAMS_JSON" ]]; then
+  [[ -f "$MT_2D_PARAMS_JSON" ]] || { echo "[ERROR] Missing MT_2D_PARAMS_JSON: $MT_2D_PARAMS_JSON"; exit 2; }
+fi
+if [[ -n "$MT_2D3D_PARAMS_JSON" ]]; then
+  [[ -f "$MT_2D3D_PARAMS_JSON" ]] || { echo "[ERROR] Missing MT_2D3D_PARAMS_JSON: $MT_2D3D_PARAMS_JSON"; exit 2; }
+fi
+if [[ -n "$MT_3D_PARAMS_JSON" ]]; then
+  [[ -f "$MT_3D_PARAMS_JSON" ]] || { echo "[ERROR] Missing MT_3D_PARAMS_JSON: $MT_3D_PARAMS_JSON"; exit 2; }
 fi
 if [[ -n "$FAMILY_BEST_PARAMS_JSON" && -n "$CATBOOST_TASK_PARAMS_JSONS" ]]; then
   echo "[INFO] Both FAMILY_BEST_PARAMS_JSON and CATBOOST_TASK_PARAMS_JSONS were provided."
@@ -172,6 +188,15 @@ if [[ -n "$CATBOOST_TASK_PARAMS_JSONS" ]]; then
   for _p in "${CATBOOST_TASK_JSON_ARR[@]}"; do
     cp -v "$_p" "$WORKDIR/"
   done
+fi
+if [[ -n "$MT_2D_PARAMS_JSON" ]]; then
+  cp -v "$MT_2D_PARAMS_JSON" "$WORKDIR/"
+fi
+if [[ -n "$MT_2D3D_PARAMS_JSON" ]]; then
+  cp -v "$MT_2D3D_PARAMS_JSON" "$WORKDIR/"
+fi
+if [[ -n "$MT_3D_PARAMS_JSON" ]]; then
+  cp -v "$MT_3D_PARAMS_JSON" "$WORKDIR/"
 fi
 
 export PYTHONPATH="$WORKDIR:${PYTHONPATH:-}"
@@ -226,6 +251,15 @@ if [[ -n "$CATBOOST_TASK_PARAMS_JSONS" ]]; then
     _task_json_args+=("$WORKDIR/$(basename "$_p")")
   done
   CMD+=(--catboost_task_params_jsons "${_task_json_args[@]}")
+fi
+if [[ -n "$MT_2D_PARAMS_JSON" ]]; then
+  CMD+=(--mt_2d_params_json "$WORKDIR/$(basename "$MT_2D_PARAMS_JSON")")
+fi
+if [[ -n "$MT_2D3D_PARAMS_JSON" ]]; then
+  CMD+=(--mt_2d3d_params_json "$WORKDIR/$(basename "$MT_2D3D_PARAMS_JSON")")
+fi
+if [[ -n "$MT_3D_PARAMS_JSON" ]]; then
+  CMD+=(--mt_3d_params_json "$WORKDIR/$(basename "$MT_3D_PARAMS_JSON")")
 fi
 
 printf '[INFO] CMD: %q ' "${CMD[@]}"; echo
