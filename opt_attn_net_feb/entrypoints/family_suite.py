@@ -1029,7 +1029,7 @@ def _run_mil_oof_predictions(
             "family.cv.mil.fold",
             family=str(family),
             fold=int(fold_id),
-            step=int(fold_step),
+            cv_step=int(fold_step),
             n_train=int(tr_idx.size),
             n_val=int(va_idx.size),
         )
@@ -1127,6 +1127,8 @@ def _run_catboost_oof_predictions(
     fold_ids = np.full((len(ids_tr),), -1, dtype=np.int64)
     fold_metric_rows: List[Dict[str, Any]] = []
     best_iters_by_task: Dict[int, List[int]] = {int(t): [] for t in range(4)}
+    cap_hits_by_task: Dict[int, int] = {int(t): 0 for t in range(4)}
+    folds_by_task: Dict[int, int] = {int(t): 0 for t in range(4)}
     for fold_step, (tr, va, fold_id) in enumerate(folds_info):
         tr_idx = np.asarray(tr, dtype=np.int64)
         va_idx = np.asarray(va, dtype=np.int64)
@@ -1137,6 +1139,7 @@ def _run_catboost_oof_predictions(
             if key not in task_best_params:
                 raise KeyError(f"Missing CatBoost params for {key}")
             p = dict(task_best_params[key])
+            iter_cap = int(p.get("iterations", 4000))
             pos = float(y_tr[tr_idx, t].sum())
             neg = float(len(tr_idx) - pos)
             spw = min(neg / max(pos, 1.0), float(p.get("pos_weight_clip", 100.0)))
@@ -1161,7 +1164,11 @@ def _run_catboost_oof_predictions(
             bi = int(cb.get_best_iteration())
             if bi < 0:
                 bi = int(cb.tree_count_) - 1
+            best_iter_1based = int(max(1, int(max(0, bi)) + 1))
             best_iters_by_task[int(t)].append(int(max(0, bi)))
+            folds_by_task[int(t)] = int(folds_by_task[int(t)] + 1)
+            if int(best_iter_1based) >= int(iter_cap):
+                cap_hits_by_task[int(t)] = int(cap_hits_by_task[int(t)] + 1)
             p_va = cb.predict_proba(X2d_tr[va_idx])[:, 1]
             p_fold[:, t] = np.asarray(_clip_prob(p_va), dtype=np.float32)
         oof[va_idx, :] = p_fold
@@ -1197,17 +1204,35 @@ def _run_catboost_oof_predictions(
     for t in range(4):
         plus_one = [int(x) + 1 for x in best_iters_by_task.get(int(t), [])]
         selected_iterations[int(t)] = int(max(1, int(np.median(np.asarray(plus_one, dtype=np.int64))))) if plus_one else 4000
+        n_folds_t = int(folds_by_task.get(int(t), 0))
+        cap_hits_t = int(cap_hits_by_task.get(int(t), 0))
+        cap_hit_rate = float(cap_hits_t / float(max(1, n_folds_t)))
         log_event(
             "INFO",
             "family.cv.catboost.iter_selection",
             task_idx=int(t),
             fold_best_iterations=",".join([str(int(x)) for x in best_iters_by_task.get(int(t), [])]),
             selected_iterations=int(selected_iterations[int(t)]),
+            cap_hits=int(cap_hits_t),
+            n_folds=int(n_folds_t),
+            cap_hit_rate=f"{cap_hit_rate:.3f}",
         )
+        if cap_hit_rate >= 0.5:
+            log_event(
+                "WARN",
+                "family.cv.catboost.iter_selection.cap_hit_high",
+                task_idx=int(t),
+                cap_hits=int(cap_hits_t),
+                n_folds=int(n_folds_t),
+                cap_hit_rate=f"{cap_hit_rate:.3f}",
+                recommendation="Consider increasing CatBoost iterations cap above 4000 for this task.",
+            )
     summary = {
         "family": str(family),
         "fold_best_iterations": {str(int(k)): [int(x) for x in v] for k, v in best_iters_by_task.items()},
         "selected_iterations": {str(int(k)): int(v) for k, v in selected_iterations.items()},
+        "cap_hits_by_task": {str(int(k)): int(v) for k, v in cap_hits_by_task.items()},
+        "n_folds_by_task": {str(int(k)): int(v) for k, v in folds_by_task.items()},
     }
     return df_oof, pd.DataFrame(fold_metric_rows), summary
 
@@ -2046,7 +2071,6 @@ def run_family_suite(args: Any) -> None:
                     X2d_tr,
                     y_tr[:, t],
                     sample_weight=sw,
-                    eval_set=(X2d_tr, y_tr[:, t]),
                     use_best_model=False,
                     verbose=False,
                 )
