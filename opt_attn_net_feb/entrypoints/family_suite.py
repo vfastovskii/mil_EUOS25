@@ -242,6 +242,50 @@ def _save_catboost_task_best_params(
     return path
 
 
+def _save_family_final_epochs(
+    *,
+    outdir: Path,
+    family: str,
+    fold_best_epochs: Sequence[int],
+    selected_epochs: int,
+) -> Path:
+    outdir.mkdir(parents=True, exist_ok=True)
+    path = outdir / f"final_epochs_{family}.json"
+    payload = {
+        "family": str(family),
+        "selection_scope": "cv_train_only",
+        "selection_rule": "median(best_epoch_plus_1)",
+        "fold_best_epochs": [int(x) for x in fold_best_epochs],
+        "selected_epochs": int(selected_epochs),
+    }
+    path.write_text(json.dumps(payload, indent=2))
+    _maybe_mirror_best_params(path)
+    return path
+
+
+def _save_catboost_final_iterations(
+    *,
+    outdir: Path,
+    task_idx: int,
+    fold_best_iterations: Sequence[int],
+    selected_iterations: int,
+) -> Path:
+    outdir.mkdir(parents=True, exist_ok=True)
+    path = outdir / f"final_iterations_catboost_t{int(task_idx)}.json"
+    payload = {
+        "family": "catboost_st",
+        "task_idx": int(task_idx),
+        "task_name": str(TASK_COLS[int(task_idx)]),
+        "selection_scope": "cv_train_only",
+        "selection_rule": "median(best_iteration_plus_1)",
+        "fold_best_iterations": [int(x) for x in fold_best_iterations],
+        "selected_iterations": int(selected_iterations),
+    }
+    path.write_text(json.dumps(payload, indent=2))
+    _maybe_mirror_best_params(path)
+    return path
+
+
 def _load_catboost_task_best_params(*, outdir: Path, task_idx: int) -> Dict[str, Any]:
     path = outdir / f"catboost_st_t{int(task_idx)}.json"
     if not path.exists():
@@ -666,7 +710,8 @@ def _run_mil_final_train_and_predict(
     outdir: Path,
     write_outputs: bool = True,
     output_prefix: str = "leaderboard",
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    fixed_train_epochs: int | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     set_all_seeds(int(cfg.seed))
     hpo_cfg = HPOConfig.from_params(
         dict(best_params),
@@ -834,14 +879,17 @@ def _run_mil_final_train_and_predict(
 
     family_dir = outdir / family_data.family
     family_dir.mkdir(parents=True, exist_ok=True)
+    use_fixed_epochs = fixed_train_epochs is not None
+    target_epochs = int(fixed_train_epochs) if use_fixed_epochs else int(cfg.max_epochs)
+    target_patience = int(max(int(cfg.patience), target_epochs + 5)) if use_fixed_epochs else int(cfg.patience)
     trainer_cfg = LightningTrainerConfig(
-        max_epochs=int(cfg.max_epochs),
-        patience=int(cfg.patience),
+        max_epochs=int(target_epochs),
+        patience=int(target_patience),
         accelerator=str(cfg.nn_accelerator),
         devices=int(cfg.nn_devices),
         precision=str(cfg.precision),
         accumulate_grad_batches=int(hpo_cfg.runtime.accumulate_grad_batches),
-        save_checkpoint=True,
+        save_checkpoint=bool(not use_fixed_epochs),
         save_weights_only=True,
     )
     trainer, ckpt_cb = LightningTrainerFactory(trainer_cfg).build(
@@ -849,11 +897,16 @@ def _run_mil_final_train_and_predict(
         trial=None,
     )
     trainer.fit(model, dl_tr, dl_val_internal)
+    epochs_trained = int(trainer.current_epoch) + 1
+    best_epoch: int | None = None
     if ckpt_cb is not None:
         best_path = ckpt_cb.best_model_path
         if best_path and Path(best_path).exists():
             ckpt = torch.load(best_path, map_location="cpu")
+            best_epoch = int(ckpt.get("epoch", -1))
             model.load_state_dict(ckpt["state_dict"], strict=True)
+    if best_epoch is None:
+        best_epoch = max(0, int(epochs_trained) - 1)
 
     eval_device = _resolve_device(cfg.nn_accelerator)
     evaluator = ModelEvaluator(device=eval_device)
@@ -894,11 +947,19 @@ def _run_mil_final_train_and_predict(
         metrics.to_csv(outdir / f"{output_prefix}_metrics_{family_data.family}.csv", index=False)
         df_pred.to_csv(outdir / f"{output_prefix}_preds_{family_data.family}.csv", index=False)
 
+    train_info = {
+        "family": str(family_data.family),
+        "use_fixed_epochs": bool(use_fixed_epochs),
+        "target_epochs": int(target_epochs),
+        "target_patience": int(target_patience),
+        "epochs_trained": int(epochs_trained),
+        "best_epoch": int(best_epoch),
+    }
     del trainer, model, dl_tr, dl_val_internal, dl_eval, ds_tr, ds_val_internal, ds_eval
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
-    return df_pred, metrics
+    return df_pred, metrics, train_info
 
 
 def _slice_mil_family_data_for_split(
@@ -949,13 +1010,14 @@ def _run_mil_oof_predictions(
     family_data: _MILFamilyData,
     best_params: Mapping[str, Any],
     outdir: Path,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     n = int(len(family_data.ids_train))
     if n <= 0:
         raise ValueError(f"No train rows for family={family}")
     oof = np.full((n, 4), np.nan, dtype=np.float32)
     fold_ids = np.full((n,), -1, dtype=np.int64)
     fold_metric_rows: List[Dict[str, Any]] = []
+    fold_best_epochs: List[int] = []
     cv_tmp_dir = outdir / "_cv_oof_tmp" / str(family)
     cv_tmp_dir.mkdir(parents=True, exist_ok=True)
     for fold_step, (tr, va, fold_id) in enumerate(family_data.folds_info):
@@ -976,13 +1038,23 @@ def _run_mil_oof_predictions(
             train_idx=tr_idx,
             eval_idx=va_idx,
         )
-        df_fold, _ = _run_mil_final_train_and_predict(
+        df_fold, _, train_info = _run_mil_final_train_and_predict(
             cfg=cfg,
             family_data=fold_data,
             best_params=best_params,
             outdir=cv_tmp_dir,
             write_outputs=False,
             output_prefix=f"cv_fold{int(fold_id)}",
+        )
+        fold_best_epoch = int(train_info.get("best_epoch", max(0, int(train_info.get("epochs_trained", 1)) - 1)))
+        fold_best_epochs.append(int(fold_best_epoch))
+        log_event(
+            "INFO",
+            "family.cv.mil.fold.epoch",
+            family=str(family),
+            fold=int(fold_id),
+            best_epoch=int(fold_best_epoch),
+            epochs_trained=int(train_info.get("epochs_trained", 0)),
         )
         p_fold = np.stack([df_fold[f"p_t{t}"].to_numpy(dtype=np.float32) for t in range(4)], axis=1)
         oof[va_idx, :] = p_fold
@@ -1017,7 +1089,21 @@ def _run_mil_oof_predictions(
         df_oof[f"w_t{t}"] = np.asarray(family_data.w_cls_train[:, t], dtype=np.float32)
         df_oof[f"pred_t{t}"] = (df_oof[f"p_t{t}"] >= 0.5).astype(int)
     df_fold_metrics = pd.DataFrame(fold_metric_rows)
-    return df_oof, df_fold_metrics
+    plus_one = [int(x) + 1 for x in fold_best_epochs]
+    selected_epochs = int(max(1, int(np.median(np.asarray(plus_one, dtype=np.int64))))) if plus_one else int(max(1, int(cfg.max_epochs)))
+    summary = {
+        "family": str(family),
+        "fold_best_epochs": [int(x) for x in fold_best_epochs],
+        "selected_epochs": int(selected_epochs),
+    }
+    log_event(
+        "INFO",
+        "family.cv.mil.epoch_selection",
+        family=str(family),
+        fold_best_epochs=",".join([str(int(x)) for x in fold_best_epochs]),
+        selected_epochs=int(selected_epochs),
+    )
+    return df_oof, df_fold_metrics, summary
 
 
 def _run_catboost_oof_predictions(
@@ -1028,7 +1114,7 @@ def _run_catboost_oof_predictions(
     X2d_cat_file: np.ndarray,
     task_best_params: Mapping[str, Mapping[str, Any]],
     family: str,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     from catboost import CatBoostClassifier
 
     ids_tr = df_train[cfg.id_col].astype(str).tolist()
@@ -1040,6 +1126,7 @@ def _run_catboost_oof_predictions(
     oof = np.full((len(ids_tr), 4), np.nan, dtype=np.float32)
     fold_ids = np.full((len(ids_tr),), -1, dtype=np.int64)
     fold_metric_rows: List[Dict[str, Any]] = []
+    best_iters_by_task: Dict[int, List[int]] = {int(t): [] for t in range(4)}
     for fold_step, (tr, va, fold_id) in enumerate(folds_info):
         tr_idx = np.asarray(tr, dtype=np.int64)
         va_idx = np.asarray(va, dtype=np.int64)
@@ -1071,6 +1158,10 @@ def _run_catboost_oof_predictions(
                 early_stopping_rounds=200,
                 verbose=False,
             )
+            bi = int(cb.get_best_iteration())
+            if bi < 0:
+                bi = int(cb.tree_count_) - 1
+            best_iters_by_task[int(t)].append(int(max(0, bi)))
             p_va = cb.predict_proba(X2d_tr[va_idx])[:, 1]
             p_fold[:, t] = np.asarray(_clip_prob(p_va), dtype=np.float32)
         oof[va_idx, :] = p_fold
@@ -1102,7 +1193,23 @@ def _run_catboost_oof_predictions(
         df_oof[f"y_t{t}"] = np.asarray(y_tr[:, t], dtype=np.int64)
         df_oof[f"w_t{t}"] = np.asarray(w_tr[:, t], dtype=np.float32)
         df_oof[f"pred_t{t}"] = (df_oof[f"p_t{t}"] >= 0.5).astype(int)
-    return df_oof, pd.DataFrame(fold_metric_rows)
+    selected_iterations: Dict[int, int] = {}
+    for t in range(4):
+        plus_one = [int(x) + 1 for x in best_iters_by_task.get(int(t), [])]
+        selected_iterations[int(t)] = int(max(1, int(np.median(np.asarray(plus_one, dtype=np.int64))))) if plus_one else 4000
+        log_event(
+            "INFO",
+            "family.cv.catboost.iter_selection",
+            task_idx=int(t),
+            fold_best_iterations=",".join([str(int(x)) for x in best_iters_by_task.get(int(t), [])]),
+            selected_iterations=int(selected_iterations[int(t)]),
+        )
+    summary = {
+        "family": str(family),
+        "fold_best_iterations": {str(int(k)): [int(x) for x in v] for k, v in best_iters_by_task.items()},
+        "selected_iterations": {str(int(k)): int(v) for k, v in selected_iterations.items()},
+    }
+    return df_oof, pd.DataFrame(fold_metric_rows), summary
 
 
 def _prepare_family_inputs(
@@ -1624,10 +1731,12 @@ def run_family_suite(args: Any) -> None:
 
     # Strict no-leak calibration/blending fit scope: train OOF only.
     cv_oof_tables: Dict[str, pd.DataFrame] = {}
+    mil_selected_epochs: Dict[str, int] = {}
+    catboost_selected_iterations: Dict[int, int] = {}
     for family in cfg.model_families:
         with log_step("family.cv.run", family=str(family)):
             if family == "catboost_st":
-                df_oof, df_fold_metrics = _run_catboost_oof_predictions(
+                df_oof, df_fold_metrics, sel_summary = _run_catboost_oof_predictions(
                     cfg=cfg,
                     df_train=df_train,
                     ids_2d_cat_file=ids_2d_cat_file,
@@ -1635,13 +1744,45 @@ def run_family_suite(args: Any) -> None:
                     task_best_params=dict(best_params[family]),
                     family=str(family),
                 )
+                sel_map = sel_summary.get("selected_iterations", {})
+                for t in range(4):
+                    sel_iter = int(sel_map.get(str(int(t)), 4000))
+                    catboost_selected_iterations[int(t)] = int(sel_iter)
+                    save_path = _save_catboost_final_iterations(
+                        outdir=best_params_dir,
+                        task_idx=int(t),
+                        fold_best_iterations=sel_summary.get("fold_best_iterations", {}).get(str(int(t)), []),
+                        selected_iterations=int(sel_iter),
+                    )
+                    log_event(
+                        "INFO",
+                        "family.cv.catboost.iterations.saved",
+                        task_idx=int(t),
+                        selected_iterations=int(sel_iter),
+                        path=str(save_path),
+                    )
             else:
-                df_oof, df_fold_metrics = _run_mil_oof_predictions(
+                df_oof, df_fold_metrics, sel_summary = _run_mil_oof_predictions(
                     cfg=cfg,
                     family=str(family),
                     family_data=mil_families[family],
                     best_params=best_params[family],
                     outdir=outdir,
+                )
+                sel_epochs = int(sel_summary.get("selected_epochs", max(1, int(cfg.max_epochs))))
+                mil_selected_epochs[str(family)] = int(sel_epochs)
+                save_path = _save_family_final_epochs(
+                    outdir=best_params_dir,
+                    family=str(family),
+                    fold_best_epochs=sel_summary.get("fold_best_epochs", []),
+                    selected_epochs=int(sel_epochs),
+                )
+                log_event(
+                    "INFO",
+                    "family.cv.mil.final_epochs.saved",
+                    family=str(family),
+                    selected_epochs=int(sel_epochs),
+                    path=str(save_path),
                 )
         cv_oof_tables[str(family)] = df_oof
         df_oof.to_csv(outdir / f"train_oof_preds_{family}.csv", index=False)
@@ -1889,13 +2030,16 @@ def run_family_suite(args: Any) -> None:
                 pos = float(y_tr[:, t].sum())
                 neg = float(len(y_tr) - pos)
                 spw = min(neg / max(pos, 1.0), float(p.get("pos_weight_clip", 100.0)))
+                target_iterations = int(catboost_selected_iterations.get(int(t), int(p.get("iterations", 4000))))
+                cb_kwargs = _catboost_common_params(
+                    params=p,
+                    seed=int(cfg.seed) + 97 * int(t),
+                    threads=max(1, int(cfg.cpu_workers)),
+                    scale_pos_weight=float(spw),
+                )
+                cb_kwargs["iterations"] = int(target_iterations)
                 cb = CatBoostClassifier(
-                    **_catboost_common_params(
-                        params=p,
-                        seed=int(cfg.seed) + 97 * int(t),
-                        threads=max(1, int(cfg.cpu_workers)),
-                        scale_pos_weight=float(spw),
-                    )
+                    **cb_kwargs
                 )
                 sw = (w_tr[:, t] if t in (0, 1) else None)
                 cb.fit(
@@ -1907,6 +2051,13 @@ def run_family_suite(args: Any) -> None:
                     verbose=False,
                 )
                 pred[:, t] = cb.predict_proba(X2d_lb)[:, 1]
+                log_event(
+                    "INFO",
+                    "family.final.catboost.task",
+                    task_idx=int(t),
+                    selected_iterations=int(target_iterations),
+                    scale_pos_weight=f"{float(spw):.6f}",
+                )
             df_pred = pd.DataFrame({"ID": [str(x) for x in ids_lb]})
             for t in range(4):
                 df_pred[f"p_t{t}"] = pred[:, t]
@@ -1920,13 +2071,30 @@ def run_family_suite(args: Any) -> None:
             pred_tables[family] = df_pred
             continue
 
-        df_pred, _ = _run_mil_final_train_and_predict(
+        selected_epochs = int(mil_selected_epochs.get(str(family), int(cfg.max_epochs)))
+        log_event(
+            "INFO",
+            "family.final.mil.epoch_plan",
+            family=str(family),
+            selected_epochs=int(selected_epochs),
+        )
+        df_pred, _unused_metrics, train_info = _run_mil_final_train_and_predict(
             cfg=cfg,
             family_data=mil_families[family],
             best_params=best_params[family],
             outdir=outdir,
             write_outputs=True,
             output_prefix="leaderboard",
+            fixed_train_epochs=int(selected_epochs),
+        )
+        log_event(
+            "INFO",
+            "family.final.mil.train_done",
+            family=str(family),
+            target_epochs=int(train_info.get("target_epochs", selected_epochs)),
+            epochs_trained=int(train_info.get("epochs_trained", 0)),
+            best_epoch=int(train_info.get("best_epoch", 0)),
+            use_fixed_epochs=bool(train_info.get("use_fixed_epochs", True)),
         )
         pred_tables[family] = df_pred
 
