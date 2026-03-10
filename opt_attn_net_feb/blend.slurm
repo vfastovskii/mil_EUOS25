@@ -98,6 +98,9 @@ CATBOOST_TASK_PARAMS_JSONS="${CATBOOST_TASK_PARAMS_JSONS:-"${DATA_DIR}/t0.json $
 MT_2D_PARAMS_JSON="${MT_2D_PARAMS_JSON:-"${DATA_DIR}/mt_2d.json"}"
 MT_2D3D_PARAMS_JSON="${MT_2D3D_PARAMS_JSON:-"${DATA_DIR}/mt_2d3d.json"}"
 MT_3D_PARAMS_JSON="${MT_3D_PARAMS_JSON:-${DATA_DIR}/mt_3d.json}"
+MT_2D_FINAL_EPOCHS_JSON="${MT_2D_FINAL_EPOCHS_JSON:-}"
+MT_2D3D_FINAL_EPOCHS_JSON="${MT_2D3D_FINAL_EPOCHS_JSON:-}"
+MT_3D_FINAL_EPOCHS_JSON="${MT_3D_FINAL_EPOCHS_JSON:-}"
 
 # -------------------- node-local scratch --------------------
 WORKDIR="/home-local/${USER}/tmp/${SLURM_JOB_ID}"
@@ -130,6 +133,9 @@ echo "[INFO] CATBOOST_TASK_PARAMS_JSONS=${CATBOOST_TASK_PARAMS_JSONS:-<none>}"
 echo "[INFO] MT_2D_PARAMS_JSON=${MT_2D_PARAMS_JSON:-<none>}"
 echo "[INFO] MT_2D3D_PARAMS_JSON=${MT_2D3D_PARAMS_JSON:-<none>}"
 echo "[INFO] MT_3D_PARAMS_JSON=${MT_3D_PARAMS_JSON:-<none>}"
+echo "[INFO] MT_2D_FINAL_EPOCHS_JSON=${MT_2D_FINAL_EPOCHS_JSON:-<none>}"
+echo "[INFO] MT_2D3D_FINAL_EPOCHS_JSON=${MT_2D3D_FINAL_EPOCHS_JSON:-<none>}"
+echo "[INFO] MT_3D_FINAL_EPOCHS_JSON=${MT_3D_FINAL_EPOCHS_JSON:-<none>}"
 command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || true
 
 # fail fast
@@ -161,6 +167,15 @@ if [[ -n "$MT_2D3D_PARAMS_JSON" ]]; then
 fi
 if [[ -n "$MT_3D_PARAMS_JSON" ]]; then
   [[ -f "$MT_3D_PARAMS_JSON" ]] || { echo "[ERROR] Missing MT_3D_PARAMS_JSON: $MT_3D_PARAMS_JSON"; exit 2; }
+fi
+if [[ -n "$MT_2D_FINAL_EPOCHS_JSON" ]]; then
+  [[ -f "$MT_2D_FINAL_EPOCHS_JSON" ]] || { echo "[ERROR] Missing MT_2D_FINAL_EPOCHS_JSON: $MT_2D_FINAL_EPOCHS_JSON"; exit 2; }
+fi
+if [[ -n "$MT_2D3D_FINAL_EPOCHS_JSON" ]]; then
+  [[ -f "$MT_2D3D_FINAL_EPOCHS_JSON" ]] || { echo "[ERROR] Missing MT_2D3D_FINAL_EPOCHS_JSON: $MT_2D3D_FINAL_EPOCHS_JSON"; exit 2; }
+fi
+if [[ -n "$MT_3D_FINAL_EPOCHS_JSON" ]]; then
+  [[ -f "$MT_3D_FINAL_EPOCHS_JSON" ]] || { echo "[ERROR] Missing MT_3D_FINAL_EPOCHS_JSON: $MT_3D_FINAL_EPOCHS_JSON"; exit 2; }
 fi
 if [[ -n "$FAMILY_BEST_PARAMS_JSON" && -n "$CATBOOST_TASK_PARAMS_JSONS" ]]; then
   echo "[INFO] Both FAMILY_BEST_PARAMS_JSON and CATBOOST_TASK_PARAMS_JSONS were provided."
@@ -197,6 +212,15 @@ if [[ -n "$MT_2D3D_PARAMS_JSON" ]]; then
 fi
 if [[ -n "$MT_3D_PARAMS_JSON" ]]; then
   cp -v "$MT_3D_PARAMS_JSON" "$WORKDIR/"
+fi
+if [[ -n "$MT_2D_FINAL_EPOCHS_JSON" ]]; then
+  cp -v "$MT_2D_FINAL_EPOCHS_JSON" "$WORKDIR/"
+fi
+if [[ -n "$MT_2D3D_FINAL_EPOCHS_JSON" ]]; then
+  cp -v "$MT_2D3D_FINAL_EPOCHS_JSON" "$WORKDIR/"
+fi
+if [[ -n "$MT_3D_FINAL_EPOCHS_JSON" ]]; then
+  cp -v "$MT_3D_FINAL_EPOCHS_JSON" "$WORKDIR/"
 fi
 
 export PYTHONPATH="$WORKDIR:${PYTHONPATH:-}"
@@ -260,6 +284,15 @@ if [[ -n "$MT_2D3D_PARAMS_JSON" ]]; then
 fi
 if [[ -n "$MT_3D_PARAMS_JSON" ]]; then
   CMD+=(--mt_3d_params_json "$WORKDIR/$(basename "$MT_3D_PARAMS_JSON")")
+fi
+if [[ -n "$MT_2D_FINAL_EPOCHS_JSON" ]]; then
+  CMD+=(--mt_2d_final_epochs_json "$WORKDIR/$(basename "$MT_2D_FINAL_EPOCHS_JSON")")
+fi
+if [[ -n "$MT_2D3D_FINAL_EPOCHS_JSON" ]]; then
+  CMD+=(--mt_2d3d_final_epochs_json "$WORKDIR/$(basename "$MT_2D3D_FINAL_EPOCHS_JSON")")
+fi
+if [[ -n "$MT_3D_FINAL_EPOCHS_JSON" ]]; then
+  CMD+=(--mt_3d_final_epochs_json "$WORKDIR/$(basename "$MT_3D_FINAL_EPOCHS_JSON")")
 fi
 
 printf '[INFO] CMD: %q ' "${CMD[@]}"; echo

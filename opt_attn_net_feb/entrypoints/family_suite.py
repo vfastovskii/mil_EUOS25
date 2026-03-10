@@ -37,6 +37,7 @@ from ..utils.instances import build_instance_index, load_and_merge_instances
 from ..utils.metrics import ap_per_task, roc_auc_per_task
 from ..utils.ops import (
     apply_standardizer,
+    bitmask_ids,
     build_aux_targets_and_masks,
     build_aux_weights,
     build_bitmask_group_definition,
@@ -752,6 +753,134 @@ def _apply_blend_task(*, x: np.ndarray, task_cfg: Mapping[str, Any], fams: Seque
     w = w / float(np.sum(w))
     out = np.dot(x_arr, w.reshape(-1, 1)).reshape(-1)
     return np.asarray(_clip_prob(out), dtype=np.float32)
+
+
+def _require_calibrated_prob_columns(*, df: pd.DataFrame, family: str, scope: str) -> None:
+    missing = [f"p_cal_t{int(t)}" for t in range(4) if f"p_cal_t{int(t)}" not in df.columns]
+    if missing:
+        raise RuntimeError(
+            f"Blending requires calibrated probabilities, missing columns for family={family} scope={scope}: {missing}"
+        )
+
+
+def _fit_blend_task(
+    *,
+    x: np.ndarray,
+    y: np.ndarray,
+    fams: Sequence[str],
+    sample_weight: np.ndarray | None,
+    enforce_non_negative: bool,
+) -> tuple[Dict[str, Any], np.ndarray]:
+    x_arr = np.asarray(x, dtype=np.float64)
+    y_arr = np.asarray(y, dtype=np.int64).reshape(-1)
+    sw = None if sample_weight is None else np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+    if sw is not None:
+        if int(sw.shape[0]) != int(y_arr.shape[0]):
+            raise ValueError(
+                f"blend sample_weight length mismatch: got {int(sw.shape[0])}, expected {int(y_arr.shape[0])}"
+            )
+        sw = np.nan_to_num(sw, nan=0.0, posinf=0.0, neginf=0.0)
+        sw = np.clip(sw, 0.0, np.inf)
+        if float(np.sum(sw)) <= 0.0:
+            sw = None
+
+    if int(np.unique(y_arr).size) < 2:
+        w_uni = np.ones(len(fams), dtype=np.float64) / float(max(1, len(fams)))
+        p_task = np.clip(np.dot(x_arr, w_uni), 1e-6, 1 - 1e-6)
+        return (
+            {
+                "kind": "uniform_single_class",
+                "weights": {f: float(w_uni[i]) for i, f in enumerate(fams)},
+                "intercept": 0.0,
+            },
+            p_task,
+        )
+
+    pos_rate = float(np.mean(y_arr))
+    # Stronger regularization for rare tasks.
+    if pos_rate < 0.01:
+        c_val = 0.10
+    elif pos_rate < 0.03:
+        c_val = 0.15
+    else:
+        c_val = 0.25
+    lr = LogisticRegression(max_iter=4000, solver="lbfgs", C=float(c_val))
+    lr.fit(x_arr, y_arr, sample_weight=sw)
+    coef = np.asarray(lr.coef_[0], dtype=np.float64)
+    intercept = float(lr.intercept_[0])
+
+    if enforce_non_negative:
+        coef_pos = np.clip(coef, 0.0, np.inf)
+        # Refit only intercept with fixed non-negative coefficients.
+        z = np.dot(x_arr, coef_pos).reshape(-1)
+        sw_local = np.ones_like(z) if sw is None else sw
+        sw_sum = float(np.sum(sw_local))
+        if sw_sum <= 0.0:
+            sw_local = np.ones_like(z)
+            sw_sum = float(np.sum(sw_local))
+        grid = np.linspace(-12.0, 12.0, 241, dtype=np.float64)
+        best_b = float(intercept)
+        best_loss = float("inf")
+        eps = 1e-12
+        for b in grid.tolist():
+            p_b = 1.0 / (1.0 + np.exp(-(z + float(b))))
+            p_b = np.clip(p_b, eps, 1.0 - eps)
+            loss_b = -float(np.sum(sw_local * (y_arr * np.log(p_b) + (1 - y_arr) * np.log(1.0 - p_b))) / sw_sum)
+            if loss_b < best_loss:
+                best_loss = loss_b
+                best_b = float(b)
+        coef = coef_pos
+        intercept = float(best_b)
+
+    logits = np.dot(x_arr, coef).reshape(-1) + float(intercept)
+    p_task = 1.0 / (1.0 + np.exp(-logits))
+    p_task = _clip_prob(p_task)
+    cfg = {
+        "kind": "logistic_stacking",
+        "weights": {f: float(coef[i]) for i, f in enumerate(fams)},
+        "intercept": float(intercept),
+        "non_negative": bool(enforce_non_negative),
+        "C": float(c_val),
+    }
+    return cfg, p_task
+
+
+def _log_oof_bitmask_coverage(*, family: str, df_oof: pd.DataFrame) -> None:
+    y = np.stack([df_oof[f"y_t{t}"].to_numpy(dtype=np.int64) for t in range(4)], axis=1)
+    folds = df_oof["fold_id"].to_numpy(dtype=np.int64)
+    bm = bitmask_ids(y)
+    all_masks = set([int(x) for x in np.unique(bm).tolist()])
+    for fold_id in sorted([int(x) for x in np.unique(folds).tolist() if int(x) >= 0]):
+        m = folds == int(fold_id)
+        if int(np.sum(m)) <= 0:
+            continue
+        fold_masks = set([int(x) for x in np.unique(bm[m]).tolist()])
+        missing = sorted(list(all_masks - fold_masks))
+        cov = float(len(fold_masks) / float(max(1, len(all_masks))))
+        pos = y[m].mean(axis=0)
+        log_event(
+            "INFO",
+            "family.cv.oof.bitmask_coverage.fold",
+            family=str(family),
+            fold=int(fold_id),
+            n_rows=int(np.sum(m)),
+            n_masks_total=int(len(all_masks)),
+            n_masks_fold=int(len(fold_masks)),
+            coverage=f"{cov:.3f}",
+            pos_t0=f"{float(pos[0]):.6f}",
+            pos_t1=f"{float(pos[1]):.6f}",
+            pos_t2=f"{float(pos[2]):.6f}",
+            pos_t3=f"{float(pos[3]):.6f}",
+        )
+        if len(missing) > 0:
+            log_event(
+                "WARN",
+                "family.cv.oof.bitmask_coverage.missing",
+                family=str(family),
+                fold=int(fold_id),
+                n_missing_masks=int(len(missing)),
+                missing_masks=",".join([str(int(x)) for x in missing[:16]]),
+            )
 
 
 def _make_internal_val_indices(n: int, seed: int) -> np.ndarray:
@@ -2030,6 +2159,7 @@ def run_family_suite(args: Any) -> None:
                     path=str(save_path),
                 )
         cv_oof_tables[str(family)] = df_oof
+        _log_oof_bitmask_coverage(family=str(family), df_oof=df_oof)
         df_oof.to_csv(outdir / f"train_oof_preds_{family}.csv", index=False)
         if len(df_fold_metrics) > 0:
             df_fold_metrics.to_csv(outdir / f"cv_fold_metrics_{family}.csv", index=False)
@@ -2047,6 +2177,43 @@ def run_family_suite(args: Any) -> None:
         _metric_table(y_true=y_oof, p_pred=p_oof, w_cls=w_oof).to_csv(
             outdir / f"cv_oof_metrics_{family}.csv", index=False
         )
+
+    # Enforce identical OOF ID/fold mapping across families.
+    fam_keys = list(cv_oof_tables.keys())
+    if len(fam_keys) >= 2:
+        ref_family = str(fam_keys[0])
+        ref_map = (
+            cv_oof_tables[ref_family][["ID", "fold_id"]]
+            .copy()
+            .assign(ID=lambda d: d["ID"].astype(str), fold_id=lambda d: d["fold_id"].astype(int))
+            .set_index("ID")["fold_id"]
+        )
+        for fam in fam_keys[1:]:
+            cur_map = (
+                cv_oof_tables[str(fam)][["ID", "fold_id"]]
+                .copy()
+                .assign(ID=lambda d: d["ID"].astype(str), fold_id=lambda d: d["fold_id"].astype(int))
+                .set_index("ID")["fold_id"]
+            )
+            if int(ref_map.shape[0]) != int(cur_map.shape[0]) or set(ref_map.index) != set(cur_map.index):
+                raise RuntimeError(
+                    f"OOF ID set mismatch across families: ref={ref_family} vs {fam} "
+                    f"(n_ref={int(ref_map.shape[0])}, n_cur={int(cur_map.shape[0])})"
+                )
+            aligned = cur_map.loc[ref_map.index]
+            mismatches = int(np.sum((aligned.to_numpy(dtype=np.int64) != ref_map.to_numpy(dtype=np.int64))))
+            log_event(
+                "INFO",
+                "family.cv.oof.alignment",
+                ref_family=str(ref_family),
+                family=str(fam),
+                n_ids=int(ref_map.shape[0]),
+                fold_mismatches=int(mismatches),
+            )
+            if mismatches > 0:
+                raise RuntimeError(
+                    f"OOF fold mismatch across families: ref={ref_family} vs {fam}, mismatches={int(mismatches)}"
+                )
 
     calibrated_oof: Dict[str, pd.DataFrame] = {}
     calib_params_by_family: Dict[str, Dict[str, Any]] = {}
@@ -2167,7 +2334,16 @@ def run_family_suite(args: Any) -> None:
             d = calibrated_oof[f].copy()
             d["ID"] = d["ID"].astype(str)
             d = d.set_index("ID").loc[common_ids].reset_index(drop=False)
+            _require_calibrated_prob_columns(df=d, family=str(f), scope="train_oof")
             x_by_family_oof[f] = np.stack([d[f"p_cal_t{t}"].to_numpy(dtype=np.float64) for t in range(4)], axis=1)
+            log_event(
+                "INFO",
+                "family.blend.fit.family_input",
+                scope="train_oof",
+                family=str(f),
+                input_source="calibrated_probabilities",
+                n_rows=int(len(d)),
+            )
             if y_bl is None:
                 y_bl = np.stack([d[f"y_t{t}"].to_numpy(dtype=np.int64) for t in range(4)], axis=1)
                 w_bl = np.stack(
@@ -2185,49 +2361,54 @@ def run_family_suite(args: Any) -> None:
         assert w_bl is not None
 
         blend_pred_oof = np.zeros_like(y_bl, dtype=np.float64)
-        blend_weights: Dict[str, Any] = {"fit_scope": "train_oof", "families": fams, "tasks": {}}
+        blend_weights: Dict[str, Any] = {
+            "fit_scope": "train_oof",
+            "families": fams,
+            "input_source": "calibrated_probabilities",
+            "calibration_method": str(cfg.calibration_method),
+            "tasks": {},
+        }
+        bitmask_w_bl = make_bitmask_sample_weights(
+            y_bl,
+            alpha=0.5,
+            cap=5.0,
+        ).astype(np.float64)
+        log_event(
+            "INFO",
+            "family.blend.fit.bitmask_weights",
+            scope="train_oof",
+            n_rows=int(bitmask_w_bl.shape[0]),
+            min_w=f"{float(np.min(bitmask_w_bl)):.4f}",
+            max_w=f"{float(np.max(bitmask_w_bl)):.4f}",
+            mean_w=f"{float(np.mean(bitmask_w_bl)):.4f}",
+        )
         for t in range(4):
             x_task = np.column_stack([x_by_family_oof[f][:, t] for f in fams]).astype(np.float64)
             y_task = y_bl[:, t].astype(int)
-            if int(np.unique(y_task).size) < 2:
-                w_uni = np.ones(len(fams), dtype=np.float64) / float(len(fams))
-                p_task = np.clip(np.dot(x_task, w_uni), 1e-6, 1 - 1e-6)
-                blend_pred_oof[:, t] = p_task
-                blend_weights["tasks"][str(t)] = {
-                    "kind": "uniform_single_class",
-                    "weights": {f: float(w_uni[i]) for i, f in enumerate(fams)},
-                    "intercept": 0.0,
-                }
-                log_event(
-                    "INFO",
-                    "family.blend.fit.task",
-                    scope="train_oof",
-                    task_idx=int(t),
-                    kind="uniform_single_class",
-                    n_rows=int(y_task.shape[0]),
-                    pos_rate=f"{float(np.mean(y_task)):.6f}",
-                )
-                continue
-            lr = LogisticRegression(max_iter=2000, solver="lbfgs")
-            lr.fit(x_task, y_task)
-            p_task = lr.predict_proba(x_task)[:, 1]
-            blend_pred_oof[:, t] = p_task
-            task_weights = {f: float(lr.coef_[0, i]) for i, f in enumerate(fams)}
-            blend_weights["tasks"][str(t)] = {
-                "kind": "logistic_stacking",
-                "weights": task_weights,
-                "intercept": float(lr.intercept_[0]),
-            }
+            base_w = np.asarray(w_bl[:, t], dtype=np.float64)
+            blend_sw = np.clip(np.nan_to_num(base_w, nan=0.0), 0.0, np.inf) * bitmask_w_bl
+            task_cfg, p_task = _fit_blend_task(
+                x=x_task,
+                y=y_task,
+                fams=fams,
+                sample_weight=blend_sw,
+                enforce_non_negative=True,
+            )
+            blend_pred_oof[:, t] = np.asarray(p_task, dtype=np.float64)
+            blend_weights["tasks"][str(t)] = dict(task_cfg)
             log_event(
                 "INFO",
                 "family.blend.fit.task",
                 scope="train_oof",
                 task_idx=int(t),
-                kind="logistic_stacking",
+                kind=str(task_cfg.get("kind", "unknown")),
                 n_rows=int(y_task.shape[0]),
                 pos_rate=f"{float(np.mean(y_task)):.6f}",
-                intercept=f"{float(lr.intercept_[0]):.6f}",
-                weight_l1=f"{float(np.sum(np.abs(lr.coef_[0]))):.6f}",
+                non_negative=bool(task_cfg.get("non_negative", False)),
+                C=f"{float(task_cfg.get('C', np.nan)):.4f}",
+                intercept=f"{float(task_cfg.get('intercept', 0.0)):.6f}",
+                weight_l1=f"{float(np.sum(np.abs(np.asarray(list(task_cfg.get('weights', {}).values()), dtype=np.float64)))):.6f}",
+                sample_weight_sum=f"{float(np.sum(blend_sw)):.3f}",
             )
         blend_weights_path = outdir / "blend_weights.json"
         blend_weights_path.write_text(json.dumps(blend_weights, indent=2))
@@ -2449,7 +2630,16 @@ def run_family_suite(args: Any) -> None:
             d = calibrated[f].copy()
             d["ID"] = d["ID"].astype(str)
             d = d.set_index("ID").loc[common_ids].reset_index(drop=False)
+            _require_calibrated_prob_columns(df=d, family=str(f), scope="leaderboard")
             x_by_family[f] = np.stack([d[f"p_cal_t{t}"].to_numpy(dtype=np.float64) for t in range(4)], axis=1)
+            log_event(
+                "INFO",
+                "family.blend.apply.family_input",
+                scope="leaderboard",
+                family=str(f),
+                input_source="calibrated_probabilities",
+                n_rows=int(len(d)),
+            )
             if y_bl is None:
                 y_bl = np.stack([d[f"y_t{t}"].to_numpy(dtype=np.int64) for t in range(4)], axis=1)
                 w_bl = np.stack(
