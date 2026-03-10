@@ -92,9 +92,12 @@ LEADERBOARD_SPLIT="${LEADERBOARD_SPLIT:-leaderboard}"
 MODEL_FAMILIES="${MODEL_FAMILIES:-catboost_st mt_2d mt_2d3d mt_3d}"
 CALIBRATION_METHOD="${CALIBRATION_METHOD:-platt}"  # platt|isotonic|temperature
 CATBOOST_HPO_PARALLEL_TASKS="${CATBOOST_HPO_PARALLEL_TASKS:-4}"
+BLEND_SEED_ENSEMBLE_SIZE="${BLEND_SEED_ENSEMBLE_SIZE:-1}"
+BLEND_SEED_STEP="${BLEND_SEED_STEP:-1000}"
 BEST_PARAMS_DIR="${BEST_PARAMS_DIR:-}"
 FAMILY_BEST_PARAMS_JSON="${FAMILY_BEST_PARAMS_JSON:-}"
 CATBOOST_TASK_PARAMS_JSONS="${CATBOOST_TASK_PARAMS_JSONS:-"${DATA_DIR}/t0.json ${DATA_DIR}/t1.json ${DATA_DIR}/t2.json ${DATA_DIR}/t3.json"}"
+CATBOOST_FINAL_ITERATIONS_JSONS="${CATBOOST_FINAL_ITERATIONS_JSONS:-}"
 MT_2D_PARAMS_JSON="${MT_2D_PARAMS_JSON:-"${DATA_DIR}/mt_2d.json"}"
 #MT_2D3D_PARAMS_JSON="${MT_2D3D_PARAMS_JSON:-}"
 #MT_3D_PARAMS_JSON="${MT_3D_PARAMS_JSON:-}"
@@ -124,9 +127,11 @@ echo "[INFO] Best params mirror dir: $FAMILY_SUITE_BEST_PARAMS_MIRROR_DIR"
 echo "[INFO] CPUs=${SLURM_CPUS_PER_TASK} | CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "[INFO] RUN_HPO=$RUN_HPO | HPO_ONLY=$HPO_ONLY | PRUNER_WARMUP_STEPS=$PRUNER_WARMUP_STEPS"
 echo "[INFO] MODEL_FAMILIES=$MODEL_FAMILIES | CALIBRATION_METHOD=$CALIBRATION_METHOD | CATBOOST_HPO_PARALLEL_TASKS=$CATBOOST_HPO_PARALLEL_TASKS"
+echo "[INFO] BLEND_SEED_ENSEMBLE_SIZE=$BLEND_SEED_ENSEMBLE_SIZE | BLEND_SEED_STEP=$BLEND_SEED_STEP"
 echo "[INFO] 2D sources: scaled=$FEAT2D_SCALED | catboost_raw=$FEAT2D_RAW"
 echo "[INFO] FAMILY_BEST_PARAMS_JSON=${FAMILY_BEST_PARAMS_JSON:-<none>}"
 echo "[INFO] CATBOOST_TASK_PARAMS_JSONS=${CATBOOST_TASK_PARAMS_JSONS:-<none>}"
+echo "[INFO] CATBOOST_FINAL_ITERATIONS_JSONS=${CATBOOST_FINAL_ITERATIONS_JSONS:-<none>}"
 echo "[INFO] MT_2D_PARAMS_JSON=${MT_2D_PARAMS_JSON:-<none>}"
 echo "[INFO] MT_2D3D_PARAMS_JSON=${MT_2D3D_PARAMS_JSON:-<none>}"
 echo "[INFO] MT_3D_PARAMS_JSON=${MT_3D_PARAMS_JSON:-<none>}"
@@ -151,6 +156,12 @@ if [[ -n "$CATBOOST_TASK_PARAMS_JSONS" ]]; then
   read -r -a CATBOOST_TASK_JSON_ARR <<< "$CATBOOST_TASK_PARAMS_JSONS"
   for _p in "${CATBOOST_TASK_JSON_ARR[@]}"; do
     [[ -f "$_p" ]] || { echo "[ERROR] Missing CATBOOST task params JSON: $_p"; exit 2; }
+  done
+fi
+if [[ -n "$CATBOOST_FINAL_ITERATIONS_JSONS" ]]; then
+  read -r -a CATBOOST_ITER_JSON_ARR <<< "$CATBOOST_FINAL_ITERATIONS_JSONS"
+  for _p in "${CATBOOST_ITER_JSON_ARR[@]}"; do
+    [[ -f "$_p" ]] || { echo "[ERROR] Missing CATBOOST final iterations JSON: $_p"; exit 2; }
   done
 fi
 if [[ -n "$MT_2D_PARAMS_JSON" ]]; then
@@ -189,6 +200,11 @@ if [[ -n "$CATBOOST_TASK_PARAMS_JSONS" ]]; then
     cp -v "$_p" "$WORKDIR/"
   done
 fi
+if [[ -n "$CATBOOST_FINAL_ITERATIONS_JSONS" ]]; then
+  for _p in "${CATBOOST_ITER_JSON_ARR[@]}"; do
+    cp -v "$_p" "$WORKDIR/"
+  done
+fi
 if [[ -n "$MT_2D_PARAMS_JSON" ]]; then
   cp -v "$MT_2D_PARAMS_JSON" "$WORKDIR/"
 fi
@@ -219,6 +235,8 @@ CMD=(
   --model_families "${MODEL_FAMILIES_ARR[@]}"
   --calibration_method "$CALIBRATION_METHOD"
   --catboost_hpo_parallel_tasks "$CATBOOST_HPO_PARALLEL_TASKS"
+  --blend_seed_ensemble_size "$BLEND_SEED_ENSEMBLE_SIZE"
+  --blend_seed_step "$BLEND_SEED_STEP"
   --max_epochs "$MAX_EPOCHS"
   --patience "$PATIENCE"
   --seed "$SEED"
@@ -251,6 +269,13 @@ if [[ -n "$CATBOOST_TASK_PARAMS_JSONS" ]]; then
     _task_json_args+=("$WORKDIR/$(basename "$_p")")
   done
   CMD+=(--catboost_task_params_jsons "${_task_json_args[@]}")
+fi
+if [[ -n "$CATBOOST_FINAL_ITERATIONS_JSONS" ]]; then
+  _iter_json_args=()
+  for _p in "${CATBOOST_ITER_JSON_ARR[@]}"; do
+    _iter_json_args+=("$WORKDIR/$(basename "$_p")")
+  done
+  CMD+=(--catboost_final_iterations_jsons "${_iter_json_args[@]}")
 fi
 if [[ -n "$MT_2D_PARAMS_JSON" ]]; then
   CMD+=(--mt_2d_params_json "$WORKDIR/$(basename "$MT_2D_PARAMS_JSON")")

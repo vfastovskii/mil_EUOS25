@@ -1725,6 +1725,24 @@ def _parse_args(argv: Any | None = None):
         ),
     )
     ap.add_argument(
+        "--blend_seed_ensemble_size",
+        type=int,
+        default=1,
+        help=(
+            "Number of seed replicas per model family for OOF/final predictions in --run_family_suite mode. "
+            "Each replica is treated as a separate calibrated input to blending."
+        ),
+    )
+    ap.add_argument(
+        "--blend_seed_step",
+        type=int,
+        default=1000,
+        help=(
+            "Seed offset step between ensemble replicas in --run_family_suite mode. "
+            "Replica r uses seed = seed + r * blend_seed_step."
+        ),
+    )
+    ap.add_argument(
         "--best_params_dir",
         default=None,
         help=(
@@ -1750,6 +1768,17 @@ def _parse_args(argv: Any | None = None):
             "Optional 4 task-specific CatBoost params JSON files "
             "(each containing task_idx + best_params). "
             "When provided, catboost_st HPO is skipped and these params are used."
+        ),
+    )
+    ap.add_argument(
+        "--catboost_final_iterations_jsons",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional 4 task-specific CatBoost iteration-selection JSON files "
+            "(each containing task_idx + selected_iterations). "
+            "When provided, these selected iterations override CV-derived CatBoost "
+            "selected iterations for final refit."
         ),
     )
     ap.add_argument(

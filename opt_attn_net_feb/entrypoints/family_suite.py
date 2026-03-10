@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import gc
@@ -111,6 +111,7 @@ class FamilySuiteConfig:
     best_params_dir: str | None
     family_best_params_json: str | None
     catboost_task_params_jsons: tuple[str, ...]
+    catboost_final_iterations_jsons: tuple[str, ...]
     mt_2d_params_json: str | None
     mt_2d3d_params_json: str | None
     mt_3d_params_json: str | None
@@ -118,6 +119,8 @@ class FamilySuiteConfig:
     mt_2d3d_final_epochs_json: str | None
     mt_3d_final_epochs_json: str | None
     catboost_hpo_parallel_tasks: int
+    blend_seed_ensemble_size: int
+    blend_seed_step: int
 
 
 @dataclass(frozen=True)
@@ -386,10 +389,28 @@ def _normalize_catboost_params(value: Any) -> Dict[str, Dict[str, Any]]:
         value = value["best_params"]
     if not isinstance(value, dict):
         raise ValueError("catboost_st params must be a dict")
+    def _with_default_iterations(d: Mapping[str, Any]) -> Dict[str, Any]:
+        out = dict(d)
+        # If iterations is not provided, use CatBoost max-iterations default for this pipeline.
+        if out.get("iterations", None) is None:
+            out["iterations"] = 4000
+        return out
+
     if all(k in value for k in ("task_0", "task_1", "task_2", "task_3")):
-        return {f"task_{int(t)}": dict(value[f"task_{int(t)}"]) for t in range(4)}
+        return {f"task_{int(t)}": _with_default_iterations(value[f"task_{int(t)}"]) for t in range(4)}
     # Backward-compatible shared-params fallback.
-    return {f"task_{int(t)}": dict(value) for t in range(4)}
+    return {f"task_{int(t)}": _with_default_iterations(value) for t in range(4)}
+
+
+def _resolve_catboost_iterations(params: Mapping[str, Any], *, default_iterations: int = 4000) -> int:
+    raw = params.get("iterations", None)
+    if raw is None:
+        return int(default_iterations)
+    try:
+        it = int(raw)
+    except Exception:
+        return int(default_iterations)
+    return int(max(1, it))
 
 
 def _normalize_family_params(*, family: str, value: Any) -> Any:
@@ -434,6 +455,62 @@ def _load_catboost_task_overrides(paths: Sequence[str]) -> Dict[str, Dict[str, A
         raise ValueError(
             "catboost_task_params_jsons must provide all 4 tasks. "
             f"Missing: {missing}"
+        )
+    return out
+
+
+def _load_catboost_task_iterations_overrides(paths: Sequence[str]) -> Dict[int, int]:
+    out: Dict[int, int] = {}
+
+    def _coerce_positive_int(value: Any, *, field: str, src: Path) -> int:
+        if isinstance(value, bool):
+            raise ValueError(f"Invalid {field} in {src}: bool is not allowed.")
+        try:
+            iv = int(value)
+        except Exception as exc:
+            raise ValueError(
+                f"Invalid {field} in {src}: expected integer-like value, got {value!r}."
+            ) from exc
+        if iv < 1:
+            raise ValueError(f"Invalid {field} in {src}: expected >= 1, got {iv}.")
+        return iv
+
+    for raw_path in paths:
+        p = Path(str(raw_path))
+        if not p.exists():
+            raise FileNotFoundError(f"CatBoost final-iterations JSON not found: {p}")
+        payload = json.loads(p.read_text())
+        if not isinstance(payload, dict):
+            raise ValueError(f"Invalid CatBoost final-iterations JSON {p}: expected object.")
+        fam = payload.get("family")
+        if isinstance(fam, str) and str(fam) != "catboost_st":
+            raise ValueError(f"Family mismatch in {p}: expected 'catboost_st', got '{fam}'.")
+        task_idx = payload.get("task_idx", None)
+        if task_idx is None:
+            raise ValueError(f"CatBoost final-iterations JSON {p} is missing 'task_idx'.")
+        t = int(task_idx)
+        if t < 0 or t > 3:
+            raise ValueError(f"CatBoost task_idx in {p} must be in [0,3], got {t}.")
+        if t in out:
+            raise ValueError(f"Duplicate CatBoost task_idx={t} across final-iterations JSON files.")
+        if "selected_iterations" in payload:
+            sel = _coerce_positive_int(payload["selected_iterations"], field="selected_iterations", src=p)
+        elif "target_iterations" in payload:
+            sel = _coerce_positive_int(payload["target_iterations"], field="target_iterations", src=p)
+        elif "iterations" in payload:
+            sel = _coerce_positive_int(payload["iterations"], field="iterations", src=p)
+        else:
+            raise ValueError(
+                f"Invalid CatBoost final-iterations JSON {p}: "
+                "missing one of ['selected_iterations', 'target_iterations', 'iterations']."
+            )
+        out[int(t)] = int(sel)
+
+    missing = [int(t) for t in range(4) if int(t) not in out]
+    if missing:
+        raise ValueError(
+            "catboost_final_iterations_jsons must provide all 4 tasks. "
+            f"Missing task_idx: {missing}"
         )
     return out
 
@@ -619,7 +696,7 @@ def _catboost_search_space(trial: optuna.Trial, *, task_idx: int) -> Dict[str, A
 
 def _catboost_common_params(*, params: Mapping[str, Any], seed: int, threads: int, scale_pos_weight: float) -> Dict[str, Any]:
     cb = dict(
-        iterations=4000,
+        iterations=int(_resolve_catboost_iterations(params)),
         loss_function="Logloss",
         eval_metric="PRAUC",
         depth=int(params["depth"]),
@@ -738,13 +815,22 @@ def _apply_calibration_task(p: np.ndarray, params: Mapping[str, Any]) -> np.ndar
 
 def _apply_blend_task(*, x: np.ndarray, task_cfg: Mapping[str, Any], fams: Sequence[str]) -> np.ndarray:
     x_arr = np.asarray(x, dtype=np.float64)
-    kind = str(task_cfg.get("kind", "uniform_single_class"))
+    kind = str(task_cfg.get("kind", "convex_blending"))
     if kind == "logistic_stacking":
         weights = task_cfg.get("weights", {})
         intercept = float(task_cfg.get("intercept", 0.0))
         w = np.asarray([float(weights.get(f, 0.0)) for f in fams], dtype=np.float64).reshape(1, -1)
         logits = (x_arr * w).sum(axis=1) + intercept
         out = 1.0 / (1.0 + np.exp(-logits))
+        return np.asarray(_clip_prob(out), dtype=np.float32)
+    if kind == "convex_blending":
+        weights = task_cfg.get("weights", {})
+        w = np.asarray([float(weights.get(f, 0.0)) for f in fams], dtype=np.float64)
+        if float(np.sum(w)) <= 0.0:
+            w = np.ones(len(fams), dtype=np.float64)
+        w = np.clip(w, 0.0, np.inf)
+        w = w / float(max(np.sum(w), 1e-12))
+        out = np.dot(x_arr, w.reshape(-1, 1)).reshape(-1)
         return np.asarray(_clip_prob(out), dtype=np.float32)
     weights = task_cfg.get("weights", {})
     w = np.asarray([float(weights.get(f, 0.0)) for f in fams], dtype=np.float64)
@@ -769,7 +855,6 @@ def _fit_blend_task(
     y: np.ndarray,
     fams: Sequence[str],
     sample_weight: np.ndarray | None,
-    enforce_non_negative: bool,
 ) -> tuple[Dict[str, Any], np.ndarray]:
     x_arr = np.asarray(x, dtype=np.float64)
     y_arr = np.asarray(y, dtype=np.int64).reshape(-1)
@@ -796,51 +881,64 @@ def _fit_blend_task(
             p_task,
         )
 
-    pos_rate = float(np.mean(y_arr))
-    # Stronger regularization for rare tasks.
-    if pos_rate < 0.01:
-        c_val = 0.10
-    elif pos_rate < 0.03:
-        c_val = 0.15
-    else:
-        c_val = 0.25
-    lr = LogisticRegression(max_iter=4000, solver="lbfgs", C=float(c_val))
-    lr.fit(x_arr, y_arr, sample_weight=sw)
-    coef = np.asarray(lr.coef_[0], dtype=np.float64)
-    intercept = float(lr.intercept_[0])
-
-    if enforce_non_negative:
-        coef_pos = np.clip(coef, 0.0, np.inf)
-        # Refit only intercept with fixed non-negative coefficients.
-        z = np.dot(x_arr, coef_pos).reshape(-1)
-        sw_local = np.ones_like(z) if sw is None else sw
+    # Constrained convex blending:
+    #   p = sum_i w_i * p_i, with w_i >= 0 and sum_i w_i = 1.
+    # We optimize weighted log-loss in simplex via exponentiated-gradient updates.
+    n_models = int(x_arr.shape[1])
+    w = np.ones((n_models,), dtype=np.float64) / float(max(1, n_models))
+    sw_local = np.ones((x_arr.shape[0],), dtype=np.float64) if sw is None else sw
+    sw_sum = float(np.sum(sw_local))
+    if sw_sum <= 0.0:
+        sw_local = np.ones((x_arr.shape[0],), dtype=np.float64)
         sw_sum = float(np.sum(sw_local))
-        if sw_sum <= 0.0:
-            sw_local = np.ones_like(z)
-            sw_sum = float(np.sum(sw_local))
-        grid = np.linspace(-12.0, 12.0, 241, dtype=np.float64)
-        best_b = float(intercept)
-        best_loss = float("inf")
-        eps = 1e-12
-        for b in grid.tolist():
-            p_b = 1.0 / (1.0 + np.exp(-(z + float(b))))
-            p_b = np.clip(p_b, eps, 1.0 - eps)
-            loss_b = -float(np.sum(sw_local * (y_arr * np.log(p_b) + (1 - y_arr) * np.log(1.0 - p_b))) / sw_sum)
-            if loss_b < best_loss:
-                best_loss = loss_b
-                best_b = float(b)
-        coef = coef_pos
-        intercept = float(best_b)
 
-    logits = np.dot(x_arr, coef).reshape(-1) + float(intercept)
-    p_task = 1.0 / (1.0 + np.exp(-logits))
-    p_task = _clip_prob(p_task)
+    def _loss_for(w_vec: np.ndarray) -> float:
+        p_vec = _clip_prob(np.dot(x_arr, w_vec.reshape(-1, 1)).reshape(-1))
+        eps = 1e-12
+        return -float(
+            np.sum(sw_local * (y_arr * np.log(np.clip(p_vec, eps, 1.0)) + (1 - y_arr) * np.log(np.clip(1.0 - p_vec, eps, 1.0))))
+            / sw_sum
+        )
+
+    best_w = w.copy()
+    best_loss = _loss_for(best_w)
+    max_iter = 800
+    eta0 = 0.20
+    tol = 1e-8
+    n_iter_done = 0
+    for it in range(max_iter):
+        p_vec = _clip_prob(np.dot(x_arr, w.reshape(-1, 1)).reshape(-1))
+        grad_core = (p_vec - y_arr) / np.clip(p_vec * (1.0 - p_vec), 1e-8, np.inf)
+        grad = np.dot(x_arr.T, (sw_local * grad_core).reshape(-1, 1)).reshape(-1) / sw_sum
+        grad = grad - float(np.mean(grad))
+        eta = float(eta0 / np.sqrt(float(it + 1)))
+        w_new = w * np.exp(-eta * grad)
+        if (not np.all(np.isfinite(w_new))) or float(np.sum(w_new)) <= 0.0:
+            break
+        w_new = np.clip(w_new, 0.0, np.inf)
+        w_new = w_new / float(max(np.sum(w_new), 1e-12))
+        n_iter_done = int(it + 1)
+        if float(np.linalg.norm(w_new - w, ord=1)) < tol:
+            w = w_new
+            cur_loss = _loss_for(w)
+            if cur_loss < best_loss:
+                best_loss = float(cur_loss)
+                best_w = w.copy()
+            break
+        w = w_new
+        cur_loss = _loss_for(w)
+        if cur_loss < best_loss:
+            best_loss = float(cur_loss)
+            best_w = w.copy()
+
+    p_task = _clip_prob(np.dot(x_arr, best_w.reshape(-1, 1)).reshape(-1))
     cfg = {
-        "kind": "logistic_stacking",
-        "weights": {f: float(coef[i]) for i, f in enumerate(fams)},
-        "intercept": float(intercept),
-        "non_negative": bool(enforce_non_negative),
-        "C": float(c_val),
+        "kind": "convex_blending",
+        "weights": {f: float(best_w[i]) for i, f in enumerate(fams)},
+        "constraint": "simplex_non_negative_sum1",
+        "optimizer": "exponentiated_gradient",
+        "n_iter": int(max(1, n_iter_done)),
+        "train_log_loss": float(best_loss),
     }
     return cfg, p_task
 
@@ -1345,7 +1443,7 @@ def _run_catboost_oof_predictions(
             if key not in task_best_params:
                 raise KeyError(f"Missing CatBoost params for {key}")
             p = dict(task_best_params[key])
-            iter_cap = int(p.get("iterations", 4000))
+            iter_cap = int(_resolve_catboost_iterations(p))
             pos = float(y_tr[tr_idx, t].sum())
             neg = float(len(tr_idx) - pos)
             spw = min(neg / max(pos, 1.0), float(p.get("pos_weight_clip", 100.0)))
@@ -1409,7 +1507,11 @@ def _run_catboost_oof_predictions(
     selected_iterations: Dict[int, int] = {}
     for t in range(4):
         plus_one = [int(x) + 1 for x in best_iters_by_task.get(int(t), [])]
-        selected_iterations[int(t)] = int(max(1, int(np.median(np.asarray(plus_one, dtype=np.int64))))) if plus_one else 4000
+        selected_iterations[int(t)] = (
+            int(max(1, int(np.median(np.asarray(plus_one, dtype=np.int64)))))
+            if plus_one
+            else 4000
+        )
         n_folds_t = int(folds_by_task.get(int(t), 0))
         cap_hits_t = int(cap_hits_by_task.get(int(t), 0))
         cap_hit_rate = float(cap_hits_t / float(max(1, n_folds_t)))
@@ -1682,6 +1784,9 @@ def run_family_suite(args: Any) -> None:
             None if getattr(args, "family_best_params_json", None) in (None, "") else str(args.family_best_params_json)
         ),
         catboost_task_params_jsons=tuple(str(x) for x in (getattr(args, "catboost_task_params_jsons", None) or [])),
+        catboost_final_iterations_jsons=tuple(
+            str(x) for x in (getattr(args, "catboost_final_iterations_jsons", None) or [])
+        ),
         mt_2d_params_json=(
             None if getattr(args, "mt_2d_params_json", None) in (None, "") else str(args.mt_2d_params_json)
         ),
@@ -1707,6 +1812,8 @@ def run_family_suite(args: Any) -> None:
             else str(args.mt_3d_final_epochs_json)
         ),
         catboost_hpo_parallel_tasks=int(getattr(args, "catboost_hpo_parallel_tasks", 1)),
+        blend_seed_ensemble_size=int(getattr(args, "blend_seed_ensemble_size", 1)),
+        blend_seed_step=int(getattr(args, "blend_seed_step", 1000)),
     )
     invalid = [x for x in cfg.model_families if x not in FAMILY_CHOICES]
     if invalid:
@@ -1740,6 +1847,19 @@ def run_family_suite(args: Any) -> None:
             "family_suite.catboost_task_overrides.loaded",
             n_files=int(len(cfg.catboost_task_params_jsons)),
             tasks=",".join(sorted(catboost_override.keys())),
+        )
+    catboost_selected_iterations_overrides: Dict[int, int] = {}
+    if len(cfg.catboost_final_iterations_jsons) > 0:
+        catboost_selected_iterations_overrides = _load_catboost_task_iterations_overrides(
+            cfg.catboost_final_iterations_jsons
+        )
+        log_event(
+            "INFO",
+            "family_suite.catboost_final_iterations_overrides.loaded",
+            n_files=int(len(cfg.catboost_final_iterations_jsons)),
+            selected_iterations=",".join(
+                [f"t{int(t)}:{int(catboost_selected_iterations_overrides[int(t)])}" for t in range(4)]
+            ),
         )
     per_family_override_paths: Dict[str, str] = {
         "mt_2d": str(cfg.mt_2d_params_json) if cfg.mt_2d_params_json else "",
@@ -2101,68 +2221,114 @@ def run_family_suite(args: Any) -> None:
         log_event("INFO", "family_suite.hpo_only.completed", n_families=int(len(cfg.model_families)))
         return
 
+    seed_ensemble_size = int(max(1, int(cfg.blend_seed_ensemble_size)))
+    seed_step = int(max(1, int(cfg.blend_seed_step)))
+    model_specs: List[Tuple[str, str, int, int]] = []
+    for family in cfg.model_families:
+        for rep_idx in range(seed_ensemble_size):
+            rep_seed = int(cfg.seed) + int(rep_idx) * int(seed_step)
+            model_key = str(family) if int(seed_ensemble_size) == 1 else f"{str(family)}__seed{int(rep_seed)}"
+            model_specs.append((str(model_key), str(family), int(rep_seed), int(rep_idx)))
+    log_event(
+        "INFO",
+        "family_suite.seed_ensemble",
+        ensemble_size=int(seed_ensemble_size),
+        seed_step=int(seed_step),
+        n_models_total=int(len(model_specs)),
+        models=",".join([str(k) for (k, _, _, _) in model_specs]),
+    )
+
     # Strict no-leak calibration/blending fit scope: train OOF only.
     cv_oof_tables: Dict[str, pd.DataFrame] = {}
-    mil_selected_epochs: Dict[str, int] = {str(k): int(v) for k, v in mil_selected_epochs_overrides.items()}
-    catboost_selected_iterations: Dict[int, int] = {}
-    for family in cfg.model_families:
-        with log_step("family.cv.run", family=str(family)):
+    mil_selected_epochs: Dict[str, int] = {}
+    catboost_selected_iterations: Dict[str, Dict[int, int]] = {}
+    for model_key, family, rep_seed, rep_idx in model_specs:
+        cfg_rep = replace(cfg, seed=int(rep_seed))
+        with log_step(
+            "family.cv.run",
+            family=str(family),
+            model=str(model_key),
+            replica_idx=int(rep_idx),
+            seed=int(rep_seed),
+        ):
             if family == "catboost_st":
                 df_oof, df_fold_metrics, sel_summary = _run_catboost_oof_predictions(
-                    cfg=cfg,
+                    cfg=cfg_rep,
                     df_train=df_train,
                     ids_2d_cat_file=ids_2d_cat_file,
                     X2d_cat_file=X2d_cat_file,
                     task_best_params=dict(best_params[family]),
-                    family=str(family),
+                    family=str(model_key),
                 )
-                sel_map = sel_summary.get("selected_iterations", {})
-                for t in range(4):
-                    sel_iter = int(sel_map.get(str(int(t)), 4000))
-                    catboost_selected_iterations[int(t)] = int(sel_iter)
-                    save_path = _save_catboost_final_iterations(
-                        outdir=best_params_dir,
-                        task_idx=int(t),
-                        fold_best_iterations=sel_summary.get("fold_best_iterations", {}).get(str(int(t)), []),
-                        selected_iterations=int(sel_iter),
-                    )
-                    log_event(
-                        "INFO",
-                        "family.cv.catboost.iterations.saved",
-                        task_idx=int(t),
-                        selected_iterations=int(sel_iter),
-                        path=str(save_path),
-                    )
+                sel_map_raw = sel_summary.get("selected_iterations", {})
+                sel_map: Dict[int, int] = {
+                    int(t): int(sel_map_raw.get(str(int(t)), 4000))
+                    for t in range(4)
+                }
+                if len(catboost_selected_iterations_overrides) > 0:
+                    for t in range(4):
+                        cv_sel = int(sel_map[int(t)])
+                        override_sel = int(catboost_selected_iterations_overrides[int(t)])
+                        sel_map[int(t)] = int(override_sel)
+                        log_event(
+                            "INFO",
+                            "family.cv.catboost.iter_selection.override_applied",
+                            model=str(model_key),
+                            task_idx=int(t),
+                            cv_selected_iterations=int(cv_sel),
+                            override_selected_iterations=int(override_sel),
+                            source="catboost_final_iterations_jsons",
+                        )
+                catboost_selected_iterations[str(model_key)] = dict(sel_map)
+                if int(rep_idx) == 0:
+                    for t in range(4):
+                        sel_iter = int(sel_map[int(t)])
+                        save_path = _save_catboost_final_iterations(
+                            outdir=best_params_dir,
+                            task_idx=int(t),
+                            fold_best_iterations=sel_summary.get("fold_best_iterations", {}).get(str(int(t)), []),
+                            selected_iterations=int(sel_iter),
+                        )
+                        log_event(
+                            "INFO",
+                            "family.cv.catboost.iterations.saved",
+                            model=str(model_key),
+                            task_idx=int(t),
+                            selected_iterations=int(sel_iter),
+                            path=str(save_path),
+                        )
             else:
                 df_oof, df_fold_metrics, sel_summary = _run_mil_oof_predictions(
-                    cfg=cfg,
-                    family=str(family),
+                    cfg=cfg_rep,
+                    family=str(model_key),
                     family_data=mil_families[family],
                     best_params=best_params[family],
                     outdir=outdir,
                     fixed_fold_train_epochs=mil_selected_epochs_overrides.get(str(family)),
                 )
                 sel_epochs = int(sel_summary.get("selected_epochs", max(1, int(cfg.max_epochs))))
-                mil_selected_epochs[str(family)] = int(sel_epochs)
-                save_path = _save_family_final_epochs(
-                    outdir=best_params_dir,
-                    family=str(family),
-                    fold_best_epochs=sel_summary.get("fold_best_epochs", []),
-                    selected_epochs=int(sel_epochs),
-                )
-                log_event(
-                    "INFO",
-                    "family.cv.mil.final_epochs.saved",
-                    family=str(family),
-                    selected_epochs=int(sel_epochs),
-                    selection_source=str(sel_summary.get("selection_source", "cv_median_best_epoch")),
-                    path=str(save_path),
-                )
-        cv_oof_tables[str(family)] = df_oof
-        _log_oof_bitmask_coverage(family=str(family), df_oof=df_oof)
-        df_oof.to_csv(outdir / f"train_oof_preds_{family}.csv", index=False)
+                mil_selected_epochs[str(model_key)] = int(sel_epochs)
+                if int(rep_idx) == 0:
+                    save_path = _save_family_final_epochs(
+                        outdir=best_params_dir,
+                        family=str(family),
+                        fold_best_epochs=sel_summary.get("fold_best_epochs", []),
+                        selected_epochs=int(sel_epochs),
+                    )
+                    log_event(
+                        "INFO",
+                        "family.cv.mil.final_epochs.saved",
+                        family=str(family),
+                        model=str(model_key),
+                        selected_epochs=int(sel_epochs),
+                        selection_source=str(sel_summary.get("selection_source", "cv_median_best_epoch")),
+                        path=str(save_path),
+                    )
+        cv_oof_tables[str(model_key)] = df_oof
+        _log_oof_bitmask_coverage(family=str(model_key), df_oof=df_oof)
+        df_oof.to_csv(outdir / f"train_oof_preds_{model_key}.csv", index=False)
         if len(df_fold_metrics) > 0:
-            df_fold_metrics.to_csv(outdir / f"cv_fold_metrics_{family}.csv", index=False)
+            df_fold_metrics.to_csv(outdir / f"cv_fold_metrics_{model_key}.csv", index=False)
         y_oof = np.stack([df_oof[f"y_t{t}"].to_numpy(dtype=np.int64) for t in range(4)], axis=1)
         p_oof = np.stack([df_oof[f"p_t{t}"].to_numpy(dtype=np.float64) for t in range(4)], axis=1)
         w_oof = np.stack(
@@ -2175,7 +2341,7 @@ def run_family_suite(args: Any) -> None:
             axis=1,
         )
         _metric_table(y_true=y_oof, p_pred=p_oof, w_cls=w_oof).to_csv(
-            outdir / f"cv_oof_metrics_{family}.csv", index=False
+            outdir / f"cv_oof_metrics_{model_key}.csv", index=False
         )
 
     # Enforce identical OOF ID/fold mapping across families.
@@ -2366,6 +2532,7 @@ def run_family_suite(args: Any) -> None:
             "families": fams,
             "input_source": "calibrated_probabilities",
             "calibration_method": str(cfg.calibration_method),
+            "blend_method": "convex_blending_simplex",
             "tasks": {},
         }
         bitmask_w_bl = make_bitmask_sample_weights(
@@ -2392,10 +2559,14 @@ def run_family_suite(args: Any) -> None:
                 y=y_task,
                 fams=fams,
                 sample_weight=blend_sw,
-                enforce_non_negative=True,
             )
             blend_pred_oof[:, t] = np.asarray(p_task, dtype=np.float64)
             blend_weights["tasks"][str(t)] = dict(task_cfg)
+            w_vec = np.asarray(list(task_cfg.get("weights", {}).values()), dtype=np.float64)
+            w_vec = w_vec if w_vec.size > 0 else np.asarray([1.0], dtype=np.float64)
+            w_sum = float(np.sum(np.clip(w_vec, 0.0, np.inf)))
+            w_norm = np.clip(w_vec, 0.0, np.inf) / float(max(w_sum, 1e-12))
+            w_entropy = -float(np.sum(w_norm * np.log(np.clip(w_norm, 1e-12, 1.0))))
             log_event(
                 "INFO",
                 "family.blend.fit.task",
@@ -2404,9 +2575,12 @@ def run_family_suite(args: Any) -> None:
                 kind=str(task_cfg.get("kind", "unknown")),
                 n_rows=int(y_task.shape[0]),
                 pos_rate=f"{float(np.mean(y_task)):.6f}",
-                non_negative=bool(task_cfg.get("non_negative", False)),
-                C=f"{float(task_cfg.get('C', np.nan)):.4f}",
-                intercept=f"{float(task_cfg.get('intercept', 0.0)):.6f}",
+                constraint=str(task_cfg.get("constraint", "")),
+                optimizer=str(task_cfg.get("optimizer", "")),
+                n_iter=int(task_cfg.get("n_iter", 0)),
+                train_log_loss=f"{float(task_cfg.get('train_log_loss', np.nan)):.6f}",
+                weight_max=f"{float(np.max(w_norm)):.6f}",
+                weight_entropy=f"{float(w_entropy):.6f}",
                 weight_l1=f"{float(np.sum(np.abs(np.asarray(list(task_cfg.get('weights', {}).values()), dtype=np.float64)))):.6f}",
                 sample_weight_sum=f"{float(np.sum(blend_sw)):.3f}",
             )
@@ -2453,7 +2627,8 @@ def run_family_suite(args: Any) -> None:
 
     pred_tables: Dict[str, pd.DataFrame] = {}
     leaderboard_metrics_by_family: Dict[str, pd.DataFrame] = {}
-    for family in cfg.model_families:
+    for model_key, family, rep_seed, rep_idx in model_specs:
+        cfg_rep = replace(cfg, seed=int(rep_seed))
         if family == "catboost_st":
             from catboost import CatBoostClassifier
 
@@ -2467,6 +2642,7 @@ def run_family_suite(args: Any) -> None:
             w_lb = build_task_weights(df_lb)
             catboost_task_params = dict(best_params[family])
             pred = np.zeros((len(ids_lb), 4), dtype=np.float64)
+            selected_iter_map = catboost_selected_iterations.get(str(model_key), {})
             for t in range(4):
                 if f"task_{int(t)}" not in catboost_task_params:
                     raise KeyError(
@@ -2477,11 +2653,11 @@ def run_family_suite(args: Any) -> None:
                 pos = float(y_tr[:, t].sum())
                 neg = float(len(y_tr) - pos)
                 spw = min(neg / max(pos, 1.0), float(p.get("pos_weight_clip", 100.0)))
-                target_iterations = int(catboost_selected_iterations.get(int(t), int(p.get("iterations", 4000))))
+                target_iterations = int(selected_iter_map.get(int(t), int(_resolve_catboost_iterations(p))))
                 cb_kwargs = _catboost_common_params(
                     params=p,
-                    seed=int(cfg.seed) + 97 * int(t),
-                    threads=max(1, int(cfg.cpu_workers)),
+                    seed=int(cfg_rep.seed) + 97 * int(t),
+                    threads=max(1, int(cfg_rep.cpu_workers)),
                     scale_pos_weight=float(spw),
                 )
                 cb_kwargs["iterations"] = int(target_iterations)
@@ -2500,6 +2676,10 @@ def run_family_suite(args: Any) -> None:
                 log_event(
                     "INFO",
                     "family.final.catboost.task",
+                    family=str(family),
+                    model=str(model_key),
+                    replica_idx=int(rep_idx),
+                    seed=int(rep_seed),
                     task_idx=int(t),
                     selected_iterations=int(target_iterations),
                     scale_pos_weight=f"{float(spw):.6f}",
@@ -2510,40 +2690,50 @@ def run_family_suite(args: Any) -> None:
                 df_pred[f"y_t{t}"] = y_lb[:, t]
                 df_pred[f"w_t{t}"] = w_lb[:, t]
                 df_pred[f"pred_t{t}"] = (pred[:, t] >= 0.5).astype(int)
-            df_pred.to_csv(outdir / f"leaderboard_preds_{family}.csv", index=False)
+            df_pred.to_csv(outdir / f"leaderboard_preds_{model_key}.csv", index=False)
             metrics_family = _metric_table(y_true=y_lb, p_pred=pred, w_cls=w_lb)
-            metrics_family.to_csv(outdir / f"leaderboard_metrics_{family}.csv", index=False)
-            leaderboard_metrics_by_family[str(family)] = metrics_family
-            pred_tables[family] = df_pred
+            metrics_family.to_csv(outdir / f"leaderboard_metrics_{model_key}.csv", index=False)
+            leaderboard_metrics_by_family[str(model_key)] = metrics_family
+            pred_tables[str(model_key)] = df_pred
             continue
 
-        selected_epochs = int(mil_selected_epochs.get(str(family), int(cfg.max_epochs)))
+        selected_epochs = int(
+            mil_selected_epochs.get(str(model_key), mil_selected_epochs.get(str(family), int(cfg.max_epochs)))
+        )
         log_event(
             "INFO",
             "family.final.mil.epoch_plan",
             family=str(family),
+            model=str(model_key),
+            replica_idx=int(rep_idx),
+            seed=int(rep_seed),
             selected_epochs=int(selected_epochs),
         )
         df_pred, metrics_family, train_info = _run_mil_final_train_and_predict(
-            cfg=cfg,
+            cfg=cfg_rep,
             family_data=mil_families[family],
             best_params=best_params[family],
             outdir=outdir,
             write_outputs=True,
-            output_prefix="leaderboard",
+            output_prefix=f"leaderboard_{model_key}",
             fixed_train_epochs=int(selected_epochs),
         )
-        leaderboard_metrics_by_family[str(family)] = metrics_family
+        leaderboard_metrics_by_family[str(model_key)] = metrics_family
+        metrics_family.to_csv(outdir / f"leaderboard_metrics_{model_key}.csv", index=False)
+        df_pred.to_csv(outdir / f"leaderboard_preds_{model_key}.csv", index=False)
         log_event(
             "INFO",
             "family.final.mil.train_done",
             family=str(family),
+            model=str(model_key),
+            replica_idx=int(rep_idx),
+            seed=int(rep_seed),
             target_epochs=int(train_info.get("target_epochs", selected_epochs)),
             epochs_trained=int(train_info.get("epochs_trained", 0)),
             best_epoch=int(train_info.get("best_epoch", 0)),
             use_fixed_epochs=bool(train_info.get("use_fixed_epochs", True)),
         )
-        pred_tables[family] = df_pred
+        pred_tables[str(model_key)] = df_pred
 
     # Apply train-OOF fitted calibrators on leaderboard predictions.
     calibrated: Dict[str, pd.DataFrame] = {}
@@ -2654,7 +2844,7 @@ def run_family_suite(args: Any) -> None:
             X_task = np.column_stack([x_by_family[f][:, t] for f in fams_lb]).astype(np.float64)
             task_cfg = blend_weights.get("tasks", {}).get(
                 str(t),
-                {"kind": "uniform_single_class", "weights": {f: 1.0 / float(max(1, len(fams_lb))) for f in fams_lb}},
+                {"kind": "convex_blending", "weights": {f: 1.0 / float(max(1, len(fams_lb))) for f in fams_lb}},
             )
             blend_pred[:, t] = _apply_blend_task(x=X_task, task_cfg=task_cfg, fams=fams_lb)
             log_event(
@@ -2662,7 +2852,7 @@ def run_family_suite(args: Any) -> None:
                 "family.blend.apply.task",
                 scope="leaderboard",
                 task_idx=int(t),
-                kind=str(task_cfg.get("kind", "uniform_single_class")),
+                kind=str(task_cfg.get("kind", "convex_blending")),
                 n_rows=int(X_task.shape[0]),
             )
 
@@ -2698,8 +2888,7 @@ def run_family_suite(args: Any) -> None:
     if blend_lb_metrics is not None:
         blend_by_task = blend_lb_metrics.set_index("task")[["pr_auc", "roc_auc"]]
         rows_summary: List[Dict[str, Any]] = []
-        for family in cfg.model_families:
-            dfm = leaderboard_metrics_by_family.get(str(family))
+        for model_name, dfm in sorted(leaderboard_metrics_by_family.items(), key=lambda kv: str(kv[0])):
             if dfm is None or len(dfm) == 0:
                 continue
             fam_by_task = dfm.set_index("task")[["pr_auc", "roc_auc"]]
@@ -2709,7 +2898,7 @@ def run_family_suite(args: Any) -> None:
                 rows_summary.append(
                     {
                         "task": str(task_name),
-                        "model": str(family),
+                        "model": str(model_name),
                         "pr_auc_lbrd": float(fam_by_task.loc[task_name, "pr_auc"]),
                         "roc_auc_lbrd": float(fam_by_task.loc[task_name, "roc_auc"]),
                         "pr_auc_lbd_blend": float(blend_by_task.loc[task_name, "pr_auc"]),
@@ -2724,10 +2913,16 @@ def run_family_suite(args: Any) -> None:
                 "family.results.summary_written",
                 path=str(results_path),
                 n_rows=int(len(rows_summary)),
-                n_models=int(len(cfg.model_families)),
+                n_models=int(len(leaderboard_metrics_by_family)),
                 n_tasks=int(len(TASK_COLS)),
             )
-    log_event("DONE", "family_suite.run", outdir=str(outdir), n_families=int(len(cfg.model_families)))
+    log_event(
+        "DONE",
+        "family_suite.run",
+        outdir=str(outdir),
+        n_families=int(len(cfg.model_families)),
+        n_models_total=int(len(model_specs)),
+    )
 
 
 __all__ = ["run_family_suite", "FAMILY_CHOICES"]
