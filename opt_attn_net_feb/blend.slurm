@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=Blend06
+#SBATCH --job-name=Blend07
 #SBATCH --export=ALL,MODULESHOME='',MODULEPATH=''   # Required on Debye
 #SBATCH --partition=qGPUr
 #SBATCH --gres=gpu:1
 #SBATCH --time=23:59:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=6
+#SBATCH --cpus-per-task=16
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
@@ -82,8 +82,8 @@ MAX_EPOCHS="${MAX_EPOCHS:-150}"
 PATIENCE="${PATIENCE:-15}"
 SEED="${SEED:-0}"
 PRECISION="${PRECISION:-16-mixed}"
-NUM_WORKERS="${NUM_WORKERS:-6}"
-CPU_WORKERS="${CPU_WORKERS:-6}"
+NUM_WORKERS="${NUM_WORKERS:-15}"
+CPU_WORKERS="${CPU_WORKERS:-15}"
 PIN_MEMORY="${PIN_MEMORY:-0}"
 
 LEADERBOARD_SPLIT="${LEADERBOARD_SPLIT:-leaderboard}"
@@ -97,7 +97,7 @@ FAMILY_BEST_PARAMS_JSON="${FAMILY_BEST_PARAMS_JSON:-}"
 CATBOOST_TASK_PARAMS_JSONS="${CATBOOST_TASK_PARAMS_JSONS:-"${DATA_DIR}/t0.json ${DATA_DIR}/t1.json ${DATA_DIR}/t2.json ${DATA_DIR}/t3.json"}"
 MT_2D_PARAMS_JSON="${MT_2D_PARAMS_JSON:-"${DATA_DIR}/mt_2d.json"}"
 MT_2D3D_PARAMS_JSON="${MT_2D3D_PARAMS_JSON:-"${DATA_DIR}/mt_2d3d.json"}"
-#MT_3D_PARAMS_JSON="${MT_3D_PARAMS_JSON:-}"
+MT_3D_PARAMS_JSON="${MT_3D_PARAMS_JSON:-${DATA_DIR}/mt_3d.json}"
 
 # -------------------- node-local scratch --------------------
 WORKDIR="/home-local/${USER}/tmp/${SLURM_JOB_ID}"

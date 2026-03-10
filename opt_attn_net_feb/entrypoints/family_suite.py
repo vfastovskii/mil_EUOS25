@@ -113,6 +113,9 @@ class FamilySuiteConfig:
     mt_2d_params_json: str | None
     mt_2d3d_params_json: str | None
     mt_3d_params_json: str | None
+    mt_2d_final_epochs_json: str | None
+    mt_2d3d_final_epochs_json: str | None
+    mt_3d_final_epochs_json: str | None
     catboost_hpo_parallel_tasks: int
 
 
@@ -340,6 +343,41 @@ def _load_single_family_override_json(*, path: Path, family: str) -> Any:
     if "best_params" not in payload:
         value = {k: v for k, v in value.items() if k not in {"family", "best_value_macro_ap_cv"}}
     return _normalize_family_params(family=family, value=value)
+
+
+def _load_family_selected_epochs_json(*, path: Path, family: str) -> int:
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"Invalid final-epochs JSON for family '{family}': expected object, got {type(payload).__name__}"
+        )
+    payload_family = payload.get("family")
+    if isinstance(payload_family, str) and str(payload_family) != str(family):
+        raise ValueError(
+            f"Family mismatch in {path}: expected '{family}', got '{payload_family}'"
+        )
+
+    def _coerce_pos_int(value: Any, *, field: str, min_value: int = 1) -> int:
+        if isinstance(value, bool):
+            raise ValueError(f"Invalid {field} in {path}: bool is not allowed.")
+        try:
+            iv = int(value)
+        except Exception as exc:
+            raise ValueError(f"Invalid {field} in {path}: expected integer-like value, got {value!r}") from exc
+        if iv < int(min_value):
+            raise ValueError(f"Invalid {field} in {path}: value must be >= {int(min_value)}, got {iv}.")
+        return iv
+
+    if "selected_epochs" in payload:
+        return _coerce_pos_int(payload.get("selected_epochs"), field="selected_epochs")
+    if "target_epochs" in payload:
+        return _coerce_pos_int(payload.get("target_epochs"), field="target_epochs")
+    if "best_epoch" in payload:
+        return int(_coerce_pos_int(payload.get("best_epoch"), field="best_epoch", min_value=0) + 1)
+    raise ValueError(
+        f"Invalid final-epochs JSON for family '{family}' in {path}: "
+        "missing one of ['selected_epochs', 'target_epochs', 'best_epoch']."
+    )
 
 
 def _normalize_catboost_params(value: Any) -> Dict[str, Dict[str, Any]]:
@@ -604,14 +642,29 @@ def _catboost_common_params(*, params: Mapping[str, Any], seed: int, threads: in
     return cb
 
 
-def _calibrate_task(y: np.ndarray, p: np.ndarray, method: str) -> tuple[np.ndarray, Dict[str, Any]]:
+def _calibrate_task(
+    y: np.ndarray,
+    p: np.ndarray,
+    method: str,
+    sample_weight: np.ndarray | None = None,
+) -> tuple[np.ndarray, Dict[str, Any]]:
     yb = np.asarray(y, dtype=int).reshape(-1)
     pp = _clip_prob(p).reshape(-1)
+    sw = None if sample_weight is None else np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+    if sw is not None:
+        if int(sw.shape[0]) != int(yb.shape[0]):
+            raise ValueError(
+                f"sample_weight length mismatch: got {int(sw.shape[0])}, expected {int(yb.shape[0])}"
+            )
+        sw = np.nan_to_num(sw, nan=0.0, posinf=0.0, neginf=0.0)
+        sw = np.clip(sw, 0.0, np.inf)
+        if float(np.sum(sw)) <= 0.0:
+            sw = None
     if int(np.unique(yb).size) < 2:
         return pp.astype(np.float32), {"kind": "identity_single_class"}
     if method == "isotonic":
         ir = IsotonicRegression(out_of_bounds="clip")
-        out = ir.fit_transform(pp, yb)
+        out = ir.fit_transform(pp, yb, sample_weight=sw)
         return np.asarray(out, dtype=np.float32), {
             "kind": "isotonic",
             "x_thresholds": [float(x) for x in ir.X_thresholds_.tolist()],
@@ -625,7 +678,7 @@ def _calibrate_task(y: np.ndarray, p: np.ndarray, method: str) -> tuple[np.ndarr
             q = 1.0 / (1.0 + np.exp(-logits / float(t)))
             q = _clip_prob(q)
             try:
-                nll = float(log_loss(yb, q, labels=[0, 1]))
+                nll = float(log_loss(yb, q, labels=[0, 1], sample_weight=sw))
             except Exception:
                 continue
             if nll < best_nll:
@@ -633,22 +686,29 @@ def _calibrate_task(y: np.ndarray, p: np.ndarray, method: str) -> tuple[np.ndarr
                 best_t = float(t)
         out = 1.0 / (1.0 + np.exp(-logits / best_t))
         return np.asarray(_clip_prob(out), dtype=np.float32), {"kind": "temperature", "temperature": float(best_t)}
-    # default platt
-    x = np.log(pp / (1.0 - pp)).reshape(-1, 1)
+    # default platt (score-space logistic calibration):
+    # fit y ~ sigmoid(A * score + B), where score is the model score.
+    # Here score=probability output (predict_proba[:,1]) because all families expose probabilities.
+    x = pp.reshape(-1, 1)
     lr = LogisticRegression(max_iter=1000, solver="lbfgs")
-    lr.fit(x, yb)
+    try:
+        lr.fit(x, yb, sample_weight=sw)
+    except Exception:
+        # Fallback to identity if calibration fit is unstable for this task.
+        return np.asarray(pp, dtype=np.float32), {"kind": "identity_fit_failed"}
     out = lr.predict_proba(x)[:, 1]
     return np.asarray(_clip_prob(out), dtype=np.float32), {
         "kind": "platt",
         "coef": float(lr.coef_[0, 0]),
         "intercept": float(lr.intercept_[0]),
+        "input_space": "raw_score_prob",
     }
 
 
 def _apply_calibration_task(p: np.ndarray, params: Mapping[str, Any]) -> np.ndarray:
     pp = _clip_prob(np.asarray(p, dtype=np.float64).reshape(-1))
     kind = str(params.get("kind", "identity"))
-    if kind in {"identity_single_class", "identity"}:
+    if kind in {"identity_single_class", "identity", "identity_fit_failed"}:
         return np.asarray(pp, dtype=np.float32)
     if kind == "isotonic":
         xs = np.asarray(params.get("x_thresholds", []), dtype=np.float64).reshape(-1)
@@ -666,7 +726,11 @@ def _apply_calibration_task(p: np.ndarray, params: Mapping[str, Any]) -> np.ndar
     if kind == "platt":
         coef = float(params.get("coef", 1.0))
         intercept = float(params.get("intercept", 0.0))
-        out = 1.0 / (1.0 + np.exp(-(coef * logits + intercept)))
+        # Backward-compatibility:
+        # old calibration JSONs used logit(prob) as score; new ones use raw probability score.
+        input_space = str(params.get("input_space", "logit_prob"))
+        score = pp if input_space in {"raw_score_prob", "raw_score", "raw_prob", "prob"} else logits
+        out = 1.0 / (1.0 + np.exp(-(coef * score + intercept)))
         return np.asarray(_clip_prob(out), dtype=np.float32)
     return np.asarray(pp, dtype=np.float32)
 
@@ -1010,6 +1074,7 @@ def _run_mil_oof_predictions(
     family_data: _MILFamilyData,
     best_params: Mapping[str, Any],
     outdir: Path,
+    fixed_fold_train_epochs: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     n = int(len(family_data.ids_train))
     if n <= 0:
@@ -1045,6 +1110,7 @@ def _run_mil_oof_predictions(
             outdir=cv_tmp_dir,
             write_outputs=False,
             output_prefix=f"cv_fold{int(fold_id)}",
+            fixed_train_epochs=(None if fixed_fold_train_epochs is None else int(fixed_fold_train_epochs)),
         )
         fold_best_epoch = int(train_info.get("best_epoch", max(0, int(train_info.get("epochs_trained", 1)) - 1)))
         fold_best_epochs.append(int(fold_best_epoch))
@@ -1089,12 +1155,22 @@ def _run_mil_oof_predictions(
         df_oof[f"w_t{t}"] = np.asarray(family_data.w_cls_train[:, t], dtype=np.float32)
         df_oof[f"pred_t{t}"] = (df_oof[f"p_t{t}"] >= 0.5).astype(int)
     df_fold_metrics = pd.DataFrame(fold_metric_rows)
-    plus_one = [int(x) + 1 for x in fold_best_epochs]
-    selected_epochs = int(max(1, int(np.median(np.asarray(plus_one, dtype=np.int64))))) if plus_one else int(max(1, int(cfg.max_epochs)))
+    if fixed_fold_train_epochs is not None:
+        selected_epochs = int(max(1, int(fixed_fold_train_epochs)))
+        selection_source = "override_fixed_epochs"
+    else:
+        plus_one = [int(x) + 1 for x in fold_best_epochs]
+        selected_epochs = (
+            int(max(1, int(np.median(np.asarray(plus_one, dtype=np.int64)))))
+            if plus_one
+            else int(max(1, int(cfg.max_epochs)))
+        )
+        selection_source = "cv_median_best_epoch"
     summary = {
         "family": str(family),
         "fold_best_epochs": [int(x) for x in fold_best_epochs],
         "selected_epochs": int(selected_epochs),
+        "selection_source": str(selection_source),
     }
     log_event(
         "INFO",
@@ -1102,6 +1178,7 @@ def _run_mil_oof_predictions(
         family=str(family),
         fold_best_epochs=",".join([str(int(x)) for x in fold_best_epochs]),
         selected_epochs=int(selected_epochs),
+        selection_source=str(selection_source),
     )
     return df_oof, df_fold_metrics, summary
 
@@ -1282,6 +1359,73 @@ def _prepare_family_inputs(
     )
     _, starts, counts, id2pos, Xinst_sorted, conf_sorted = build_instance_index(ids_conf, conf_ids, Xinst)
 
+    def _build_dense_instance_index_with_fallback(
+        *,
+        ids_order: Sequence[str],
+        starts_base: np.ndarray,
+        counts_base: np.ndarray,
+        id2pos_base: Mapping[str, int],
+        Xinst_base: np.ndarray,
+        conf_base: np.ndarray,
+        inst_dim: int,
+    ) -> tuple[np.ndarray, np.ndarray, Dict[str, int], np.ndarray, np.ndarray, int]:
+        starts_new = np.zeros((len(ids_order),), dtype=np.int64)
+        counts_new = np.zeros((len(ids_order),), dtype=np.int64)
+        id2pos_new: Dict[str, int] = {}
+        x_chunks: List[np.ndarray] = []
+        c_chunks: List[np.ndarray] = []
+        cursor = 0
+        n_missing = 0
+        for i, mol_id_raw in enumerate(ids_order):
+            mol_id = str(mol_id_raw)
+            starts_new[i] = int(cursor)
+            id2pos_new[mol_id] = int(i)
+            p = id2pos_base.get(mol_id)
+            if p is None:
+                bag_x = np.zeros((1, int(inst_dim)), dtype=np.float32)
+                bag_c = np.asarray(["dummy"], dtype=object)
+                n_missing += 1
+            else:
+                s = int(starts_base[int(p)])
+                c = int(counts_base[int(p)])
+                if c <= 0:
+                    bag_x = np.zeros((1, int(inst_dim)), dtype=np.float32)
+                    bag_c = np.asarray(["dummy"], dtype=object)
+                    n_missing += 1
+                else:
+                    bag_x = np.asarray(Xinst_base[s : s + c], dtype=np.float32)
+                    bag_c = np.asarray(conf_base[s : s + c], dtype=object)
+            counts_new[i] = int(bag_x.shape[0])
+            cursor += int(bag_x.shape[0])
+            x_chunks.append(bag_x)
+            c_chunks.append(bag_c)
+        if x_chunks:
+            Xinst_new = np.concatenate(x_chunks, axis=0).astype(np.float32, copy=False)
+            conf_new = np.concatenate(c_chunks, axis=0)
+        else:
+            Xinst_new = np.zeros((0, int(inst_dim)), dtype=np.float32)
+            conf_new = np.zeros((0,), dtype=object)
+        return starts_new, counts_new, id2pos_new, Xinst_new, conf_new, int(n_missing)
+
+    union_ids_all = list(dict.fromkeys([str(x) for x in (ids_train_all + ids_lb_all)]))
+    starts_dense, counts_dense, id2pos_dense, Xinst_dense, conf_dense, n_missing_3d = _build_dense_instance_index_with_fallback(
+        ids_order=union_ids_all,
+        starts_base=np.asarray(starts, dtype=np.int64),
+        counts_base=np.asarray(counts, dtype=np.int64),
+        id2pos_base={str(k): int(v) for k, v in id2pos.items()},
+        Xinst_base=np.asarray(Xinst_sorted, dtype=np.float32),
+        conf_base=np.asarray(conf_sorted),
+        inst_dim=int(inst_meta["inst_dim"]),
+    )
+    log_event(
+        "INFO",
+        "family_suite.prepare_data.instance_fallback",
+        n_ids_total=int(len(union_ids_all)),
+        n_ids_missing_3d=int(n_missing_3d),
+        n_rows_dense=int(Xinst_dense.shape[0]),
+        inst_dim=int(inst_meta["inst_dim"]),
+    )
+
     def _make_mil_family(family: str) -> _MILFamilyData:
         if family == "mt_2d":
             ids_tr = ids_train_all
@@ -1297,19 +1441,31 @@ def _prepare_family_inputs(
             geom_dim = 0
             qm_dim = 0
         elif family == "mt_3d":
-            ids_tr = [i for i in ids_train_all if i in id2pos]
-            ids_lb = [i for i in ids_lb_all if i in id2pos]
+            ids_tr = ids_train_all
+            ids_lb = ids_lb_all
             X2d_tr = np.zeros((len(ids_tr), 0), dtype=np.float32)
             X2d_lb = np.zeros((len(ids_lb), 0), dtype=np.float32)
-            starts_loc, counts_loc, id2pos_loc, Xinst_loc, conf_loc = starts, counts, id2pos, Xinst_sorted, conf_sorted
+            starts_loc, counts_loc, id2pos_loc, Xinst_loc, conf_loc = (
+                starts_dense,
+                counts_dense,
+                id2pos_dense,
+                Xinst_dense,
+                conf_dense,
+            )
             geom_dim = int(inst_meta["geom_dim"])
             qm_dim = int(inst_meta["qm_dim"])
         else:  # mt_2d3d
-            ids_tr = [i for i in ids_train_all if i in id2pos]
-            ids_lb = [i for i in ids_lb_all if i in id2pos]
+            ids_tr = ids_train_all
+            ids_lb = ids_lb_all
             X2d_tr = align_by_id(ids_2d_file, X2d_file, ids_tr)
             X2d_lb = align_by_id(ids_2d_file, X2d_file, ids_lb)
-            starts_loc, counts_loc, id2pos_loc, Xinst_loc, conf_loc = starts, counts, id2pos, Xinst_sorted, conf_sorted
+            starts_loc, counts_loc, id2pos_loc, Xinst_loc, conf_loc = (
+                starts_dense,
+                counts_dense,
+                id2pos_dense,
+                Xinst_dense,
+                conf_dense,
+            )
             geom_dim = int(inst_meta["geom_dim"])
             qm_dim = int(inst_meta["qm_dim"])
 
@@ -1406,6 +1562,21 @@ def run_family_suite(args: Any) -> None:
         mt_3d_params_json=(
             None if getattr(args, "mt_3d_params_json", None) in (None, "") else str(args.mt_3d_params_json)
         ),
+        mt_2d_final_epochs_json=(
+            None
+            if getattr(args, "mt_2d_final_epochs_json", None) in (None, "")
+            else str(args.mt_2d_final_epochs_json)
+        ),
+        mt_2d3d_final_epochs_json=(
+            None
+            if getattr(args, "mt_2d3d_final_epochs_json", None) in (None, "")
+            else str(args.mt_2d3d_final_epochs_json)
+        ),
+        mt_3d_final_epochs_json=(
+            None
+            if getattr(args, "mt_3d_final_epochs_json", None) in (None, "")
+            else str(args.mt_3d_final_epochs_json)
+        ),
         catboost_hpo_parallel_tasks=int(getattr(args, "catboost_hpo_parallel_tasks", 1)),
     )
     invalid = [x for x in cfg.model_families if x not in FAMILY_CHOICES]
@@ -1467,6 +1638,53 @@ def run_family_suite(args: Any) -> None:
             family=str(fam),
             path=str(p),
         )
+    epoch_override_paths: Dict[str, str] = {
+        "mt_2d": str(cfg.mt_2d_final_epochs_json) if cfg.mt_2d_final_epochs_json else "",
+        "mt_2d3d": str(cfg.mt_2d3d_final_epochs_json) if cfg.mt_2d3d_final_epochs_json else "",
+        "mt_3d": str(cfg.mt_3d_final_epochs_json) if cfg.mt_3d_final_epochs_json else "",
+    }
+    mil_selected_epochs_overrides: Dict[str, int] = {}
+    for fam, raw_path in epoch_override_paths.items():
+        if not raw_path:
+            continue
+        p = Path(raw_path)
+        if not p.exists():
+            raise FileNotFoundError(f"{fam} final-epochs JSON not found: {p}")
+        sel_epochs = _load_family_selected_epochs_json(path=p, family=fam)
+        mil_selected_epochs_overrides[str(fam)] = int(sel_epochs)
+        log_event(
+            "INFO",
+            "family_suite.family_epochs_override.loaded",
+            family=str(fam),
+            path=str(p),
+            selected_epochs=int(sel_epochs),
+            source="family_specific_flag",
+        )
+    for fam in ("mt_2d", "mt_2d3d", "mt_3d"):
+        if fam in mil_selected_epochs_overrides:
+            continue
+        auto_path = best_params_dir / f"final_epochs_{fam}.json"
+        if not auto_path.exists():
+            continue
+        try:
+            sel_epochs = _load_family_selected_epochs_json(path=auto_path, family=fam)
+            mil_selected_epochs_overrides[str(fam)] = int(sel_epochs)
+            log_event(
+                "INFO",
+                "family_suite.family_epochs_override.loaded",
+                family=str(fam),
+                path=str(auto_path),
+                selected_epochs=int(sel_epochs),
+                source="best_params_dir_auto",
+            )
+        except Exception as exc:
+            log_event(
+                "WARN",
+                "family_suite.family_epochs_override.auto_load_failed",
+                family=str(fam),
+                path=str(auto_path),
+                error=repr(exc),
+            )
 
     with log_step("family_suite.prepare_data", families=list(cfg.model_families)):
         df_train, df_lb, ids_2d_file, X2d_file, ids_2d_cat_file, X2d_cat_file, mil_families = _prepare_family_inputs(
@@ -1756,7 +1974,7 @@ def run_family_suite(args: Any) -> None:
 
     # Strict no-leak calibration/blending fit scope: train OOF only.
     cv_oof_tables: Dict[str, pd.DataFrame] = {}
-    mil_selected_epochs: Dict[str, int] = {}
+    mil_selected_epochs: Dict[str, int] = {str(k): int(v) for k, v in mil_selected_epochs_overrides.items()}
     catboost_selected_iterations: Dict[int, int] = {}
     for family in cfg.model_families:
         with log_step("family.cv.run", family=str(family)):
@@ -1793,6 +2011,7 @@ def run_family_suite(args: Any) -> None:
                     family_data=mil_families[family],
                     best_params=best_params[family],
                     outdir=outdir,
+                    fixed_fold_train_epochs=mil_selected_epochs_overrides.get(str(family)),
                 )
                 sel_epochs = int(sel_summary.get("selected_epochs", max(1, int(cfg.max_epochs))))
                 mil_selected_epochs[str(family)] = int(sel_epochs)
@@ -1807,6 +2026,7 @@ def run_family_suite(args: Any) -> None:
                     "family.cv.mil.final_epochs.saved",
                     family=str(family),
                     selected_epochs=int(sel_epochs),
+                    selection_source=str(sel_summary.get("selection_source", "cv_median_best_epoch")),
                     path=str(save_path),
                 )
         cv_oof_tables[str(family)] = df_oof
@@ -1844,8 +2064,26 @@ def run_family_suite(args: Any) -> None:
             p_cal = np.zeros_like(p, dtype=np.float32)
             params_by_task: Dict[str, Any] = {}
             for t in range(4):
+                sw_t = (
+                    arr[f"w_t{t}"].to_numpy(dtype=np.float64)
+                    if f"w_t{t}" in arr.columns
+                    else np.ones((int(y.shape[0]),), dtype=np.float64)
+                )
                 pos_rate = float(np.mean(y[:, t])) if int(y.shape[0]) > 0 else 0.0
-                p_cal[:, t], t_params = _calibrate_task(y[:, t], p[:, t], cfg.calibration_method)
+                sw_sum = float(np.sum(np.clip(np.nan_to_num(sw_t, nan=0.0), 0.0, np.inf)))
+                sw_pos = float(
+                    np.sum(
+                        np.clip(np.nan_to_num(sw_t, nan=0.0), 0.0, np.inf)
+                        * np.asarray(y[:, t], dtype=np.float64)
+                    )
+                )
+                pos_rate_weighted = float(sw_pos / sw_sum) if sw_sum > 0.0 else float("nan")
+                p_cal[:, t], t_params = _calibrate_task(
+                    y[:, t],
+                    p[:, t],
+                    cfg.calibration_method,
+                    sample_weight=sw_t,
+                )
                 params_by_task[str(t)] = t_params
                 arr[f"p_cal_t{t}"] = p_cal[:, t]
                 log_event(
@@ -1856,6 +2094,8 @@ def run_family_suite(args: Any) -> None:
                     task_idx=int(t),
                     kind=str(t_params.get("kind", "unknown")),
                     pos_rate=f"{pos_rate:.6f}",
+                    pos_rate_weighted=f"{pos_rate_weighted:.6f}",
+                    sample_weight_sum=f"{sw_sum:.3f}",
                     n_rows=int(y.shape[0]),
                 )
             cal_pred_path = outdir / f"train_oof_preds_{family}_calibrated.csv"
@@ -2031,6 +2271,7 @@ def run_family_suite(args: Any) -> None:
             )
 
     pred_tables: Dict[str, pd.DataFrame] = {}
+    leaderboard_metrics_by_family: Dict[str, pd.DataFrame] = {}
     for family in cfg.model_families:
         if family == "catboost_st":
             from catboost import CatBoostClassifier
@@ -2089,9 +2330,9 @@ def run_family_suite(args: Any) -> None:
                 df_pred[f"w_t{t}"] = w_lb[:, t]
                 df_pred[f"pred_t{t}"] = (pred[:, t] >= 0.5).astype(int)
             df_pred.to_csv(outdir / f"leaderboard_preds_{family}.csv", index=False)
-            _metric_table(y_true=y_lb, p_pred=pred, w_cls=w_lb).to_csv(
-                outdir / f"leaderboard_metrics_{family}.csv", index=False
-            )
+            metrics_family = _metric_table(y_true=y_lb, p_pred=pred, w_cls=w_lb)
+            metrics_family.to_csv(outdir / f"leaderboard_metrics_{family}.csv", index=False)
+            leaderboard_metrics_by_family[str(family)] = metrics_family
             pred_tables[family] = df_pred
             continue
 
@@ -2102,7 +2343,7 @@ def run_family_suite(args: Any) -> None:
             family=str(family),
             selected_epochs=int(selected_epochs),
         )
-        df_pred, _unused_metrics, train_info = _run_mil_final_train_and_predict(
+        df_pred, metrics_family, train_info = _run_mil_final_train_and_predict(
             cfg=cfg,
             family_data=mil_families[family],
             best_params=best_params[family],
@@ -2111,6 +2352,7 @@ def run_family_suite(args: Any) -> None:
             output_prefix="leaderboard",
             fixed_train_epochs=int(selected_epochs),
         )
+        leaderboard_metrics_by_family[str(family)] = metrics_family
         log_event(
             "INFO",
             "family.final.mil.train_done",
@@ -2180,6 +2422,7 @@ def run_family_suite(args: Any) -> None:
                 )
 
     # Apply train-OOF fitted blender on calibrated leaderboard probabilities.
+    blend_lb_metrics: pd.DataFrame | None = None
     with log_step("family.blend.apply", scope="leaderboard"):
         fams_lb = [str(x) for x in blend_weights.get("families", []) if str(x) in calibrated]
         if len(fams_lb) == 0:
@@ -2259,6 +2502,40 @@ def run_family_suite(args: Any) -> None:
                 macro_roc_auc=f"{float(macro_row.iloc[0]['roc_auc']):.6f}",
                 preds_path=str(blend_lb_pred_path),
                 metrics_path=str(blend_lb_metric_path),
+            )
+
+    # Summary table for direct single-model vs blend comparison on leaderboard.
+    if blend_lb_metrics is not None:
+        blend_by_task = blend_lb_metrics.set_index("task")[["pr_auc", "roc_auc"]]
+        rows_summary: List[Dict[str, Any]] = []
+        for family in cfg.model_families:
+            dfm = leaderboard_metrics_by_family.get(str(family))
+            if dfm is None or len(dfm) == 0:
+                continue
+            fam_by_task = dfm.set_index("task")[["pr_auc", "roc_auc"]]
+            for task_name in [str(t) for t in TASK_COLS]:
+                if task_name not in fam_by_task.index or task_name not in blend_by_task.index:
+                    continue
+                rows_summary.append(
+                    {
+                        "task": str(task_name),
+                        "model": str(family),
+                        "pr_auc_lbrd": float(fam_by_task.loc[task_name, "pr_auc"]),
+                        "roc_auc_lbrd": float(fam_by_task.loc[task_name, "roc_auc"]),
+                        "pr_auc_lbd_blend": float(blend_by_task.loc[task_name, "pr_auc"]),
+                        "roc_auc_lbd_blend": float(blend_by_task.loc[task_name, "roc_auc"]),
+                    }
+                )
+        if len(rows_summary) > 0:
+            results_path = outdir / "results.csv"
+            pd.DataFrame(rows_summary).to_csv(results_path, index=False)
+            log_event(
+                "INFO",
+                "family.results.summary_written",
+                path=str(results_path),
+                n_rows=int(len(rows_summary)),
+                n_models=int(len(cfg.model_families)),
+                n_tasks=int(len(TASK_COLS)),
             )
     log_event("DONE", "family_suite.run", outdir=str(outdir), n_families=int(len(cfg.model_families)))
 

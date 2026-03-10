@@ -1777,6 +1777,30 @@ def _parse_args(argv: Any | None = None):
         ),
     )
     ap.add_argument(
+        "--mt_2d_final_epochs_json",
+        default=None,
+        help=(
+            "Optional final-epochs JSON override for mt_2d in --run_family_suite mode. "
+            "Expected payload with selected_epochs (e.g., final_epochs_mt_2d.json)."
+        ),
+    )
+    ap.add_argument(
+        "--mt_2d3d_final_epochs_json",
+        default=None,
+        help=(
+            "Optional final-epochs JSON override for mt_2d3d in --run_family_suite mode. "
+            "Expected payload with selected_epochs (e.g., final_epochs_mt_2d3d.json)."
+        ),
+    )
+    ap.add_argument(
+        "--mt_3d_final_epochs_json",
+        default=None,
+        help=(
+            "Optional final-epochs JSON override for mt_3d in --run_family_suite mode. "
+            "Expected payload with selected_epochs (e.g., final_epochs_mt_3d.json)."
+        ),
+    )
+    ap.add_argument(
         "--run_hpo",
         action="store_true",
         help="Run Optuna CV optimization before final train.",
