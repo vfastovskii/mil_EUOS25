@@ -377,6 +377,183 @@ def export_leaderboard_attention(
     return Path(out_path)
 
 
+def export_attention_dataset_summary(
+    *,
+    pred_table_path: Path,
+    fusion_gate_summary_path: Path | None = None,
+    top_conformers_path: Path | None = None,
+    quantiles: Sequence[float] = (0.05, 0.25, 0.50, 0.75, 0.95),
+    top_k_per_task: int = 25,
+) -> Dict[str, Path]:
+    """
+    Build compact summary tables from an attention export.
+
+    Outputs:
+    - molecule-level fusion gate statistics by task / subset / modality
+    - ranked top conformers by task / modality from per-conformer attention
+    """
+    src = Path(pred_table_path)
+    df = _load_prediction_table(src).copy()
+
+    if fusion_gate_summary_path is None:
+        fusion_gate_summary_path = src.with_name(f"{src.stem}_fusion_gate_summary.csv")
+    if top_conformers_path is None:
+        top_conformers_path = src.with_name(f"{src.stem}_top_conformers.csv")
+
+    fusion_gate_summary_path.parent.mkdir(parents=True, exist_ok=True)
+    top_conformers_path.parent.mkdir(parents=True, exist_ok=True)
+
+    quantiles_arr = np.asarray([float(q) for q in quantiles], dtype=np.float64)
+    quantiles_arr = quantiles_arr[np.isfinite(quantiles_arr)]
+    if quantiles_arr.size <= 0:
+        quantiles_arr = np.asarray([0.05, 0.25, 0.50, 0.75, 0.95], dtype=np.float64)
+    quantiles_arr = np.clip(quantiles_arr, 0.0, 1.0)
+    quantiles_arr = np.unique(quantiles_arr)
+
+    if df.empty:
+        pd.DataFrame().to_csv(fusion_gate_summary_path, index=False)
+        pd.DataFrame().to_csv(top_conformers_path, index=False)
+        return {
+            "fusion_gate_summary": Path(fusion_gate_summary_path),
+            "top_conformers": Path(top_conformers_path),
+        }
+
+    required = {"ID", "conf_id"}
+    missing = sorted([c for c in required if c not in df.columns])
+    if missing:
+        raise ValueError(f"Attention table missing required columns: {missing}")
+
+    mol_df = df.drop_duplicates(subset=["ID"], keep="first").copy()
+    fusion_rows: list[dict[str, Any]] = []
+
+    for task in TASK_COLS:
+        pred_label_col = f"pred_label_{task}"
+        true_label_col = f"true_label_{task}"
+        subset_masks: list[tuple[str, pd.Series]] = [
+            ("all", pd.Series(True, index=mol_df.index, dtype=bool)),
+        ]
+        if pred_label_col in mol_df.columns:
+            pred_pos = pd.to_numeric(mol_df[pred_label_col], errors="coerce").fillna(0).astype(int) > 0
+            subset_masks.append(("predicted_positive", pred_pos))
+        if true_label_col in mol_df.columns:
+            true_pos = pd.to_numeric(mol_df[true_label_col], errors="coerce")
+            subset_masks.append(("true_positive", true_pos.fillna(0).astype(int) > 0))
+
+        modality_cols = [
+            ("2d", f"fusion_gate_2d_{task}"),
+            ("3d_geom", f"fusion_gate_3d_geom_{task}"),
+            ("3d_qm", f"fusion_gate_3d_qm_{task}"),
+        ]
+        modality_cols = [(m, c) for (m, c) in modality_cols if c in mol_df.columns]
+        if len(modality_cols) <= 0:
+            continue
+
+        for subset_name, subset_mask in subset_masks:
+            subset_df = mol_df.loc[subset_mask].copy()
+            for modality_name, gate_col in modality_cols:
+                vals = pd.to_numeric(subset_df[gate_col], errors="coerce").to_numpy(dtype=np.float64)
+                vals = vals[np.isfinite(vals)]
+                row: dict[str, Any] = {
+                    "task": str(task),
+                    "subset": str(subset_name),
+                    "modality": str(modality_name),
+                    "n_molecules": int(vals.size),
+                }
+                if vals.size <= 0:
+                    row.update(
+                        {
+                            "mean": np.nan,
+                            "std": np.nan,
+                            "min": np.nan,
+                            "max": np.nan,
+                        }
+                    )
+                    for q in quantiles_arr.tolist():
+                        row[f"q{int(round(100.0 * float(q))):02d}"] = np.nan
+                else:
+                    row.update(
+                        {
+                            "mean": float(np.mean(vals)),
+                            "std": float(np.std(vals, ddof=0)),
+                            "min": float(np.min(vals)),
+                            "max": float(np.max(vals)),
+                        }
+                    )
+                    qvals = np.quantile(vals, quantiles_arr)
+                    for q, qv in zip(quantiles_arr.tolist(), qvals.tolist()):
+                        row[f"q{int(round(100.0 * float(q))):02d}"] = float(qv)
+                fusion_rows.append(row)
+
+    fusion_df = pd.DataFrame(fusion_rows)
+    if not fusion_df.empty:
+        fusion_df = fusion_df.sort_values(["task", "subset", "modality"], kind="stable").reset_index(drop=True)
+    fusion_df.to_csv(fusion_gate_summary_path, index=False)
+
+    top_rows: list[pd.DataFrame] = []
+    top_k = max(1, int(top_k_per_task))
+    base_cols = ["ID", "conf_id"]
+    for task in TASK_COLS:
+        pred_col = f"pred_{task}"
+        pred_label_col = f"pred_label_{task}"
+        true_label_col = f"true_label_{task}"
+        gate_cols = [
+            c
+            for c in (
+                f"fusion_gate_2d_{task}",
+                f"fusion_gate_3d_geom_{task}",
+                f"fusion_gate_3d_qm_{task}",
+            )
+            if c in df.columns
+        ]
+        keep_cols = list(base_cols)
+        for maybe in (pred_col, pred_label_col, true_label_col):
+            if maybe in df.columns:
+                keep_cols.append(maybe)
+        keep_cols.extend(gate_cols)
+        for modality_name, attn_col in (("geom", f"attn_geom_{task}"), ("qm", f"attn_qm_{task}")):
+            if attn_col not in df.columns:
+                continue
+            work = df[keep_cols + [attn_col]].copy()
+            work["attention"] = pd.to_numeric(work[attn_col], errors="coerce").fillna(0.0).astype(np.float64)
+            work = work.loc[work["attention"] > 0.0].copy()
+            if work.empty:
+                continue
+            work["task"] = str(task)
+            work["modality"] = str(modality_name)
+            work["rank_within_molecule"] = (
+                work.groupby("ID", sort=False)["attention"].rank(method="first", ascending=False).astype(int)
+            )
+            work = work.sort_values(
+                ["attention", "ID", "conf_id"],
+                ascending=[False, True, True],
+                kind="stable",
+            ).head(top_k).reset_index(drop=True)
+            work.insert(0, "rank_global", np.arange(1, len(work) + 1, dtype=np.int64))
+            top_rows.append(work.drop(columns=[attn_col]))
+
+    if len(top_rows) > 0:
+        top_df = pd.concat(top_rows, axis=0, ignore_index=True)
+        top_df = top_df.sort_values(["task", "modality", "rank_global"], kind="stable").reset_index(drop=True)
+    else:
+        top_df = pd.DataFrame(
+            columns=[
+                "rank_global",
+                "task",
+                "modality",
+                "ID",
+                "conf_id",
+                "attention",
+                "rank_within_molecule",
+            ]
+        )
+    top_df.to_csv(top_conformers_path, index=False)
+
+    return {
+        "fusion_gate_summary": Path(fusion_gate_summary_path),
+        "top_conformers": Path(top_conformers_path),
+    }
+
+
 def _load_prediction_table(path: Path) -> pd.DataFrame:
     suffix = path.suffix.lower()
     if suffix in {".parquet", ".pq"}:

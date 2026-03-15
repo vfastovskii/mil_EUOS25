@@ -23,7 +23,7 @@ except Exception:  # pragma: no cover - scipy may be unavailable in minimal envs
 
 from ..data.collate import collate_export, collate_train
 from ..data.datasets import MILExportDataset, MILTrainDataset
-from ..data.exports import export_leaderboard_attention
+from ..data.exports import export_attention_dataset_summary, export_leaderboard_attention
 from ..training.builders import DataLoaderBuilder, LoaderConfig, MILModelBuilder
 from ..training.configs import HPOConfig
 from ..training.execution import (
@@ -309,7 +309,7 @@ def _save_catboost_final_iterations(
         "task_idx": int(task_idx),
         "task_name": str(TASK_COLS[int(task_idx)]),
         "selection_scope": "cv_train_only",
-        "selection_rule": "max(1000, median(best_iteration_plus_1))",
+        "selection_rule": "round(mean(best_iteration_plus_1))",
         "fold_best_iterations": [int(x) for x in fold_best_iterations],
         "selected_iterations": int(selected_iterations),
     }
@@ -908,7 +908,7 @@ def _fit_blend_task(
 
     # Constrained convex blending:
     #   p = sum_i w_i * p_i, with w_i >= 0 and sum_i w_i = 1.
-    # Objective here is direct weighted ROC-AUC maximization on train OOF.
+    # Objective here is direct weighted PR-AUC maximization on train OOF.
     # We use deterministic randomized search + local refinement on the simplex.
     n_models = int(x_arr.shape[1])
     sw_local = np.ones((x_arr.shape[0],), dtype=np.float64) if sw is None else sw
@@ -929,14 +929,14 @@ def _fit_blend_task(
         wv = _normalize_simplex(w_vec)
         p_vec = _clip_prob(np.dot(x_arr, wv.reshape(-1, 1)).reshape(-1))
         try:
-            auc = float(roc_auc_score(y_arr, p_vec, sample_weight=sw_local))
-        except Exception:
-            auc = float("nan")
-        try:
             ap = float(average_precision_score(y_arr, p_vec, sample_weight=sw_local))
         except Exception:
             ap = float("nan")
-        return auc, ap, p_vec
+        try:
+            auc = float(roc_auc_score(y_arr, p_vec, sample_weight=sw_local))
+        except Exception:
+            auc = float("nan")
+        return ap, auc, p_vec
 
     seed_basis = int(
         (int(x_arr.shape[0]) * 17 + int(x_arr.shape[1]) * 97 + int(np.sum(y_arr)) * 131) % (2**31 - 1)
@@ -965,18 +965,18 @@ def _fit_blend_task(
         candidates.append(rng.dirichlet(np.ones((n_models,), dtype=np.float64)))
 
     best_w = candidates[0]
-    best_auc = float("-inf")
     best_ap = float("-inf")
+    best_auc = float("-inf")
     best_p = _clip_prob(np.dot(x_arr, _normalize_simplex(best_w).reshape(-1, 1)).reshape(-1))
     n_eval = 0
     for cand in candidates:
-        auc, ap, p_vec = _eval_weights(cand)
+        ap, auc, p_vec = _eval_weights(cand)
         n_eval += 1
-        if (np.isfinite(auc) and (auc > best_auc + 1e-12)) or (
-            np.isfinite(auc) and abs(auc - best_auc) <= 1e-12 and np.isfinite(ap) and ap > best_ap
+        if (np.isfinite(ap) and (ap > best_ap + 1e-12)) or (
+            np.isfinite(ap) and abs(ap - best_ap) <= 1e-12 and np.isfinite(auc) and auc > best_auc
         ):
-            best_auc = float(auc)
-            best_ap = float(ap) if np.isfinite(ap) else float(best_ap)
+            best_ap = float(ap)
+            best_auc = float(auc) if np.isfinite(auc) else float(best_auc)
             best_w = _normalize_simplex(cand)
             best_p = p_vec
 
@@ -984,13 +984,13 @@ def _fit_blend_task(
     for sigma, n_steps in ((0.10, 320), (0.05, 320), (0.02, 240), (0.01, 160)):
         for _ in range(int(n_steps)):
             cand = _normalize_simplex(best_w + rng.normal(loc=0.0, scale=float(sigma), size=n_models))
-            auc, ap, p_vec = _eval_weights(cand)
+            ap, auc, p_vec = _eval_weights(cand)
             n_eval += 1
-            if (np.isfinite(auc) and (auc > best_auc + 1e-12)) or (
-                np.isfinite(auc) and abs(auc - best_auc) <= 1e-12 and np.isfinite(ap) and ap > best_ap
+            if (np.isfinite(ap) and (ap > best_ap + 1e-12)) or (
+                np.isfinite(ap) and abs(ap - best_ap) <= 1e-12 and np.isfinite(auc) and auc > best_auc
             ):
-                best_auc = float(auc)
-                best_ap = float(ap) if np.isfinite(ap) else float(best_ap)
+                best_ap = float(ap)
+                best_auc = float(auc) if np.isfinite(auc) else float(best_auc)
                 best_w = cand
                 best_p = p_vec
 
@@ -1000,10 +1000,10 @@ def _fit_blend_task(
         "weights": {f: float(best_w[i]) for i, f in enumerate(fams)},
         "constraint": "simplex_non_negative_sum1",
         "optimizer": "simplex_random_local_search",
-        "objective": "roc_auc",
+        "objective": "pr_auc",
         "n_eval": int(max(1, n_eval)),
-        "train_roc_auc": float(best_auc) if np.isfinite(best_auc) else float("nan"),
-        "train_pr_auc_tiebreak": float(best_ap) if np.isfinite(best_ap) else float("nan"),
+        "train_pr_auc": float(best_ap) if np.isfinite(best_ap) else float("nan"),
+        "train_roc_auc_tiebreak": float(best_auc) if np.isfinite(best_auc) else float("nan"),
     }
     return cfg, p_task
 
@@ -1331,11 +1331,16 @@ def _run_mil_final_train_and_predict(
                 out_path=attn_out_path,
                 true_labels_by_id=true_labels_by_id,
             )
+            summary_paths = export_attention_dataset_summary(
+                pred_table_path=written_attn_path,
+            )
             log_event(
                 "INFO",
                 "family.final.mil.modality_export.done",
                 family=str(family_data.family),
                 path=str(written_attn_path),
+                fusion_gate_summary_path=str(summary_paths["fusion_gate_summary"]),
+                top_conformers_path=str(summary_paths["top_conformers"]),
             )
 
     train_info = {
@@ -1635,12 +1640,12 @@ def _run_catboost_oof_predictions(
     selected_iterations: Dict[int, int] = {}
     for t in range(4):
         plus_one = [int(x) + 1 for x in best_iters_by_task.get(int(t), [])]
-        raw_selected = (
-            int(max(1, int(np.median(np.asarray(plus_one, dtype=np.int64)))))
+        raw_selected_mean = (
+            float(np.mean(np.asarray(plus_one, dtype=np.float64)))
             if plus_one
-            else 4000
+            else 4000.0
         )
-        selected_iterations[int(t)] = int(max(1000, int(raw_selected)))
+        selected_iterations[int(t)] = int(max(1, int(round(raw_selected_mean))))
         n_folds_t = int(folds_by_task.get(int(t), 0))
         cap_hits_t = int(cap_hits_by_task.get(int(t), 0))
         cap_hit_rate = float(cap_hits_t / float(max(1, n_folds_t)))
@@ -1651,10 +1656,8 @@ def _run_catboost_oof_predictions(
             fold_best_iterations=",".join([str(int(x)) for x in best_iters_by_task.get(int(t), [])]),
             selection_values=",".join([str(int(x)) for x in plus_one]),
             selected_iterations=int(selected_iterations[int(t)]),
-            selection_stat="median_then_floor_1000",
-            selected_from_fold_best_plus_one=int(raw_selected),
-            selection_floor=1000,
-            selection_floor_applied=bool(int(selected_iterations[int(t)]) != int(raw_selected)),
+            selection_stat="mean_plus_one_rounded",
+            selected_from_fold_best_plus_one=f"{float(raw_selected_mean):.6f}",
             cap_hits=int(cap_hits_t),
             n_folds=int(n_folds_t),
             cap_hit_rate=f"{cap_hit_rate:.3f}",
@@ -2715,10 +2718,10 @@ def run_family_suite(args: Any) -> None:
                 pos_rate=f"{float(np.mean(y_task)):.6f}",
                 constraint=str(task_cfg.get("constraint", "")),
                 optimizer=str(task_cfg.get("optimizer", "")),
-                objective=str(task_cfg.get("objective", "roc_auc")),
+                objective=str(task_cfg.get("objective", "pr_auc")),
                 n_eval=int(task_cfg.get("n_eval", 0)),
-                train_roc_auc=f"{float(task_cfg.get('train_roc_auc', np.nan)):.6f}",
-                train_pr_auc_tiebreak=f"{float(task_cfg.get('train_pr_auc_tiebreak', np.nan)):.6f}",
+                train_pr_auc=f"{float(task_cfg.get('train_pr_auc', np.nan)):.6f}",
+                train_roc_auc_tiebreak=f"{float(task_cfg.get('train_roc_auc_tiebreak', np.nan)):.6f}",
                 weight_max=f"{float(np.max(w_norm)):.6f}",
                 weight_entropy=f"{float(w_entropy):.6f}",
                 weight_l1=f"{float(np.sum(np.abs(np.asarray(list(task_cfg.get('weights', {}).values()), dtype=np.float64)))):.6f}",
