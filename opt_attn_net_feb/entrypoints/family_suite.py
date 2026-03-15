@@ -286,7 +286,7 @@ def _save_family_final_epochs(
     payload = {
         "family": str(family),
         "selection_scope": "cv_train_only",
-        "selection_rule": "median(best_epoch_plus_1)",
+        "selection_rule": "round(mean(best_epoch_plus_1))",
         "fold_best_epochs": [int(x) for x in fold_best_epochs],
         "selected_epochs": int(selected_epochs),
     }
@@ -908,7 +908,7 @@ def _fit_blend_task(
 
     # Constrained convex blending:
     #   p = sum_i w_i * p_i, with w_i >= 0 and sum_i w_i = 1.
-    # Objective here is direct weighted PR-AUC maximization on train OOF.
+    # Objective here is direct weighted ROC-AUC maximization on train OOF.
     # We use deterministic randomized search + local refinement on the simplex.
     n_models = int(x_arr.shape[1])
     sw_local = np.ones((x_arr.shape[0],), dtype=np.float64) if sw is None else sw
@@ -929,14 +929,14 @@ def _fit_blend_task(
         wv = _normalize_simplex(w_vec)
         p_vec = _clip_prob(np.dot(x_arr, wv.reshape(-1, 1)).reshape(-1))
         try:
-            ap = float(average_precision_score(y_arr, p_vec, sample_weight=sw_local))
-        except Exception:
-            ap = float("nan")
-        try:
             auc = float(roc_auc_score(y_arr, p_vec, sample_weight=sw_local))
         except Exception:
             auc = float("nan")
-        return ap, auc, p_vec
+        try:
+            ap = float(average_precision_score(y_arr, p_vec, sample_weight=sw_local))
+        except Exception:
+            ap = float("nan")
+        return auc, ap, p_vec
 
     seed_basis = int(
         (int(x_arr.shape[0]) * 17 + int(x_arr.shape[1]) * 97 + int(np.sum(y_arr)) * 131) % (2**31 - 1)
@@ -965,18 +965,18 @@ def _fit_blend_task(
         candidates.append(rng.dirichlet(np.ones((n_models,), dtype=np.float64)))
 
     best_w = candidates[0]
-    best_ap = float("-inf")
     best_auc = float("-inf")
+    best_ap = float("-inf")
     best_p = _clip_prob(np.dot(x_arr, _normalize_simplex(best_w).reshape(-1, 1)).reshape(-1))
     n_eval = 0
     for cand in candidates:
-        ap, auc, p_vec = _eval_weights(cand)
+        auc, ap, p_vec = _eval_weights(cand)
         n_eval += 1
-        if (np.isfinite(ap) and (ap > best_ap + 1e-12)) or (
-            np.isfinite(ap) and abs(ap - best_ap) <= 1e-12 and np.isfinite(auc) and auc > best_auc
+        if (np.isfinite(auc) and (auc > best_auc + 1e-12)) or (
+            np.isfinite(auc) and abs(auc - best_auc) <= 1e-12 and np.isfinite(ap) and ap > best_ap
         ):
-            best_ap = float(ap)
-            best_auc = float(auc) if np.isfinite(auc) else float(best_auc)
+            best_auc = float(auc)
+            best_ap = float(ap) if np.isfinite(ap) else float(best_ap)
             best_w = _normalize_simplex(cand)
             best_p = p_vec
 
@@ -984,13 +984,13 @@ def _fit_blend_task(
     for sigma, n_steps in ((0.10, 320), (0.05, 320), (0.02, 240), (0.01, 160)):
         for _ in range(int(n_steps)):
             cand = _normalize_simplex(best_w + rng.normal(loc=0.0, scale=float(sigma), size=n_models))
-            ap, auc, p_vec = _eval_weights(cand)
+            auc, ap, p_vec = _eval_weights(cand)
             n_eval += 1
-            if (np.isfinite(ap) and (ap > best_ap + 1e-12)) or (
-                np.isfinite(ap) and abs(ap - best_ap) <= 1e-12 and np.isfinite(auc) and auc > best_auc
+            if (np.isfinite(auc) and (auc > best_auc + 1e-12)) or (
+                np.isfinite(auc) and abs(auc - best_auc) <= 1e-12 and np.isfinite(ap) and ap > best_ap
             ):
-                best_ap = float(ap)
-                best_auc = float(auc) if np.isfinite(auc) else float(best_auc)
+                best_auc = float(auc)
+                best_ap = float(ap) if np.isfinite(ap) else float(best_ap)
                 best_w = cand
                 best_p = p_vec
 
@@ -1000,10 +1000,10 @@ def _fit_blend_task(
         "weights": {f: float(best_w[i]) for i, f in enumerate(fams)},
         "constraint": "simplex_non_negative_sum1",
         "optimizer": "simplex_random_local_search",
-        "objective": "pr_auc",
+        "objective": "roc_auc",
         "n_eval": int(max(1, n_eval)),
-        "train_pr_auc": float(best_ap) if np.isfinite(best_ap) else float("nan"),
-        "train_roc_auc_tiebreak": float(best_auc) if np.isfinite(best_auc) else float("nan"),
+        "train_roc_auc": float(best_auc) if np.isfinite(best_auc) else float("nan"),
+        "train_pr_auc_tiebreak": float(best_ap) if np.isfinite(best_ap) else float("nan"),
     }
     return cfg, p_task
 
@@ -1467,6 +1467,16 @@ def _run_mil_oof_predictions(
             fold_metric_rows.append(row)
         macro_row = fold_metrics[fold_metrics["task"] == "macro"]
         if len(macro_row) == 1:
+            by_task = fold_metrics[fold_metrics["task"] != "macro"].set_index("task")
+
+            def _metric(task_name: str, metric_name: str) -> str:
+                if task_name in by_task.index:
+                    try:
+                        return f"{float(by_task.loc[task_name, metric_name]):.6f}"
+                    except Exception:
+                        return "nan"
+                return "nan"
+
             log_event(
                 "DONE",
                 "family.cv.mil.fold",
@@ -1474,6 +1484,14 @@ def _run_mil_oof_predictions(
                 fold=int(fold_id),
                 macro_pr_auc=f"{float(macro_row.iloc[0]['pr_auc']):.6f}",
                 macro_roc_auc=f"{float(macro_row.iloc[0]['roc_auc']):.6f}",
+                pr_auc_t0=_metric(str(TASK_COLS[0]), "pr_auc"),
+                pr_auc_t1=_metric(str(TASK_COLS[1]), "pr_auc"),
+                pr_auc_t2=_metric(str(TASK_COLS[2]), "pr_auc"),
+                pr_auc_t3=_metric(str(TASK_COLS[3]), "pr_auc"),
+                roc_auc_t0=_metric(str(TASK_COLS[0]), "roc_auc"),
+                roc_auc_t1=_metric(str(TASK_COLS[1]), "roc_auc"),
+                roc_auc_t2=_metric(str(TASK_COLS[2]), "roc_auc"),
+                roc_auc_t3=_metric(str(TASK_COLS[3]), "roc_auc"),
             )
         else:
             log_event("DONE", "family.cv.mil.fold", family=str(family), fold=int(fold_id))
@@ -1492,15 +1510,17 @@ def _run_mil_oof_predictions(
         selected_epochs = int(max(1, int(fixed_fold_train_epochs)))
         selection_source = "override_fixed_epochs"
         selection_stat = "override_fixed"
+        selected_from_plus_one: float | str = "override"
     else:
         plus_one = [int(x) + 1 for x in fold_best_epochs]
-        selected_epochs = (
-            int(max(1, int(np.median(np.asarray(plus_one, dtype=np.int64)))))
+        selected_from_plus_one = (
+            float(np.mean(np.asarray(plus_one, dtype=np.float64)))
             if plus_one
-            else int(max(1, int(cfg.max_epochs)))
+            else float(max(1, int(cfg.max_epochs)))
         )
-        selection_source = "cv_median_best_epoch"
-        selection_stat = "median"
+        selected_epochs = int(max(1, int(round(float(selected_from_plus_one)))))
+        selection_source = "cv_mean_best_epoch"
+        selection_stat = "mean"
     summary = {
         "family": str(family),
         "fold_best_epochs": [int(x) for x in fold_best_epochs],
@@ -1518,7 +1538,9 @@ def _run_mil_oof_predictions(
         selected_epochs=int(selected_epochs),
         selection_stat=str(selection_stat),
         selected_from_fold_best_plus_one=(
-            int(selected_epochs) if str(selection_stat) == "median" else "override"
+            f"{float(selected_from_plus_one):.6f}"
+            if isinstance(selected_from_plus_one, (float, int))
+            else str(selected_from_plus_one)
         ),
         selection_source=str(selection_source),
     )
@@ -2459,7 +2481,7 @@ def run_family_suite(args: Any) -> None:
                         family=str(family),
                         model=str(model_key),
                         selected_epochs=int(sel_epochs),
-                        selection_source=str(sel_summary.get("selection_source", "cv_median_best_epoch")),
+                        selection_source=str(sel_summary.get("selection_source", "cv_mean_best_epoch")),
                         path=str(save_path),
                     )
         cv_oof_tables[str(model_key)] = df_oof
@@ -2718,10 +2740,10 @@ def run_family_suite(args: Any) -> None:
                 pos_rate=f"{float(np.mean(y_task)):.6f}",
                 constraint=str(task_cfg.get("constraint", "")),
                 optimizer=str(task_cfg.get("optimizer", "")),
-                objective=str(task_cfg.get("objective", "pr_auc")),
+                objective=str(task_cfg.get("objective", "roc_auc")),
                 n_eval=int(task_cfg.get("n_eval", 0)),
-                train_pr_auc=f"{float(task_cfg.get('train_pr_auc', np.nan)):.6f}",
-                train_roc_auc_tiebreak=f"{float(task_cfg.get('train_roc_auc_tiebreak', np.nan)):.6f}",
+                train_roc_auc=f"{float(task_cfg.get('train_roc_auc', np.nan)):.6f}",
+                train_pr_auc_tiebreak=f"{float(task_cfg.get('train_pr_auc_tiebreak', np.nan)):.6f}",
                 weight_max=f"{float(np.max(w_norm)):.6f}",
                 weight_entropy=f"{float(w_entropy):.6f}",
                 weight_l1=f"{float(np.sum(np.abs(np.asarray(list(task_cfg.get('weights', {}).values()), dtype=np.float64)))):.6f}",

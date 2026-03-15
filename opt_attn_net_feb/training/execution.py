@@ -1070,6 +1070,14 @@ class MILFoldTrainer:
             macro_pr_auc=f"{best_macro:.6f}",
             macro_roc_auc=f"{best_macro_auc:.6f}",
             min_pr_auc=f"{best_min:.6f}",
+            pr_auc_t0=f"{float(best_aps[0]):.6f}",
+            pr_auc_t1=f"{float(best_aps[1]):.6f}",
+            pr_auc_t2=f"{float(best_aps[2]):.6f}",
+            pr_auc_t3=f"{float(best_aps[3]):.6f}",
+            roc_auc_t0=f"{float(best_aucs[0]):.6f}",
+            roc_auc_t1=f"{float(best_aucs[1]):.6f}",
+            roc_auc_t2=f"{float(best_aucs[2]):.6f}",
+            roc_auc_t3=f"{float(best_aucs[3]):.6f}",
             run_tag=str(run_tag),
         )
 
