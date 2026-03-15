@@ -59,6 +59,11 @@ class BackboneConfig:
     inst_embedder_name: str = "mlp_v3_3d"
     aggregator_name: str = "task_attention_pool"
     predictor_name: str = "mlp_v3"
+    fusion_use_task_2d_adapter: bool = True
+    fusion_use_modality_gates: bool = True
+    fusion_use_modality_interaction: bool = True
+    fusion_gate_hidden: int | None = None
+    fusion_interaction_heads: int = 4
 
 
 @dataclass(frozen=True)
@@ -357,6 +362,15 @@ class HPOConfig:
             inst_embedder_name=str(params.get("inst_embedder_name", "mlp_v3_3d")),
             aggregator_name=str(params.get("aggregator_name", "task_attention_pool")),
             predictor_name=str(params.get("predictor_name", "mlp_v3")),
+            fusion_use_task_2d_adapter=bool(params.get("fusion_use_task_2d_adapter", True)),
+            fusion_use_modality_gates=bool(params.get("fusion_use_modality_gates", True)),
+            fusion_use_modality_interaction=bool(params.get("fusion_use_modality_interaction", True)),
+            fusion_gate_hidden=(
+                None
+                if params.get("fusion_gate_hidden", None) in (None, "")
+                else int(params.get("fusion_gate_hidden"))
+            ),
+            fusion_interaction_heads=int(params.get("fusion_interaction_heads", 4)),
         )
 
         heads = HeadConfig(

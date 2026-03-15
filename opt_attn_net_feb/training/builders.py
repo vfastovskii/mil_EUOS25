@@ -93,6 +93,13 @@ class MILModelBuilder:
                 mol_embedder_name=str(b.mol_embedder_name),
                 inst_embedder_name=str(b.inst_embedder_name),
                 aggregator_name=str(b.aggregator_name),
+                fusion_use_task_2d_adapter=bool(b.fusion_use_task_2d_adapter),
+                fusion_use_modality_gates=bool(b.fusion_use_modality_gates),
+                fusion_use_modality_interaction=bool(b.fusion_use_modality_interaction),
+                fusion_gate_hidden=(
+                    None if b.fusion_gate_hidden is None else int(b.fusion_gate_hidden)
+                ),
+                fusion_interaction_heads=int(b.fusion_interaction_heads),
             ),
             predictor=MILPredictorConfig(
                 predictor_name=str(b.predictor_name),

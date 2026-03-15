@@ -36,8 +36,14 @@ if _HAS_TORCH:
             logits = x2d[:, :t]
             attn_geom = torch.ones((b, t, x3d.shape[1]), dtype=x3d.dtype, device=x3d.device)
             attn_qm = torch.ones((b, t, x3d.shape[1]), dtype=x3d.dtype, device=x3d.device)
+            gates = torch.full((b, t, 3), 1.0 / 3.0, dtype=x3d.dtype, device=x3d.device)
             if return_attn_modalities:
-                attn = {"attn_geom": attn_geom, "attn_qm": attn_qm}
+                attn = {
+                    "attn_geom": attn_geom,
+                    "attn_qm": attn_qm,
+                    "modality_gates": gates,
+                    "modality_order": ("2d", "3d_geom", "3d_qm"),
+                }
             else:
                 attn = 0.5 * (attn_geom + attn_qm)
             return logits, None, None, attn
@@ -95,6 +101,9 @@ class ExportLeaderboardAttentionTest(unittest.TestCase):
                 self.assertIn(f"pred_label_{task}", df.columns)
                 self.assertIn(f"attn_geom_{task}", df.columns)
                 self.assertIn(f"attn_qm_{task}", df.columns)
+                self.assertIn(f"fusion_gate_2d_{task}", df.columns)
+                self.assertIn(f"fusion_gate_3d_geom_{task}", df.columns)
+                self.assertIn(f"fusion_gate_3d_qm_{task}", df.columns)
 
             row_m1 = df[(df["ID"] == "m1") & (df["conf_id"] == "c1")].iloc[0]
             row_m2 = df[(df["ID"] == "m2") & (df["conf_id"] == "d1")].iloc[0]

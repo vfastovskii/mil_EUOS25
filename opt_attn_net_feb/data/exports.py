@@ -142,6 +142,10 @@ def export_leaderboard_attention(
     - 8 attention weights (per endpoint and per 3D modality):
       - `attn_geom_<task>`
       - `attn_qm_<task>`
+    - optional fusion gate weights (per endpoint and modality):
+      - `fusion_gate_2d_<task>`
+      - `fusion_gate_3d_geom_<task>`
+      - `fusion_gate_3d_qm_<task>`
 
     Parameters:
         model: Any
@@ -222,6 +226,8 @@ def export_leaderboard_attention(
             raise RuntimeError("Expected modality attention dict when return_attn_modalities=True")
         attn_geom_t = attn.get("attn_geom")
         attn_qm_t = attn.get("attn_qm")
+        modality_gates_t = attn.get("modality_gates")
+        modality_order = tuple(str(x) for x in (attn.get("modality_order") or ()))
         if (attn_geom_t is None) and (attn_qm_t is None):
             raise RuntimeError("No modality attention returned; expected attn_geom and/or attn_qm")
 
@@ -233,6 +239,9 @@ def export_leaderboard_attention(
         attn_qm_np = (
             None if attn_qm_t is None else attn_qm_t.detach().cpu().numpy()
         )  # [B,4,N]
+        modality_gates_np = (
+            None if modality_gates_t is None else modality_gates_t.detach().cpu().numpy()
+        )  # [B,4,M]
         ref = attn_geom_np if attn_geom_np is not None else attn_qm_np
         if ref is None:
             raise RuntimeError("Internal error: missing reference attention tensor")
@@ -312,6 +321,15 @@ def export_leaderboard_attention(
                     **pred_label_cols,
                     **true_label_cols,
                 }
+                if (
+                    modality_gates_np is not None
+                    and len(modality_order) == int(modality_gates_np.shape[2])
+                ):
+                    for t in range(T):
+                        for mi, modality_name in enumerate(modality_order):
+                            row[f"fusion_gate_{str(modality_name)}_{TASK_COLS[t]}"] = float(
+                                modality_gates_np[b, t, mi]
+                            )
                 if conf_signature_map is not None:
                     key = _normalize_conf_id(confs[i])
                     row["pmapper_sig_md5"] = str(

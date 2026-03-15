@@ -21,12 +21,25 @@ from .predictors import build_predictor_heads
 from .training import compute_training_losses
 
 
+def _make_activation_module(name: str) -> nn.Module:
+    n = str(name).strip().lower()
+    if n == "gelu":
+        return nn.GELU()
+    if n in {"relu", "leakyrelu", "leaky_relu"}:
+        return nn.ReLU()
+    return nn.SiLU()
+
+
 class MILTaskAttnMixerWithAux(pl.LightningModule):
     """
     - 2D embedder -> e2d (no aggregator)
     - 3D geometry embedder -> tokens -> geometry aggregator
     - 3D quantum embedder -> tokens -> quantum aggregator
-    - project 2D/3D-geom/3D-qm to same dim, concat, mixer -> z_task
+    - project 2D/3D-geom/3D-qm to same dim
+    - make 2D task-aware before fusion
+    - apply explicit per-task modality gates
+    - run a tiny modality interaction block
+    - flatten modality summaries and pass through mixer -> z_task
     - cls logits from task-specific z_task
     - aux heads from mean(z_task)
     """
@@ -104,6 +117,13 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             inst_embedder_name=str(b.inst_embedder_name),
             aggregator_name=str(b.aggregator_name),
             aggregator_kwargs=b.aggregator_kwargs,
+            fusion_use_task_2d_adapter=bool(b.fusion_use_task_2d_adapter),
+            fusion_use_modality_gates=bool(b.fusion_use_modality_gates),
+            fusion_use_modality_interaction=bool(b.fusion_use_modality_interaction),
+            fusion_gate_hidden=(
+                None if b.fusion_gate_hidden is None else int(b.fusion_gate_hidden)
+            ),
+            fusion_interaction_heads=int(b.fusion_interaction_heads),
             predictor_name=str(h.predictor_name),
             head_num_layers=int(h.num_layers),
             head_dropout=float(h.dropout),
@@ -145,6 +165,11 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         inst_embedder_name: str = "mlp_v3_3d",
         aggregator_name: str = "task_attention_pool",
         aggregator_kwargs: Optional[Dict[str, Any]] = None,
+        fusion_use_task_2d_adapter: bool = True,
+        fusion_use_modality_gates: bool = True,
+        fusion_use_modality_interaction: bool = True,
+        fusion_gate_hidden: Optional[int] = None,
+        fusion_interaction_heads: int = 4,
         predictor_name: str = "mlp_v3",
         head_num_layers: int = 2,
         head_dropout: float = 0.1,
@@ -159,6 +184,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self.inst_geom_dim = int(inst_geom_dim)
         self.inst_qm_dim = int(inst_qm_dim)
         self.inst_hidden = int(inst_hidden)
+        self.proj_dim = int(proj_dim)
         use_2d = self.mol_dim > 0
         use_geom = self.inst_geom_dim > 0
         use_qm = self.inst_qm_dim > 0
@@ -260,6 +286,82 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 ("3d_geom", self.proj3d_geom is not None),
                 ("3d_qm", self.proj3d_qm is not None),
             ) if enabled
+        )
+        self.modality_name_to_index = {
+            str(name): int(i) for i, name in enumerate(self.active_modalities)
+        }
+        n_modalities = int(len(self.active_modalities))
+        act_mod = _make_activation_module(str(activation))
+        self.fusion_use_task_2d_adapter = bool(fusion_use_task_2d_adapter and self.proj2d is not None)
+        self.fusion_use_modality_gates = bool(fusion_use_modality_gates)
+        self.fusion_use_modality_interaction = bool(fusion_use_modality_interaction and n_modalities > 1)
+        gate_hidden = (
+            int(fusion_gate_hidden)
+            if fusion_gate_hidden is not None
+            else int(max(32, min(self.proj_dim, max(1, self.proj_dim // 2))))
+        )
+        self.task_2d_tokens = (
+            None
+            if not self.fusion_use_task_2d_adapter
+            else nn.Parameter(torch.randn(NUM_TASKS, self.proj_dim) * 0.02)
+        )
+        self.task_2d_adapter = (
+            None
+            if not self.fusion_use_task_2d_adapter
+            else nn.Sequential(
+                nn.Linear(2 * self.proj_dim, self.proj_dim),
+                _make_activation_module(str(activation)),
+                nn.Dropout(float(mixer_dropout)),
+                nn.Linear(self.proj_dim, self.proj_dim),
+            )
+        )
+        self.task_2d_post_norm = (
+            None if not self.fusion_use_task_2d_adapter else nn.LayerNorm(self.proj_dim)
+        )
+        self.modality_type_embeddings = nn.Parameter(
+            torch.randn(max(1, n_modalities), self.proj_dim) * 0.02
+        )
+        self.modality_gate_net = nn.Sequential(
+            nn.Linear(self.proj_dim, gate_hidden),
+            act_mod,
+            nn.Dropout(float(mixer_dropout)),
+            nn.Linear(gate_hidden, 1),
+        )
+        interaction_heads = int(max(1, fusion_interaction_heads))
+        if self.proj_dim % interaction_heads != 0:
+            interaction_heads = 1
+        self.fusion_interaction_heads = int(interaction_heads)
+        self.modality_interaction_attn = (
+            None
+            if not self.fusion_use_modality_interaction
+            else nn.MultiheadAttention(
+                embed_dim=self.proj_dim,
+                num_heads=self.fusion_interaction_heads,
+                dropout=float(mixer_dropout),
+                batch_first=True,
+                bias=True,
+            )
+        )
+        self.modality_interaction_dropout = (
+            nn.Identity()
+            if not self.fusion_use_modality_interaction
+            else nn.Dropout(float(mixer_dropout))
+        )
+        self.modality_interaction_ln1 = (
+            None if not self.fusion_use_modality_interaction else nn.LayerNorm(self.proj_dim)
+        )
+        self.modality_interaction_ffn = (
+            None
+            if not self.fusion_use_modality_interaction
+            else nn.Sequential(
+                nn.Linear(self.proj_dim, 2 * self.proj_dim),
+                _make_activation_module(str(activation)),
+                nn.Dropout(float(mixer_dropout)),
+                nn.Linear(2 * self.proj_dim, self.proj_dim),
+            )
+        )
+        self.modality_interaction_ln2 = (
+            None if not self.fusion_use_modality_interaction else nn.LayerNorm(self.proj_dim)
         )
         mixer_in_dim = int(max(1, len(self.active_modalities)) * int(proj_dim))
 
@@ -494,7 +596,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             key_padding_mask=key_padding_mask,
             return_attn=need_attn,
         )
-        z_tasks = self._build_task_representations(
+        z_tasks, fusion_info = self._build_task_representations(
             x2d=x2d,
             pooled_geom=pooled_geom,
             pooled_qm=pooled_qm,
@@ -517,6 +619,10 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             attn_payload = {
                 "attn_geom": attn_geom,
                 "attn_qm": attn_qm,
+                "modality_gates": fusion_info.get("modality_gates"),
+                "modality_scores": fusion_info.get("modality_scores"),
+                "modality_order": fusion_info.get("modality_order"),
+                "modality_attn": fusion_info.get("modality_attn"),
             }
 
         if need_attn and return_bitmask:
@@ -635,32 +741,98 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         x2d: torch.Tensor,
         pooled_geom: torch.Tensor,
         pooled_qm: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         batch_size = x2d.shape[0]
-        mix_parts: list[torch.Tensor] = []
+        modality_parts: dict[str, torch.Tensor] = {}
         if self.mol_enc is not None and self.mol_post_embed_norm is not None and self.proj2d is not None:
             mol_emb = self.mol_post_embed_norm(self.mol_enc(x2d))
             e2d = self.proj2d(mol_emb)  # [B,proj]
             e2d_rep = e2d.unsqueeze(1).expand(-1, NUM_TASKS, -1)  # [B,4,proj]
-            mix_parts.append(e2d_rep)
+            if (
+                self.fusion_use_task_2d_adapter
+                and self.task_2d_tokens is not None
+                and self.task_2d_adapter is not None
+                and self.task_2d_post_norm is not None
+            ):
+                task_ctx = self.task_2d_tokens.unsqueeze(0).expand(batch_size, -1, -1)
+                delta = self.task_2d_adapter(torch.cat([e2d_rep, task_ctx], dim=-1))
+                e2d_rep = self.task_2d_post_norm(e2d_rep + delta)
+            modality_parts["2d"] = e2d_rep
         if self.proj3d_geom is not None and self.agg_geom_post_norm is not None:
             pooled_geom = self.agg_geom_post_norm(pooled_geom)
             e3d_geom = self.proj3d_geom(
                 pooled_geom.reshape(batch_size * NUM_TASKS, -1)
             ).reshape(batch_size, NUM_TASKS, -1)
-            mix_parts.append(e3d_geom)
+            modality_parts["3d_geom"] = e3d_geom
         if self.proj3d_qm is not None and self.agg_qm_post_norm is not None:
             pooled_qm = self.agg_qm_post_norm(pooled_qm)
             e3d_qm = self.proj3d_qm(
                 pooled_qm.reshape(batch_size * NUM_TASKS, -1)
             ).reshape(batch_size, NUM_TASKS, -1)
-            mix_parts.append(e3d_qm)
-        if len(mix_parts) == 0:
+            modality_parts["3d_qm"] = e3d_qm
+        if len(modality_parts) == 0:
             raise RuntimeError("No active modality projections found for mixer input.")
+        tokens = torch.stack(
+            [modality_parts[str(name)] for name in self.active_modalities],
+            dim=2,
+        )  # [B,T,M,proj]
+        n_modalities = int(tokens.shape[2])
+        type_embed = self.modality_type_embeddings[:n_modalities].view(1, 1, n_modalities, self.proj_dim)
+        tokens_with_type = tokens + type_embed
 
-        mix_in = torch.cat(mix_parts, dim=2).reshape(batch_size * NUM_TASKS, -1)
+        if n_modalities == 1:
+            modality_scores = torch.ones(
+                (batch_size, NUM_TASKS, 1),
+                dtype=tokens.dtype,
+                device=tokens.device,
+            )
+            modality_gates = modality_scores
+        else:
+            flat_tokens = tokens_with_type.reshape(batch_size * NUM_TASKS * n_modalities, self.proj_dim)
+            modality_scores = self.modality_gate_net(flat_tokens).reshape(batch_size, NUM_TASKS, n_modalities)
+            if self.fusion_use_modality_gates:
+                modality_gates = torch.softmax(modality_scores, dim=-1)
+            else:
+                modality_gates = torch.full_like(modality_scores, fill_value=1.0 / float(n_modalities))
+
+        gated_tokens = tokens * modality_gates.unsqueeze(-1)
+        modality_attn = None
+        fused_tokens = gated_tokens
+        if (
+            self.fusion_use_modality_interaction
+            and self.modality_interaction_attn is not None
+            and self.modality_interaction_ln1 is not None
+            and self.modality_interaction_ffn is not None
+            and self.modality_interaction_ln2 is not None
+            and n_modalities > 1
+        ):
+            seq = gated_tokens.reshape(batch_size * NUM_TASKS, n_modalities, self.proj_dim)
+            seq_type = type_embed.expand(batch_size, NUM_TASKS, -1, -1).reshape(
+                batch_size * NUM_TASKS, n_modalities, self.proj_dim
+            )
+            seq_in = seq + seq_type
+            attn_out, attn_w = self.modality_interaction_attn(
+                query=seq_in,
+                key=seq_in,
+                value=seq_in,
+                need_weights=True,
+                average_attn_weights=False,
+            )
+            seq = self.modality_interaction_ln1(seq + self.modality_interaction_dropout(attn_out))
+            seq = self.modality_interaction_ln2(seq + self.modality_interaction_ffn(seq))
+            fused_tokens = seq.reshape(batch_size, NUM_TASKS, n_modalities, self.proj_dim)
+            modality_attn = attn_w.mean(dim=1).reshape(batch_size, NUM_TASKS, n_modalities, n_modalities)
+
+        mix_in = fused_tokens.reshape(batch_size * NUM_TASKS, n_modalities * self.proj_dim)
         z_tasks = self.mixer(mix_in).reshape(batch_size, NUM_TASKS, -1)  # [B,4,mixer_hidden]
-        return self.mixer_post_norm(z_tasks)
+        z_tasks = self.mixer_post_norm(z_tasks)
+        fusion_info = {
+            "modality_order": tuple(str(x) for x in self.active_modalities),
+            "modality_scores": modality_scores,
+            "modality_gates": modality_gates,
+            "modality_attn": modality_attn,
+        }
+        return z_tasks, fusion_info
 
     def training_step(self, batch, batch_idx):
         x2d, x3d, kpm, y_cls, w_cls, y_abs, m_abs, w_abs, y_fluo, m_fluo, w_fluo = batch[:11]

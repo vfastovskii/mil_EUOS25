@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import gc
 import json
+import math
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -15,9 +16,14 @@ import torch
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, brier_score_loss, log_loss, roc_auc_score
+try:
+    from scipy.stats import t as _student_t_dist
+except Exception:  # pragma: no cover - scipy may be unavailable in minimal envs
+    _student_t_dist = None
 
-from ..data.collate import collate_train
-from ..data.datasets import MILTrainDataset
+from ..data.collate import collate_export, collate_train
+from ..data.datasets import MILExportDataset, MILTrainDataset
+from ..data.exports import export_leaderboard_attention
 from ..training.builders import DataLoaderBuilder, LoaderConfig, MILModelBuilder
 from ..training.configs import HPOConfig
 from ..training.execution import (
@@ -55,6 +61,25 @@ from ..utils.ops import (
 from ..utils.progress import log_event, log_step
 
 FAMILY_CHOICES: tuple[str, ...] = ("catboost_st", "mt_2d", "mt_2d3d", "mt_3d")
+
+
+def _mean_sd_ci95(values: np.ndarray) -> tuple[float, float, float, float, float]:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        nan = float("nan")
+        return nan, nan, nan, nan, nan
+    mean = float(np.mean(arr))
+    if arr.size == 1:
+        return mean, 0.0, mean, mean, 0.0
+    sd = float(np.std(arr, ddof=1))
+    df = int(arr.size - 1)
+    if _student_t_dist is not None:
+        crit = float(_student_t_dist.ppf(0.975, df=df))
+    else:  # Fallback to normal approximation if scipy is unavailable.
+        crit = 1.96
+    half = float(crit * sd / math.sqrt(float(arr.size)))
+    return mean, sd, mean - half, mean + half, half
 
 
 def _maybe_mirror_best_params(path: Path) -> None:
@@ -284,7 +309,7 @@ def _save_catboost_final_iterations(
         "task_idx": int(task_idx),
         "task_name": str(TASK_COLS[int(task_idx)]),
         "selection_scope": "cv_train_only",
-        "selection_rule": "median(best_iteration_plus_1)",
+        "selection_rule": "max(1000, median(best_iteration_plus_1))",
         "fold_best_iterations": [int(x) for x in fold_best_iterations],
         "selected_iterations": int(selected_iterations),
     }
@@ -883,62 +908,102 @@ def _fit_blend_task(
 
     # Constrained convex blending:
     #   p = sum_i w_i * p_i, with w_i >= 0 and sum_i w_i = 1.
-    # We optimize weighted log-loss in simplex via exponentiated-gradient updates.
+    # Objective here is direct weighted ROC-AUC maximization on train OOF.
+    # We use deterministic randomized search + local refinement on the simplex.
     n_models = int(x_arr.shape[1])
-    w = np.ones((n_models,), dtype=np.float64) / float(max(1, n_models))
     sw_local = np.ones((x_arr.shape[0],), dtype=np.float64) if sw is None else sw
     sw_sum = float(np.sum(sw_local))
     if sw_sum <= 0.0:
         sw_local = np.ones((x_arr.shape[0],), dtype=np.float64)
         sw_sum = float(np.sum(sw_local))
 
-    def _loss_for(w_vec: np.ndarray) -> float:
-        p_vec = _clip_prob(np.dot(x_arr, w_vec.reshape(-1, 1)).reshape(-1))
-        eps = 1e-12
-        return -float(
-            np.sum(sw_local * (y_arr * np.log(np.clip(p_vec, eps, 1.0)) + (1 - y_arr) * np.log(np.clip(1.0 - p_vec, eps, 1.0))))
-            / sw_sum
-        )
+    def _normalize_simplex(v: np.ndarray) -> np.ndarray:
+        vv = np.asarray(v, dtype=np.float64).reshape(-1)
+        vv = np.clip(np.nan_to_num(vv, nan=0.0, posinf=0.0, neginf=0.0), 0.0, np.inf)
+        s = float(np.sum(vv))
+        if not np.isfinite(s) or s <= 0.0:
+            return np.ones((n_models,), dtype=np.float64) / float(max(1, n_models))
+        return vv / s
 
-    best_w = w.copy()
-    best_loss = _loss_for(best_w)
-    max_iter = 800
-    eta0 = 0.20
-    tol = 1e-8
-    n_iter_done = 0
-    for it in range(max_iter):
-        p_vec = _clip_prob(np.dot(x_arr, w.reshape(-1, 1)).reshape(-1))
-        grad_core = (p_vec - y_arr) / np.clip(p_vec * (1.0 - p_vec), 1e-8, np.inf)
-        grad = np.dot(x_arr.T, (sw_local * grad_core).reshape(-1, 1)).reshape(-1) / sw_sum
-        grad = grad - float(np.mean(grad))
-        eta = float(eta0 / np.sqrt(float(it + 1)))
-        w_new = w * np.exp(-eta * grad)
-        if (not np.all(np.isfinite(w_new))) or float(np.sum(w_new)) <= 0.0:
-            break
-        w_new = np.clip(w_new, 0.0, np.inf)
-        w_new = w_new / float(max(np.sum(w_new), 1e-12))
-        n_iter_done = int(it + 1)
-        if float(np.linalg.norm(w_new - w, ord=1)) < tol:
-            w = w_new
-            cur_loss = _loss_for(w)
-            if cur_loss < best_loss:
-                best_loss = float(cur_loss)
-                best_w = w.copy()
-            break
-        w = w_new
-        cur_loss = _loss_for(w)
-        if cur_loss < best_loss:
-            best_loss = float(cur_loss)
-            best_w = w.copy()
+    def _eval_weights(w_vec: np.ndarray) -> tuple[float, float, np.ndarray]:
+        wv = _normalize_simplex(w_vec)
+        p_vec = _clip_prob(np.dot(x_arr, wv.reshape(-1, 1)).reshape(-1))
+        try:
+            auc = float(roc_auc_score(y_arr, p_vec, sample_weight=sw_local))
+        except Exception:
+            auc = float("nan")
+        try:
+            ap = float(average_precision_score(y_arr, p_vec, sample_weight=sw_local))
+        except Exception:
+            ap = float("nan")
+        return auc, ap, p_vec
 
-    p_task = _clip_prob(np.dot(x_arr, best_w.reshape(-1, 1)).reshape(-1))
+    seed_basis = int(
+        (int(x_arr.shape[0]) * 17 + int(x_arr.shape[1]) * 97 + int(np.sum(y_arr)) * 131) % (2**31 - 1)
+    )
+    rng = np.random.RandomState(seed_basis)
+
+    candidates: List[np.ndarray] = []
+    candidates.append(np.ones((n_models,), dtype=np.float64) / float(max(1, n_models)))  # uniform
+    for i in range(n_models):  # one-hot
+        v = np.zeros((n_models,), dtype=np.float64)
+        v[i] = 1.0
+        candidates.append(v)
+    # Pairwise mixes are cheap and improve robustness when one model dominates.
+    if n_models >= 2:
+        alphas = np.asarray([0.1, 0.25, 0.5, 0.75, 0.9], dtype=np.float64)
+        for i in range(n_models):
+            for j in range(i + 1, n_models):
+                for a in alphas.tolist():
+                    v = np.zeros((n_models,), dtype=np.float64)
+                    v[i] = float(a)
+                    v[j] = float(1.0 - a)
+                    candidates.append(v)
+    # Random simplex samples for broader search.
+    n_random = int(max(1024, 256 * n_models))
+    for _ in range(n_random):
+        candidates.append(rng.dirichlet(np.ones((n_models,), dtype=np.float64)))
+
+    best_w = candidates[0]
+    best_auc = float("-inf")
+    best_ap = float("-inf")
+    best_p = _clip_prob(np.dot(x_arr, _normalize_simplex(best_w).reshape(-1, 1)).reshape(-1))
+    n_eval = 0
+    for cand in candidates:
+        auc, ap, p_vec = _eval_weights(cand)
+        n_eval += 1
+        if (np.isfinite(auc) and (auc > best_auc + 1e-12)) or (
+            np.isfinite(auc) and abs(auc - best_auc) <= 1e-12 and np.isfinite(ap) and ap > best_ap
+        ):
+            best_auc = float(auc)
+            best_ap = float(ap) if np.isfinite(ap) else float(best_ap)
+            best_w = _normalize_simplex(cand)
+            best_p = p_vec
+
+    # Local refinement around best candidate.
+    for sigma, n_steps in ((0.10, 320), (0.05, 320), (0.02, 240), (0.01, 160)):
+        for _ in range(int(n_steps)):
+            cand = _normalize_simplex(best_w + rng.normal(loc=0.0, scale=float(sigma), size=n_models))
+            auc, ap, p_vec = _eval_weights(cand)
+            n_eval += 1
+            if (np.isfinite(auc) and (auc > best_auc + 1e-12)) or (
+                np.isfinite(auc) and abs(auc - best_auc) <= 1e-12 and np.isfinite(ap) and ap > best_ap
+            ):
+                best_auc = float(auc)
+                best_ap = float(ap) if np.isfinite(ap) else float(best_ap)
+                best_w = cand
+                best_p = p_vec
+
+    p_task = np.asarray(best_p, dtype=np.float64)
     cfg = {
         "kind": "convex_blending",
         "weights": {f: float(best_w[i]) for i, f in enumerate(fams)},
         "constraint": "simplex_non_negative_sum1",
-        "optimizer": "exponentiated_gradient",
-        "n_iter": int(max(1, n_iter_done)),
-        "train_log_loss": float(best_loss),
+        "optimizer": "simplex_random_local_search",
+        "objective": "roc_auc",
+        "n_eval": int(max(1, n_eval)),
+        "train_roc_auc": float(best_auc) if np.isfinite(best_auc) else float("nan"),
+        "train_pr_auc_tiebreak": float(best_ap) if np.isfinite(best_ap) else float("nan"),
     }
     return cfg, p_task
 
@@ -1237,6 +1302,41 @@ def _run_mil_final_train_and_predict(
     if bool(write_outputs):
         metrics.to_csv(outdir / f"{output_prefix}_metrics_{family_data.family}.csv", index=False)
         df_pred.to_csv(outdir / f"{output_prefix}_preds_{family_data.family}.csv", index=False)
+        if int(family_data.inst_geom_dim) > 0 or int(family_data.inst_qm_dim) > 0:
+            export_ds = MILExportDataset(
+                ids=[str(x) for x in family_data.ids_lb],
+                X2d=np.asarray(family_data.X2d_lb, dtype=np.float32),
+                starts=np.asarray(family_data.starts, dtype=np.int64),
+                counts=np.asarray(family_data.counts, dtype=np.int64),
+                id2pos={str(k): int(v) for k, v in family_data.id2pos.items()},
+                Xinst_sorted=np.asarray(family_data.Xinst_sorted, dtype=np.float32),
+                conf_sorted=np.asarray(family_data.conf_sorted),
+                max_instances=0,
+                seed=int(cfg.seed) + 123,
+            )
+            export_dl = loader_builder.eval_loader(
+                export_ds,
+                batch_size=min(64, int(hpo_cfg.runtime.batch_size)),
+                collate_fn=collate_export,
+            )
+            true_labels_by_id = {
+                str(family_data.ids_lb[i]): np.asarray(Y[i], dtype=np.float32).reshape(-1)
+                for i in range(len(family_data.ids_lb))
+            }
+            attn_out_path = outdir / f"{output_prefix}_attention.csv"
+            written_attn_path = export_leaderboard_attention(
+                model=model,
+                dl_lb_export=export_dl,
+                device=eval_device,
+                out_path=attn_out_path,
+                true_labels_by_id=true_labels_by_id,
+            )
+            log_event(
+                "INFO",
+                "family.final.mil.modality_export.done",
+                family=str(family_data.family),
+                path=str(written_attn_path),
+            )
 
     train_info = {
         "family": str(family_data.family),
@@ -1383,8 +1483,10 @@ def _run_mil_oof_predictions(
         df_oof[f"pred_t{t}"] = (df_oof[f"p_t{t}"] >= 0.5).astype(int)
     df_fold_metrics = pd.DataFrame(fold_metric_rows)
     if fixed_fold_train_epochs is not None:
+        plus_one = [int(x) + 1 for x in fold_best_epochs]
         selected_epochs = int(max(1, int(fixed_fold_train_epochs)))
         selection_source = "override_fixed_epochs"
+        selection_stat = "override_fixed"
     else:
         plus_one = [int(x) + 1 for x in fold_best_epochs]
         selected_epochs = (
@@ -1393,18 +1495,26 @@ def _run_mil_oof_predictions(
             else int(max(1, int(cfg.max_epochs)))
         )
         selection_source = "cv_median_best_epoch"
+        selection_stat = "median"
     summary = {
         "family": str(family),
         "fold_best_epochs": [int(x) for x in fold_best_epochs],
+        "fold_best_plus_one": [int(x) for x in plus_one],
         "selected_epochs": int(selected_epochs),
         "selection_source": str(selection_source),
+        "selection_stat": str(selection_stat),
     }
     log_event(
         "INFO",
         "family.cv.mil.epoch_selection",
         family=str(family),
         fold_best_epochs=",".join([str(int(x)) for x in fold_best_epochs]),
+        selection_values=",".join([str(int(x)) for x in plus_one]),
         selected_epochs=int(selected_epochs),
+        selection_stat=str(selection_stat),
+        selected_from_fold_best_plus_one=(
+            int(selected_epochs) if str(selection_stat) == "median" else "override"
+        ),
         selection_source=str(selection_source),
     )
     return df_oof, df_fold_metrics, summary
@@ -1487,6 +1597,16 @@ def _run_catboost_oof_predictions(
             fold_metric_rows.append(row)
         macro_row = fold_metrics[fold_metrics["task"] == "macro"]
         if len(macro_row) == 1:
+            by_task = fold_metrics[fold_metrics["task"] != "macro"].set_index("task")
+
+            def _metric(task_name: str, metric_name: str) -> str:
+                if task_name in by_task.index:
+                    try:
+                        return f"{float(by_task.loc[task_name, metric_name]):.6f}"
+                    except Exception:
+                        return "nan"
+                return "nan"
+
             log_event(
                 "INFO",
                 "family.cv.catboost.fold",
@@ -1494,6 +1614,14 @@ def _run_catboost_oof_predictions(
                 fold=int(fold_id),
                 macro_pr_auc=f"{float(macro_row.iloc[0]['pr_auc']):.6f}",
                 macro_roc_auc=f"{float(macro_row.iloc[0]['roc_auc']):.6f}",
+                pr_auc_t0=_metric(str(TASK_COLS[0]), "pr_auc"),
+                pr_auc_t1=_metric(str(TASK_COLS[1]), "pr_auc"),
+                pr_auc_t2=_metric(str(TASK_COLS[2]), "pr_auc"),
+                pr_auc_t3=_metric(str(TASK_COLS[3]), "pr_auc"),
+                roc_auc_t0=_metric(str(TASK_COLS[0]), "roc_auc"),
+                roc_auc_t1=_metric(str(TASK_COLS[1]), "roc_auc"),
+                roc_auc_t2=_metric(str(TASK_COLS[2]), "roc_auc"),
+                roc_auc_t3=_metric(str(TASK_COLS[3]), "roc_auc"),
             )
     if np.isnan(oof).any():
         missing = int(np.isnan(oof).sum())
@@ -1507,11 +1635,12 @@ def _run_catboost_oof_predictions(
     selected_iterations: Dict[int, int] = {}
     for t in range(4):
         plus_one = [int(x) + 1 for x in best_iters_by_task.get(int(t), [])]
-        selected_iterations[int(t)] = (
+        raw_selected = (
             int(max(1, int(np.median(np.asarray(plus_one, dtype=np.int64)))))
             if plus_one
             else 4000
         )
+        selected_iterations[int(t)] = int(max(1000, int(raw_selected)))
         n_folds_t = int(folds_by_task.get(int(t), 0))
         cap_hits_t = int(cap_hits_by_task.get(int(t), 0))
         cap_hit_rate = float(cap_hits_t / float(max(1, n_folds_t)))
@@ -1520,7 +1649,12 @@ def _run_catboost_oof_predictions(
             "family.cv.catboost.iter_selection",
             task_idx=int(t),
             fold_best_iterations=",".join([str(int(x)) for x in best_iters_by_task.get(int(t), [])]),
+            selection_values=",".join([str(int(x)) for x in plus_one]),
             selected_iterations=int(selected_iterations[int(t)]),
+            selection_stat="median_then_floor_1000",
+            selected_from_fold_best_plus_one=int(raw_selected),
+            selection_floor=1000,
+            selection_floor_applied=bool(int(selected_iterations[int(t)]) != int(raw_selected)),
             cap_hits=int(cap_hits_t),
             n_folds=int(n_folds_t),
             cap_hit_rate=f"{cap_hit_rate:.3f}",
@@ -2240,6 +2374,7 @@ def run_family_suite(args: Any) -> None:
 
     # Strict no-leak calibration/blending fit scope: train OOF only.
     cv_oof_tables: Dict[str, pd.DataFrame] = {}
+    cv_fold_metrics_by_model: Dict[str, pd.DataFrame] = {}
     mil_selected_epochs: Dict[str, int] = {}
     catboost_selected_iterations: Dict[str, Dict[int, int]] = {}
     for model_key, family, rep_seed, rep_idx in model_specs:
@@ -2327,6 +2462,9 @@ def run_family_suite(args: Any) -> None:
         cv_oof_tables[str(model_key)] = df_oof
         _log_oof_bitmask_coverage(family=str(model_key), df_oof=df_oof)
         df_oof.to_csv(outdir / f"train_oof_preds_{model_key}.csv", index=False)
+        cv_fold_metrics_by_model[str(model_key)] = (
+            df_fold_metrics.copy() if isinstance(df_fold_metrics, pd.DataFrame) else pd.DataFrame()
+        )
         if len(df_fold_metrics) > 0:
             df_fold_metrics.to_csv(outdir / f"cv_fold_metrics_{model_key}.csv", index=False)
         y_oof = np.stack([df_oof[f"y_t{t}"].to_numpy(dtype=np.int64) for t in range(4)], axis=1)
@@ -2577,8 +2715,10 @@ def run_family_suite(args: Any) -> None:
                 pos_rate=f"{float(np.mean(y_task)):.6f}",
                 constraint=str(task_cfg.get("constraint", "")),
                 optimizer=str(task_cfg.get("optimizer", "")),
-                n_iter=int(task_cfg.get("n_iter", 0)),
-                train_log_loss=f"{float(task_cfg.get('train_log_loss', np.nan)):.6f}",
+                objective=str(task_cfg.get("objective", "roc_auc")),
+                n_eval=int(task_cfg.get("n_eval", 0)),
+                train_roc_auc=f"{float(task_cfg.get('train_roc_auc', np.nan)):.6f}",
+                train_pr_auc_tiebreak=f"{float(task_cfg.get('train_pr_auc_tiebreak', np.nan)):.6f}",
                 weight_max=f"{float(np.max(w_norm)):.6f}",
                 weight_entropy=f"{float(w_entropy):.6f}",
                 weight_l1=f"{float(np.sum(np.abs(np.asarray(list(task_cfg.get('weights', {}).values()), dtype=np.float64)))):.6f}",
@@ -2899,12 +3039,46 @@ def run_family_suite(args: Any) -> None:
                     {
                         "task": str(task_name),
                         "model": str(model_name),
+                        "pr_auc_cv_mean": float("nan"),
+                        "pr_auc_cv_sd": float("nan"),
+                        "pr_auc_cv_ci95_low": float("nan"),
+                        "pr_auc_cv_ci95_high": float("nan"),
+                        "pr_auc_cv_ci95_halfwidth": float("nan"),
+                        "roc_auc_cv_mean": float("nan"),
+                        "roc_auc_cv_sd": float("nan"),
+                        "roc_auc_cv_ci95_low": float("nan"),
+                        "roc_auc_cv_ci95_high": float("nan"),
+                        "roc_auc_cv_ci95_halfwidth": float("nan"),
                         "pr_auc_lbrd": float(fam_by_task.loc[task_name, "pr_auc"]),
                         "roc_auc_lbrd": float(fam_by_task.loc[task_name, "roc_auc"]),
                         "pr_auc_lbd_blend": float(blend_by_task.loc[task_name, "pr_auc"]),
                         "roc_auc_lbd_blend": float(blend_by_task.loc[task_name, "roc_auc"]),
+                        "pr_auc_lbrd_blend": float(blend_by_task.loc[task_name, "pr_auc"]),
+                        "roc_auc_lbrd_blend": float(blend_by_task.loc[task_name, "roc_auc"]),
                     }
                 )
+                dff = cv_fold_metrics_by_model.get(str(model_name))
+                if isinstance(dff, pd.DataFrame) and len(dff) > 0:
+                    cur = dff[dff["task"].astype(str) == str(task_name)].copy()
+                    if len(cur) > 0:
+                        pr_vals = pd.to_numeric(cur["pr_auc"], errors="coerce").to_numpy(dtype=np.float64)
+                        roc_vals = pd.to_numeric(cur["roc_auc"], errors="coerce").to_numpy(dtype=np.float64)
+                        pr_vals = pr_vals[np.isfinite(pr_vals)]
+                        roc_vals = roc_vals[np.isfinite(roc_vals)]
+                        if pr_vals.size > 0:
+                            mean, sd, lo, hi, half = _mean_sd_ci95(pr_vals)
+                            rows_summary[-1]["pr_auc_cv_mean"] = mean
+                            rows_summary[-1]["pr_auc_cv_sd"] = sd
+                            rows_summary[-1]["pr_auc_cv_ci95_low"] = lo
+                            rows_summary[-1]["pr_auc_cv_ci95_high"] = hi
+                            rows_summary[-1]["pr_auc_cv_ci95_halfwidth"] = half
+                        if roc_vals.size > 0:
+                            mean, sd, lo, hi, half = _mean_sd_ci95(roc_vals)
+                            rows_summary[-1]["roc_auc_cv_mean"] = mean
+                            rows_summary[-1]["roc_auc_cv_sd"] = sd
+                            rows_summary[-1]["roc_auc_cv_ci95_low"] = lo
+                            rows_summary[-1]["roc_auc_cv_ci95_high"] = hi
+                            rows_summary[-1]["roc_auc_cv_ci95_halfwidth"] = half
         if len(rows_summary) > 0:
             results_path = outdir / "results.csv"
             pd.DataFrame(rows_summary).to_csv(results_path, index=False)

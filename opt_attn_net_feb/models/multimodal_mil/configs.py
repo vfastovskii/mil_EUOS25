@@ -27,6 +27,11 @@ class MILBackboneConfig:
     inst_embedder_name: str = "mlp_v3_3d"
     aggregator_name: str = "task_attention_pool"
     aggregator_kwargs: Optional[Dict[str, Any]] = None
+    fusion_use_task_2d_adapter: bool = True
+    fusion_use_modality_gates: bool = True
+    fusion_use_modality_interaction: bool = True
+    fusion_gate_hidden: Optional[int] = None
+    fusion_interaction_heads: int = 4
 
 
 @dataclass(frozen=True)
