@@ -6,7 +6,8 @@
   <component name="ChangeListManager">
     <list default="true" id="33826e23-5bc2-4bf8-9077-a15c3daefac9" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/entrypoints/family_suite.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/entrypoints/family_suite.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/models/multimodal_mil/model.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/models/multimodal_mil/model.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/tests/test_multimodal_fusion_model.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/tests/test_multimodal_fusion_model.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -66,7 +67,7 @@
       <updated>1770573376037</updated>
       <workItem from="1770573377091" duration="1443000" />
       <workItem from="1773516930843" duration="7046000" />
-      <workItem from="1773573422894" duration="2044000" />
+      <workItem from="1773573422894" duration="5792000" />
     </task>
     <servers />
   </component>

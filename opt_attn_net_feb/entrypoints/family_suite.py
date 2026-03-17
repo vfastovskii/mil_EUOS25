@@ -286,7 +286,7 @@ def _save_family_final_epochs(
     payload = {
         "family": str(family),
         "selection_scope": "cv_train_only",
-        "selection_rule": "round(mean(best_epoch_plus_1))",
+        "selection_rule": "median(best_epoch_plus_1)",
         "fold_best_epochs": [int(x) for x in fold_best_epochs],
         "selected_epochs": int(selected_epochs),
     }
@@ -309,7 +309,7 @@ def _save_catboost_final_iterations(
         "task_idx": int(task_idx),
         "task_name": str(TASK_COLS[int(task_idx)]),
         "selection_scope": "cv_train_only",
-        "selection_rule": "round(mean(best_iteration_plus_1))",
+        "selection_rule": "median(best_iteration_plus_1)",
         "fold_best_iterations": [int(x) for x in fold_best_iterations],
         "selected_iterations": int(selected_iterations),
     }
@@ -1514,13 +1514,13 @@ def _run_mil_oof_predictions(
     else:
         plus_one = [int(x) + 1 for x in fold_best_epochs]
         selected_from_plus_one = (
-            float(np.mean(np.asarray(plus_one, dtype=np.float64)))
+            int(max(1, int(np.median(np.asarray(plus_one, dtype=np.int64)))))
             if plus_one
-            else float(max(1, int(cfg.max_epochs)))
+            else int(max(1, int(cfg.max_epochs)))
         )
-        selected_epochs = int(max(1, int(round(float(selected_from_plus_one)))))
-        selection_source = "cv_mean_best_epoch"
-        selection_stat = "mean"
+        selected_epochs = int(selected_from_plus_one)
+        selection_source = "cv_median_best_epoch"
+        selection_stat = "median"
     summary = {
         "family": str(family),
         "fold_best_epochs": [int(x) for x in fold_best_epochs],
@@ -1538,7 +1538,7 @@ def _run_mil_oof_predictions(
         selected_epochs=int(selected_epochs),
         selection_stat=str(selection_stat),
         selected_from_fold_best_plus_one=(
-            f"{float(selected_from_plus_one):.6f}"
+            int(selected_from_plus_one)
             if isinstance(selected_from_plus_one, (float, int))
             else str(selected_from_plus_one)
         ),
@@ -1662,12 +1662,12 @@ def _run_catboost_oof_predictions(
     selected_iterations: Dict[int, int] = {}
     for t in range(4):
         plus_one = [int(x) + 1 for x in best_iters_by_task.get(int(t), [])]
-        raw_selected_mean = (
-            float(np.mean(np.asarray(plus_one, dtype=np.float64)))
+        raw_selected_median = (
+            int(max(1, int(np.median(np.asarray(plus_one, dtype=np.int64)))))
             if plus_one
-            else 4000.0
+            else 4000
         )
-        selected_iterations[int(t)] = int(max(1, int(round(raw_selected_mean))))
+        selected_iterations[int(t)] = int(raw_selected_median)
         n_folds_t = int(folds_by_task.get(int(t), 0))
         cap_hits_t = int(cap_hits_by_task.get(int(t), 0))
         cap_hit_rate = float(cap_hits_t / float(max(1, n_folds_t)))
@@ -1678,8 +1678,8 @@ def _run_catboost_oof_predictions(
             fold_best_iterations=",".join([str(int(x)) for x in best_iters_by_task.get(int(t), [])]),
             selection_values=",".join([str(int(x)) for x in plus_one]),
             selected_iterations=int(selected_iterations[int(t)]),
-            selection_stat="mean_plus_one_rounded",
-            selected_from_fold_best_plus_one=f"{float(raw_selected_mean):.6f}",
+            selection_stat="median",
+            selected_from_fold_best_plus_one=int(raw_selected_median),
             cap_hits=int(cap_hits_t),
             n_folds=int(n_folds_t),
             cap_hit_rate=f"{cap_hit_rate:.3f}",
@@ -2481,7 +2481,7 @@ def run_family_suite(args: Any) -> None:
                         family=str(family),
                         model=str(model_key),
                         selected_epochs=int(sel_epochs),
-                        selection_source=str(sel_summary.get("selection_source", "cv_mean_best_epoch")),
+                        selection_source=str(sel_summary.get("selection_source", "cv_median_best_epoch")),
                         path=str(save_path),
                     )
         cv_oof_tables[str(model_key)] = df_oof

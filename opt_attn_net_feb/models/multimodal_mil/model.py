@@ -532,7 +532,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self,
         *,
         y_cls: torch.Tensor,
-        attn: torch.Tensor,
+        attn: Any,
         key_padding_mask: torch.Tensor,
         mol_ids: Sequence[str],
         conf_pad: np.ndarray,
@@ -541,7 +541,11 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         if (not self.rl_enabled) or attn is None:
             return torch.zeros((), dtype=y_cls.dtype, device=y_cls.device)
 
-        total = torch.zeros((), dtype=attn.dtype, device=attn.device)
+        attn_tensor = self._resolve_alignment_attention(attn)
+        if attn_tensor is None:
+            return torch.zeros((), dtype=y_cls.dtype, device=y_cls.device)
+
+        total = torch.zeros((), dtype=attn_tensor.dtype, device=attn_tensor.device)
         denom = 0
         bsz = int(y_cls.shape[0])
 
@@ -558,14 +562,14 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                     y_pos = False
                 else:
                     y_pos = True
-                w = attn[b, t, :L]
+                w = attn_tensor[b, t, :L]
                 w = w / (w.sum() + 1e-8)
 
                 target_pairs = self.rl_target_conf_pairs_by_task[t]
                 idx = [i for i, cid in enumerate(confs) if (mol_id, str(cid)) in target_pairs]
                 if not idx:
                     continue
-                idx_t = torch.tensor(idx, dtype=torch.long, device=attn.device)
+                idx_t = torch.tensor(idx, dtype=torch.long, device=attn_tensor.device)
                 score = w.index_select(0, idx_t).sum()
                 if y_pos:
                     total = total + score
@@ -577,8 +581,60 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                         denom += neg_w
 
         if denom <= 0:
-            return torch.zeros((), dtype=attn.dtype, device=attn.device)
+            return torch.zeros((), dtype=attn_tensor.dtype, device=attn_tensor.device)
         return total / float(denom)
+
+    def _resolve_alignment_attention(self, attn: Any) -> Optional[torch.Tensor]:
+        """
+        Convert attention payload into a conformer-level [B,T,N] tensor for RL alignment.
+
+        If modality-aware attention is available, use 3D modality gates to combine geometry
+        and QM branch attentions. 2D gates are ignored here because RL alignment is defined
+        over conformer-level targets only.
+        """
+        if attn is None:
+            return None
+        if torch.is_tensor(attn):
+            return attn
+        if not isinstance(attn, dict):
+            return None
+
+        attn_geom = attn.get("attn_geom")
+        attn_qm = attn.get("attn_qm")
+        if attn_geom is None and attn_qm is None:
+            return None
+        if attn_geom is None:
+            return attn_qm
+        if attn_qm is None:
+            return attn_geom
+
+        modality_gates = attn.get("modality_gates")
+        modality_order = tuple(str(x) for x in (attn.get("modality_order") or ()))
+        if modality_gates is None or len(modality_order) != int(modality_gates.shape[-1]):
+            return 0.5 * (attn_geom + attn_qm)
+
+        try:
+            geom_idx = modality_order.index("3d_geom")
+        except ValueError:
+            geom_idx = -1
+        try:
+            qm_idx = modality_order.index("3d_qm")
+        except ValueError:
+            qm_idx = -1
+
+        if geom_idx < 0 and qm_idx < 0:
+            return 0.5 * (attn_geom + attn_qm)
+        if geom_idx < 0:
+            return attn_qm
+        if qm_idx < 0:
+            return attn_geom
+
+        g_geom = modality_gates[..., int(geom_idx)]
+        g_qm = modality_gates[..., int(qm_idx)]
+        g_sum = (g_geom + g_qm).clamp_min(1e-8)
+        w_geom = (g_geom / g_sum).unsqueeze(-1)
+        w_qm = (g_qm / g_sum).unsqueeze(-1)
+        return (w_geom * attn_geom) + (w_qm * attn_qm)
 
     def forward(
         self,
@@ -845,7 +901,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 x2d,
                 x3d,
                 kpm,
-                return_attn=True,
+                return_attn_modalities=True,
                 return_bitmask=True,
             )
         else:
