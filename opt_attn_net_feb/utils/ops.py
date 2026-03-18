@@ -50,8 +50,8 @@ def coerce_binary_labels(df: pd.DataFrame) -> np.ndarray:
 def build_task_weights(df_lab: pd.DataFrame) -> np.ndarray:
     W = np.ones((len(df_lab), 4), dtype=np.float32)
     for t in range(4):
-        col = WEIGHT_COLS[t]
-        if col in df_lab.columns:
+        col = WEIGHT_COLS.get(t)
+        if col and col in df_lab.columns:
             scale = float(SAMPLE_WEIGHT_COL_SCALE.get(col, 1.0))
             W[:, t] = (
                 df_lab[col]
@@ -148,37 +148,6 @@ def bitmask_ids(y: np.ndarray) -> np.ndarray:
         raise ValueError(f"Expected y to have shape [N,T], got shape {yb.shape}")
     bits = (1 << np.arange(yb.shape[1], dtype=np.int64)).reshape(1, -1)
     return (yb * bits).sum(axis=1).astype(np.int64)
-
-
-def make_bitmask_sample_weights(
-    y: np.ndarray,
-    *,
-    alpha: float = 0.5,
-    cap: float = 3.0,
-) -> np.ndarray:
-    """
-    Build per-sample weights based on bitmask-frequency rarity.
-
-    Weight for sample i with bitmask m_i:
-      w_i = clip((median_nonzero_count / count(m_i)) ** alpha, 1, cap)
-    """
-    yb = (np.asarray(y) > 0).astype(np.int64)
-    if yb.ndim != 2:
-        raise ValueError(f"Expected y to have shape [N,T], got shape {yb.shape}")
-    if yb.shape[0] == 0:
-        return np.ones((0,), dtype=np.float32)
-
-    m = bitmask_ids(yb)
-    max_mask = int(1 << yb.shape[1])
-    cnt = np.bincount(m, minlength=max_mask).astype(np.float64)
-    nonzero = cnt[cnt > 0]
-    if nonzero.size == 0:
-        return np.ones((yb.shape[0],), dtype=np.float32)
-
-    ref = float(np.median(nonzero))
-    per_sample_cnt = cnt[m]
-    w = (ref / np.maximum(per_sample_cnt, 1.0)) ** max(0.0, float(alpha))
-    return np.clip(w, 1.0, max(1.0, float(cap))).astype(np.float32)
 
 
 def build_bitmask_group_definition(
@@ -326,10 +295,6 @@ class MultitaskBalancedBatchSampler(Sampler[List[int]]):
         sample_weight_cap: float = 10.0,
         batch_pos_fraction: float = 0.35,
         min_pos_per_batch: int = 1,
-        enforce_bitmask_quota: bool = True,
-        quota_t450_per_256: int = 4,
-        quota_fgt480_per_256: int = 1,
-        quota_multi_per_256: int = 8,
         rare_prev_thr: Optional[float] = None,
         seed: int = 0,
         drop_last: bool = False,
@@ -347,10 +312,6 @@ class MultitaskBalancedBatchSampler(Sampler[List[int]]):
         self.sample_weight_cap = float(sample_weight_cap)
         self.batch_pos_fraction = float(np.clip(batch_pos_fraction, 0.0, 1.0))
         self.min_pos_per_batch = int(max(0, min_pos_per_batch))
-        self.enforce_bitmask_quota = bool(enforce_bitmask_quota)
-        self.quota_t450_per_256 = int(max(0, quota_t450_per_256))
-        self.quota_fgt480_per_256 = int(max(0, quota_fgt480_per_256))
-        self.quota_multi_per_256 = int(max(0, quota_multi_per_256))
         self.rare_prev_thr = rare_prev_thr
         self.seed = int(seed)
         self.drop_last = bool(drop_last)
@@ -361,13 +322,11 @@ class MultitaskBalancedBatchSampler(Sampler[List[int]]):
             n // self.batch_size if self.drop_last else int(math.ceil(n / self.batch_size))
         )
         self._all_idx = np.arange(n, dtype=np.int64)
+        self._all_w = np.ones((n,), dtype=np.float64)
 
         any_pos = self.y.sum(axis=1) > 0
         self._pos_idx = np.flatnonzero(any_pos)
         self._neg_idx = np.flatnonzero(~any_pos)
-        self._t450_idx = np.flatnonzero(self.y[:, 1] > 0) if self.y.shape[1] > 1 else np.array([], dtype=np.int64)
-        self._fgt480_idx = np.flatnonzero(self.y[:, 3] > 0) if self.y.shape[1] > 3 else np.array([], dtype=np.int64)
-        self._multi_idx = np.flatnonzero(self.y.sum(axis=1) >= 2)
 
         if self._pos_idx.size > 0:
             severity = _task_rarity_severity(
@@ -379,18 +338,52 @@ class MultitaskBalancedBatchSampler(Sampler[List[int]]):
             all_w = 1.0 + self.rare_mult * sample_rarity
             cap = max(1.0, self.sample_weight_cap)
             self._all_w = np.clip(all_w, 1.0, cap)
-            self._pos_prob = _normalize_probs(self._all_w[self._pos_idx])
-            self._t450_prob = _normalize_probs(self._all_w[self._t450_idx]) if self._t450_idx.size > 0 else np.array([], dtype=np.float64)
-            self._fgt480_prob = _normalize_probs(self._all_w[self._fgt480_idx]) if self._fgt480_idx.size > 0 else np.array([], dtype=np.float64)
-            self._multi_prob = _normalize_probs(self._all_w[self._multi_idx]) if self._multi_idx.size > 0 else np.array([], dtype=np.float64)
-        else:
-            self._pos_prob = None
-            self._t450_prob = np.array([], dtype=np.float64)
-            self._fgt480_prob = np.array([], dtype=np.float64)
-            self._multi_prob = np.array([], dtype=np.float64)
 
     def __len__(self) -> int:
         return self._num_batches
+
+    @staticmethod
+    def _used_to_array(used: Set[int]) -> np.ndarray:
+        if len(used) == 0:
+            return np.empty((0,), dtype=np.int64)
+        return np.fromiter((int(x) for x in used), dtype=np.int64, count=len(used))
+
+    def _available_unique(self, pool_idx: np.ndarray, used: Set[int]) -> np.ndarray:
+        if pool_idx.size == 0:
+            return np.empty((0,), dtype=np.int64)
+        used_arr = self._used_to_array(used)
+        if used_arr.size == 0:
+            return np.asarray(pool_idx, dtype=np.int64)
+        mask = ~np.isin(pool_idx, used_arr, assume_unique=False)
+        return np.asarray(pool_idx[mask], dtype=np.int64)
+
+    def _draw_unique(
+        self,
+        *,
+        rng: np.random.Generator,
+        pool_idx: np.ndarray,
+        take: int,
+        used: Set[int],
+        weighted: bool,
+    ) -> np.ndarray:
+        need = int(max(0, take))
+        if need <= 0 or pool_idx.size == 0:
+            return np.empty((0,), dtype=np.int64)
+        avail = self._available_unique(pool_idx, used)
+        if avail.size == 0:
+            return np.empty((0,), dtype=np.int64)
+        k = int(min(need, int(avail.size)))
+        if k <= 0:
+            return np.empty((0,), dtype=np.int64)
+        if k == int(avail.size):
+            draw = np.array(avail, copy=True)
+            rng.shuffle(draw)
+            return draw.astype(np.int64)
+        probs = None
+        if weighted:
+            probs = _normalize_probs(self._all_w[avail])
+        draw = rng.choice(avail, size=k, replace=False, p=probs)
+        return np.asarray(draw, dtype=np.int64)
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed + self._epoch)
@@ -414,40 +407,42 @@ class MultitaskBalancedBatchSampler(Sampler[List[int]]):
             n_pos = int(np.clip(n_pos, min_pos, max_pos))
             n_neg = self.batch_size - n_pos
 
-            if self.enforce_bitmask_quota and n_pos > 0:
-                remaining = n_pos
-                pos_chunks: List[np.ndarray] = []
-
-                def _scaled_quota(per_256: int) -> int:
-                    if per_256 <= 0:
-                        return 0
-                    q = int(round(float(self.batch_size) * (float(per_256) / 256.0)))
-                    return max(1, q)
-
-                quota_specs = [
-                    # Prioritize rarest endpoint first.
-                    (self._fgt480_idx, self._fgt480_prob, _scaled_quota(self.quota_fgt480_per_256)),
-                    (self._t450_idx, self._t450_prob, _scaled_quota(self.quota_t450_per_256)),
-                    (self._multi_idx, self._multi_prob, _scaled_quota(self.quota_multi_per_256)),
-                ]
-
-                for pool_idx, pool_prob, q in quota_specs:
-                    if remaining <= 0 or q <= 0 or pool_idx.size == 0:
-                        continue
-                    take = min(q, remaining)
-                    if take > 0:
-                        pos_chunks.append(rng.choice(pool_idx, size=take, replace=True, p=pool_prob))
-                        remaining -= take
-
-                if remaining > 0:
-                    pos_chunks.append(
-                        rng.choice(self._pos_idx, size=remaining, replace=True, p=self._pos_prob)
-                    )
-                pos_draw = np.concatenate(pos_chunks, axis=0) if len(pos_chunks) > 0 else np.array([], dtype=np.int64)
+            used = set()
+            pos_draw = self._draw_unique(
+                rng=rng,
+                pool_idx=self._pos_idx,
+                take=n_pos,
+                used=used,
+                weighted=True,
+            )
+            used.update(int(x) for x in pos_draw.tolist())
+            neg_draw = self._draw_unique(
+                rng=rng,
+                pool_idx=self._neg_idx,
+                take=(self.batch_size - int(pos_draw.size)),
+                used=used,
+                weighted=False,
+            )
+            used.update(int(x) for x in neg_draw.tolist())
+            fill_needed = int(self.batch_size - int(pos_draw.size) - int(neg_draw.size))
+            if fill_needed > 0:
+                fill_draw = self._draw_unique(
+                    rng=rng,
+                    pool_idx=self._all_idx,
+                    take=fill_needed,
+                    used=used,
+                    weighted=False,
+                )
+                used.update(int(x) for x in fill_draw.tolist())
             else:
-                pos_draw = rng.choice(self._pos_idx, size=n_pos, replace=True, p=self._pos_prob)
-            neg_draw = rng.choice(self._neg_idx, size=n_neg, replace=True)
-            batch = np.concatenate([pos_draw, neg_draw], axis=0)
+                fill_draw = np.empty((0,), dtype=np.int64)
+            still_needed = int(self.batch_size - int(pos_draw.size) - int(neg_draw.size) - int(fill_draw.size))
+            if still_needed > 0:
+                # Extremely small datasets may not have enough unique rows to fill a full batch.
+                refill = np.asarray(rng.choice(self._all_idx, size=still_needed, replace=True), dtype=np.int64)
+            else:
+                refill = np.empty((0,), dtype=np.int64)
+            batch = np.concatenate([pos_draw, neg_draw, fill_draw, refill], axis=0)
             rng.shuffle(batch)
             yield batch.tolist()
 
@@ -461,10 +456,6 @@ def make_balanced_batch_sampler(
     sample_weight_cap: float = 10.0,
     batch_pos_fraction: float = 0.35,
     min_pos_per_batch: int = 1,
-    enforce_bitmask_quota: bool = True,
-    quota_t450_per_256: int = 4,
-    quota_fgt480_per_256: int = 1,
-    quota_multi_per_256: int = 8,
     rare_prev_thr: Optional[float] = None,
     seed: int = 0,
 ) -> MultitaskBalancedBatchSampler:
@@ -476,14 +467,168 @@ def make_balanced_batch_sampler(
         sample_weight_cap=float(sample_weight_cap),
         batch_pos_fraction=float(batch_pos_fraction),
         min_pos_per_batch=int(min_pos_per_batch),
-        enforce_bitmask_quota=bool(enforce_bitmask_quota),
-        quota_t450_per_256=int(quota_t450_per_256),
-        quota_fgt480_per_256=int(quota_fgt480_per_256),
-        quota_multi_per_256=int(quota_multi_per_256),
         rare_prev_thr=rare_prev_thr,
         seed=int(seed),
         drop_last=False,
     )
+
+
+def build_sampler_diagnostics_df(
+    *,
+    y: np.ndarray,
+    batch_size: int,
+    use_balanced_batch_sampler: bool,
+    rare_mult: float,
+    rare_target_prev: float = 0.10,
+    sample_weight_cap: float = 10.0,
+    batch_pos_fraction: float = 0.35,
+    min_pos_per_batch: int = 1,
+    rare_prev_thr: Optional[float] = None,
+    seed: int = 0,
+    max_batches: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Build a compact long-form sampler diagnostics table.
+
+    The report summarizes:
+    - mean positive rows per batch
+    - duplicate rate within sampled batches
+    - unique-row coverage
+    - per-task sampled prevalence and exposure lift
+    """
+    yb = (np.asarray(y) > 0).astype(np.int64)
+    if yb.ndim != 2:
+        raise ValueError(f"Expected y to have shape [N,T], got shape {yb.shape}")
+
+    batch_size_int = int(max(1, batch_size))
+    sampler_mode = "balanced_batch" if bool(use_balanced_batch_sampler) else "weighted_sampler"
+
+    if bool(use_balanced_batch_sampler):
+        sampler = make_balanced_batch_sampler(
+            yb,
+            batch_size=batch_size_int,
+            rare_mult=float(rare_mult),
+            rare_target_prev=float(rare_target_prev),
+            sample_weight_cap=float(sample_weight_cap),
+            batch_pos_fraction=float(batch_pos_fraction),
+            min_pos_per_batch=int(min_pos_per_batch),
+            rare_prev_thr=rare_prev_thr,
+            seed=int(seed),
+        )
+        total_batches = int(len(sampler))
+        n_batches = total_batches if max_batches is None else int(min(total_batches, max(0, int(max_batches))))
+        batches = [np.asarray(batch, dtype=np.int64) for _, batch in zip(range(n_batches), iter(sampler))]
+    else:
+        sampler = make_weighted_sampler(
+            yb,
+            rare_mult=float(rare_mult),
+            rare_target_prev=float(rare_target_prev),
+            sample_weight_cap=float(sample_weight_cap),
+            rare_prev_thr=rare_prev_thr,
+        )
+        draws = np.fromiter(iter(sampler), dtype=np.int64, count=int(len(sampler)))
+        total_batches = int(math.ceil(float(draws.size) / float(batch_size_int))) if draws.size > 0 else 0
+        n_batches = total_batches if max_batches is None else int(min(total_batches, max(0, int(max_batches))))
+        batches = [
+            np.asarray(draws[i * batch_size_int:(i + 1) * batch_size_int], dtype=np.int64)
+            for i in range(int(n_batches))
+        ]
+
+    batch_sizes = np.asarray([int(len(b)) for b in batches], dtype=np.int64)
+    duplicate_counts = np.asarray(
+        [int(max(0, len(b) - len(np.unique(b)))) for b in batches],
+        dtype=np.int64,
+    )
+    unique_counts = batch_sizes - duplicate_counts
+
+    any_pos = yb.sum(axis=1) > 0
+    batch_pos_counts = np.asarray(
+        [int(np.sum(any_pos[b])) for b in batches],
+        dtype=np.int64,
+    ) if len(batches) > 0 else np.zeros((0,), dtype=np.int64)
+    batch_neg_counts = batch_sizes - batch_pos_counts
+
+    sampled_idx = np.concatenate(batches, axis=0) if len(batches) > 0 else np.empty((0,), dtype=np.int64)
+    sampled_unique_idx = np.unique(sampled_idx) if sampled_idx.size > 0 else np.empty((0,), dtype=np.int64)
+
+    rows: List[Dict[str, object]] = []
+    base_meta: Dict[str, object] = {
+        "sampler_mode": str(sampler_mode),
+        "batch_size_target": int(batch_size_int),
+        "n_dataset_rows": int(yb.shape[0]),
+        "n_batches_analyzed": int(len(batches)),
+        "rare_mult": float(rare_mult),
+        "rare_target_prev": float(rare_target_prev),
+        "sample_weight_cap": float(sample_weight_cap),
+        "batch_pos_fraction": float(batch_pos_fraction),
+        "min_pos_per_batch": int(min_pos_per_batch),
+        "seed": int(seed),
+    }
+
+    def _append_row(section: str, metric: str, value: float, *, task_idx: Optional[int] = None) -> None:
+        rows.append(
+            {
+                **base_meta,
+                "section": str(section),
+                "metric": str(metric),
+                "task_idx": ("" if task_idx is None else int(task_idx)),
+                "task": ("" if task_idx is None else str(TASK_COLS[int(task_idx)])),
+                "value": float(value) if np.isfinite(value) else float("nan"),
+            }
+        )
+
+    total_sampled_rows = int(sampled_idx.size)
+    total_duplicates = int(duplicate_counts.sum()) if duplicate_counts.size > 0 else 0
+    duplicate_rate = (
+        float(total_duplicates / float(total_sampled_rows))
+        if total_sampled_rows > 0 else 0.0
+    )
+    _append_row("summary", "dataset_any_positive_prevalence", float(any_pos.mean()) if any_pos.size > 0 else float("nan"))
+    _append_row("summary", "sampled_any_positive_prevalence", float(any_pos[sampled_idx].mean()) if sampled_idx.size > 0 else float("nan"))
+    _append_row("summary", "mean_pos_per_batch", float(batch_pos_counts.mean()) if batch_pos_counts.size > 0 else float("nan"))
+    _append_row("summary", "mean_neg_per_batch", float(batch_neg_counts.mean()) if batch_neg_counts.size > 0 else float("nan"))
+    _append_row("summary", "mean_unique_per_batch", float(unique_counts.mean()) if unique_counts.size > 0 else float("nan"))
+    _append_row("summary", "duplicate_rate", float(duplicate_rate))
+    _append_row(
+        "summary",
+        "unique_row_coverage_rate",
+        float(sampled_unique_idx.size / float(max(1, yb.shape[0]))),
+    )
+    _append_row("summary", "sampled_rows_total", float(total_sampled_rows))
+
+    for t in range(int(yb.shape[1])):
+        dataset_prev = float(yb[:, t].mean()) if yb.shape[0] > 0 else float("nan")
+        sampled_prev = float(yb[sampled_idx, t].mean()) if sampled_idx.size > 0 else float("nan")
+        exposure_lift = (
+            float(sampled_prev / dataset_prev)
+            if np.isfinite(dataset_prev) and dataset_prev > 0.0 and np.isfinite(sampled_prev)
+            else float("nan")
+        )
+        task_pos_idx = np.flatnonzero(yb[:, t] > 0)
+        sampled_task_pos = sampled_idx[yb[sampled_idx, t] > 0] if sampled_idx.size > 0 else np.empty((0,), dtype=np.int64)
+        unique_task_pos = np.unique(sampled_task_pos) if sampled_task_pos.size > 0 else np.empty((0,), dtype=np.int64)
+        unique_positive_coverage = (
+            float(unique_task_pos.size / float(task_pos_idx.size))
+            if task_pos_idx.size > 0 else float("nan")
+        )
+        per_batch_pos = np.asarray([int(yb[b, t].sum()) for b in batches], dtype=np.int64) if len(batches) > 0 else np.zeros((0,), dtype=np.int64)
+        batch_hit_rate = (
+            float(np.mean(per_batch_pos > 0))
+            if per_batch_pos.size > 0 else float("nan")
+        )
+        draws_per_positive = (
+            float(sampled_task_pos.size / float(task_pos_idx.size))
+            if task_pos_idx.size > 0 else float("nan")
+        )
+        _append_row("task_exposure", "dataset_prevalence", dataset_prev, task_idx=t)
+        _append_row("task_exposure", "sampled_prevalence", sampled_prev, task_idx=t)
+        _append_row("task_exposure", "exposure_lift", exposure_lift, task_idx=t)
+        _append_row("task_exposure", "mean_positive_rows_per_batch", float(per_batch_pos.mean()) if per_batch_pos.size > 0 else float("nan"), task_idx=t)
+        _append_row("task_exposure", "batch_hit_rate", batch_hit_rate, task_idx=t)
+        _append_row("task_exposure", "unique_positive_coverage_rate", unique_positive_coverage, task_idx=t)
+        _append_row("task_exposure", "positive_draws_per_positive_sample", draws_per_positive, task_idx=t)
+
+    return pd.DataFrame(rows)
 
 
 def fit_standardizer(y: np.ndarray, m: np.ndarray, tr_idx: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:

@@ -65,6 +65,8 @@ class MILModelConfig:
     predictor: MILPredictorConfig
     optimization: MILOptimizationConfig
     loss: MILLossConfig
+    objective_mode: str = "macro_plus_min"
+    objective_min_w: float = 0.40
 
 
 __all__ = [

@@ -150,8 +150,8 @@ Label table (`utils/constants.py`):
 - Weight columns mapping (`WEIGHT_COLS`):
   - task0 -> `sample_weight_340`
   - task1 -> `sample_weight_450`
-  - task2 -> `w_ad`
-  - task3 -> `w_ad`
+  - task2 -> unweighted
+  - task3 -> unweighted
 
 Default ID/split/fold columns:
 - `--id_col ID`
@@ -512,22 +512,11 @@ Sample weight:
 - Enforces positive quota per batch:
   - target positives: `round(batch_size * batch_pos_fraction)`
   - clamp with `min_pos_per_batch`, positivity/negativity availability
-- Positive draws are rarity-weighted.
-- Optional bitmask-quota enrichment (`enforce_bitmask_quota=True`):
-  - per-256 quotas scaled to batch size:
-    - `quota_t450_per_256` (task index 1)
-    - `quota_fgt480_per_256` (task index 3)
-    - `quota_multi_per_256` (samples positive on >=2 tasks)
-  - priority order: Fgt480 -> T450 -> multi -> generic positive pool
-- Negatives drawn uniformly from all-negative samples.
-
-### 8.5 Bitmask frequency weights
-
-`make_bitmask_sample_weights`:
-- bitmask ID from multitask binary vector
-- `weight_i = clip((median_nonzero_count / count(mask_i))^alpha, 1, cap)`
-
-Used to rescale `w_cls` when `use_bitmask_loss_weight=True`.
+- Positive draws are rarity-weighted and unique within a batch whenever the dataset
+  has enough distinct rows to support that.
+- Negatives are drawn uniformly from all-negative samples.
+- If a tiny dataset cannot supply enough unique rows, replacement is used only as
+  a final fallback to complete the batch.
 
 ---
 
@@ -1468,13 +1457,6 @@ This section lists defaults exactly as defined in typed configs and CLI parser, 
 - `use_balanced_batch_sampler = True`
 - `batch_pos_fraction = 0.35`
 - `min_pos_per_batch = 1`
-- `enforce_bitmask_quota = True`
-- `quota_t450_per_256 = 4`
-- `quota_fgt480_per_256 = 1`
-- `quota_multi_per_256 = 8`
-- `use_bitmask_loss_weight = True`
-- `bitmask_weight_alpha = 0.5`
-- `bitmask_weight_cap = 3.0`
 
 ### 23.6 `LossWeightingConfig` defaults
 

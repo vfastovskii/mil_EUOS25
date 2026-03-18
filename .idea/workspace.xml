@@ -5,14 +5,38 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="33826e23-5bc2-4bf8-9077-a15c3daefac9" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/ARCHITECTURE.md" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/ARCHITECTURE.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/blend.slurm" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/blend.slurm" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/entrypoints/family_suite.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/entrypoints/family_suite.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/entrypoints/hpo_pipeline.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/entrypoints/hpo_pipeline.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/example_code/opt_net_fast.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/example_code/opt_net_fast.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/models/multimodal_mil/configs.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/models/multimodal_mil/configs.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/models/multimodal_mil/model.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/models/multimodal_mil/model.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/tests/test_multimodal_fusion_model.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/tests/test_multimodal_fusion_model.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/run_family_suite_no_explainability_debye.slurm" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/run_family_suite_no_explainability_debye.slurm" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/training/builders.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/training/builders.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/training/configs.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/training/configs.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/training/execution.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/training/execution.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/training/trainer.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/training/trainer.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/utils/constants.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/utils/constants.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/utils/ops.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/utils/ops.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
     <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="FlaskConsoleOptions" custom-start-script="import sys; print('Python %s on %s' % (sys.version, sys.platform)); sys.path.extend([WORKING_DIR_AND_PYTHON_PATHS])&#10;from flask.cli import ScriptInfo, NoAppException&#10;for module in [&quot;main.py&quot;, &quot;wsgi.py&quot;, &quot;app.py&quot;]:&#10;    try: locals().update(ScriptInfo(app_import_path=module, create_app=None).load_app().make_shell_context()); print(&quot;\nFlask App: %s&quot; % app.import_name); break&#10;    except NoAppException: pass">
+    <envs>
+      <env key="FLASK_APP" value="app" />
+    </envs>
+    <option name="myCustomStartScript" value="import sys; print('Python %s on %s' % (sys.version, sys.platform)); sys.path.extend([WORKING_DIR_AND_PYTHON_PATHS])&#10;from flask.cli import ScriptInfo, NoAppException&#10;for module in [&quot;main.py&quot;, &quot;wsgi.py&quot;, &quot;app.py&quot;]:&#10;    try: locals().update(ScriptInfo(app_import_path=module, create_app=None).load_app().make_shell_context()); print(&quot;\nFlask App: %s&quot; % app.import_name); break&#10;    except NoAppException: pass" />
+    <option name="myEnvs">
+      <map>
+        <entry key="FLASK_APP" value="app" />
+      </map>
+    </option>
   </component>
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
@@ -67,7 +91,7 @@
       <updated>1770573376037</updated>
       <workItem from="1770573377091" duration="1443000" />
       <workItem from="1773516930843" duration="7046000" />
-      <workItem from="1773573422894" duration="5792000" />
+      <workItem from="1773573422894" duration="14428000" />
     </task>
     <servers />
   </component>

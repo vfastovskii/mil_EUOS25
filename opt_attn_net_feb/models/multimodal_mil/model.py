@@ -129,6 +129,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             head_dropout=float(h.dropout),
             head_stochastic_depth=float(h.stochastic_depth),
             head_fc2_gain_non_last=float(h.fc2_gain_non_last),
+            objective_mode=str(config.objective_mode),
+            objective_min_w=float(config.objective_min_w),
         )
 
     def __init__(
@@ -175,6 +177,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         head_dropout: float = 0.1,
         head_stochastic_depth: float = 0.1,
         head_fc2_gain_non_last: float = 1e-2,
+        objective_mode: str = "macro_plus_min",
+        objective_min_w: float = 0.40,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["pos_weight", "gamma", "lam"])
@@ -185,6 +189,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self.inst_qm_dim = int(inst_qm_dim)
         self.inst_hidden = int(inst_hidden)
         self.proj_dim = int(proj_dim)
+        self.objective_mode = str(objective_mode)
+        self.objective_min_w = float(objective_min_w)
         use_2d = self.mol_dim > 0
         use_geom = self.inst_geom_dim > 0
         use_qm = self.inst_qm_dim > 0
@@ -998,11 +1004,16 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         aps = ap_per_task(y_all, p_all, w_cls=w_all, weighted_tasks=(0, 1))
         macro_ap = float(np.mean(aps))
         min_ap = float(np.min(aps))
+        if str(self.objective_mode) in {"macro_plus_min"}:
+            objective_ap = float((1.0 - float(self.objective_min_w)) * macro_ap + float(self.objective_min_w) * min_ap)
+        else:
+            objective_ap = float(macro_ap)
 
         for task_idx in range(NUM_TASKS):
             self.log(f"val_ap_{task_idx}", float(aps[task_idx]), prog_bar=False, on_step=False, on_epoch=True)
         self.log("val_macro_ap", float(macro_ap), prog_bar=True, on_step=False, on_epoch=True)
         self.log("val_min_ap", float(min_ap), prog_bar=False, on_step=False, on_epoch=True)
+        self.log("val_objective_ap", float(objective_ap), prog_bar=False, on_step=False, on_epoch=True)
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)

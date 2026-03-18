@@ -35,6 +35,7 @@ from ..training.execution import (
     _resolve_device,
 )
 from ..training.loss_config import compute_gamma, compute_lam, compute_posw_clips
+from ..training.model_artifacts import save_mil_model_artifact
 from ..training.search_space import search_space
 from ..training.trainer import LightningTrainerConfig, LightningTrainerFactory, ModelEvaluator
 from ..utils.constants import TASK_COLS
@@ -47,12 +48,12 @@ from ..utils.ops import (
     build_aux_targets_and_masks,
     build_aux_weights,
     build_bitmask_group_definition,
+    build_sampler_diagnostics_df,
     build_task_weights,
     coerce_binary_labels,
     fit_standardizer,
     fold_indices,
     make_balanced_batch_sampler,
-    make_bitmask_sample_weights,
     make_weighted_sampler,
     maybe_set_torch_fast_flags,
     pos_weight_per_task,
@@ -133,6 +134,9 @@ class FamilySuiteConfig:
     pruner_warmup_steps: int
     model_families: tuple[str, ...]
     calibration_method: str
+    skip_family_explainability: bool
+    skip_family_calibration: bool
+    skip_family_blending: bool
     best_params_dir: str | None
     family_best_params_json: str | None
     catboost_task_params_jsons: tuple[str, ...]
@@ -185,6 +189,18 @@ def _clip_prob(p: np.ndarray) -> np.ndarray:
     return np.clip(np.nan_to_num(np.asarray(p, dtype=np.float64), nan=0.5, posinf=1.0, neginf=0.0), 1e-6, 1 - 1e-6)
 
 
+def _metric_sample_weight_for_task(w: np.ndarray | None, task_idx: int) -> np.ndarray | None:
+    """Apply the same per-task weighting policy used by reported metrics."""
+    if w is None or int(task_idx) not in (0, 1):
+        return None
+    sw = np.asarray(w, dtype=np.float64).reshape(-1)
+    sw = np.nan_to_num(sw, nan=0.0, posinf=0.0, neginf=0.0)
+    sw = np.clip(sw, 0.0, np.inf)
+    if float(np.sum(sw)) <= 0.0:
+        return None
+    return sw
+
+
 def _df_by_ids(df: pd.DataFrame, *, id_col: str, ids: Sequence[str]) -> pd.DataFrame:
     # Keep first row for duplicate IDs to preserve one-label-per-ID contract.
     d = df.drop_duplicates(subset=[id_col], keep="first").copy()
@@ -208,7 +224,7 @@ def _metric_table(
     for t, task in enumerate(TASK_COLS):
         yt = y_true[:, t].astype(int)
         pt = _clip_prob(p_pred[:, t])
-        sw = np.asarray(w_cls[:, t], dtype=float) if t in (0, 1) else None
+        sw = _metric_sample_weight_for_task(w_cls[:, t] if w_cls is not None else None, t)
         try:
             nll = float(log_loss(yt, pt, sample_weight=sw, labels=[0, 1]))
         except Exception:
@@ -286,7 +302,7 @@ def _save_family_final_epochs(
     payload = {
         "family": str(family),
         "selection_scope": "cv_train_only",
-        "selection_rule": "median(best_epoch_plus_1)",
+        "selection_rule": "round(mean(best_epoch_plus_1))",
         "fold_best_epochs": [int(x) for x in fold_best_epochs],
         "selected_epochs": int(selected_epochs),
     }
@@ -309,7 +325,7 @@ def _save_catboost_final_iterations(
         "task_idx": int(task_idx),
         "task_name": str(TASK_COLS[int(task_idx)]),
         "selection_scope": "cv_train_only",
-        "selection_rule": "median(best_iteration_plus_1)",
+        "selection_rule": "round(mean(best_iteration_plus_1))",
         "fold_best_iterations": [int(x) for x in fold_best_iterations],
         "selected_iterations": int(selected_iterations),
     }
@@ -634,7 +650,7 @@ class _MILMacroCrossValidator:
         fold_detail: Dict[str, Any] = {}
         for step, (tr, va, fold_id) in enumerate(self.data.folds_info):
             try:
-                _unused_score, detail = fold_runner.run_fold(
+                fold_score, detail = fold_runner.run_fold(
                     train_idx=np.asarray(tr, dtype=np.int64),
                     val_idx=np.asarray(va, dtype=np.int64),
                     fold_id=int(fold_id),
@@ -672,9 +688,13 @@ class _MILMacroCrossValidator:
                         f"OOM in family={self.family} trial={int(trial.number)} fold={int(fold_id)}"
                     ) from exc
                 raise
-            fold_macro = float(detail.get("macro_pr_auc_best_epoch", detail.get("macro_ap_best_epoch", 0.0)))
-            fold_scores.append(fold_macro)
-            detail["objective_macro_ap"] = float(fold_macro)
+            objective_mode = str(cfg.objective.mode)
+            if objective_mode in {"macro_pr_auc", "macro_ap"}:
+                trial_score = float(detail.get("macro_pr_auc_best_epoch", detail.get("macro_ap_best_epoch", 0.0)))
+            else:
+                trial_score = float(fold_score)
+            fold_scores.append(float(trial_score))
+            detail["objective_value"] = float(trial_score)
             fold_detail[str(fold_id)] = detail
             trial.report(float(np.mean(fold_scores)), step=int(step))
             if trial.should_prune():
@@ -1065,6 +1085,7 @@ def _run_mil_final_train_and_predict(
     best_params: Mapping[str, Any],
     outdir: Path,
     write_outputs: bool = True,
+    write_explainability_outputs: bool = True,
     output_prefix: str = "leaderboard",
     fixed_train_epochs: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
@@ -1100,13 +1121,6 @@ def _run_mil_final_train_and_predict(
     y_fluo_lb_sc = apply_standardizer(family_data.y_fluo_lb, mu_f, sd_f)
 
     w_cls_tr = np.asarray(family_data.w_cls_train, dtype=np.float32).copy()
-    if bool(hpo_cfg.sampler.use_bitmask_loss_weight):
-        bitmask_w = make_bitmask_sample_weights(
-            family_data.y_cls_train,
-            alpha=float(hpo_cfg.sampler.bitmask_weight_alpha),
-            cap=float(hpo_cfg.sampler.bitmask_weight_cap),
-        )
-        w_cls_tr = (w_cls_tr * bitmask_w.reshape(-1, 1)).astype(np.float32)
 
     ds_tr = MILTrainDataset(
         family_data.ids_train,
@@ -1176,10 +1190,6 @@ def _run_mil_final_train_and_predict(
             sample_weight_cap=float(hpo_cfg.sampler.sample_weight_cap),
             batch_pos_fraction=float(hpo_cfg.sampler.batch_pos_fraction),
             min_pos_per_batch=int(hpo_cfg.sampler.min_pos_per_batch),
-            enforce_bitmask_quota=bool(hpo_cfg.sampler.enforce_bitmask_quota),
-            quota_t450_per_256=int(hpo_cfg.sampler.quota_t450_per_256),
-            quota_fgt480_per_256=int(hpo_cfg.sampler.quota_fgt480_per_256),
-            quota_multi_per_256=int(hpo_cfg.sampler.quota_multi_per_256),
             rare_prev_thr=hpo_cfg.sampler.rare_prev_thr,
             seed=int(cfg.seed) + 1000,
         )
@@ -1235,6 +1245,31 @@ def _run_mil_final_train_and_predict(
 
     family_dir = outdir / family_data.family
     family_dir.mkdir(parents=True, exist_ok=True)
+    sampler_diag_path = family_dir / f"{output_prefix}_sampler_diagnostics.csv"
+    sampler_diag_df = build_sampler_diagnostics_df(
+        y=family_data.y_cls_train,
+        batch_size=int(hpo_cfg.runtime.batch_size),
+        use_balanced_batch_sampler=bool(hpo_cfg.sampler.use_balanced_batch_sampler),
+        rare_mult=float(hpo_cfg.sampler.rare_oversample_mult),
+        rare_target_prev=float(hpo_cfg.sampler.rare_target_prev),
+        sample_weight_cap=float(hpo_cfg.sampler.sample_weight_cap),
+        batch_pos_fraction=float(hpo_cfg.sampler.batch_pos_fraction),
+        min_pos_per_batch=int(hpo_cfg.sampler.min_pos_per_batch),
+        rare_prev_thr=hpo_cfg.sampler.rare_prev_thr,
+        seed=int(cfg.seed) + 1000,
+    )
+    sampler_diag_df.to_csv(sampler_diag_path, index=False)
+    _diag_pick = sampler_diag_df.set_index(["section", "metric"])["value"].to_dict()
+    log_event(
+        "INFO",
+        "family.final.mil.sampler_diagnostics",
+        family=str(family_data.family),
+        output_prefix=str(output_prefix),
+        path=str(sampler_diag_path),
+        sampler_mode=str("balanced_batch" if bool(hpo_cfg.sampler.use_balanced_batch_sampler) else "weighted_sampler"),
+        mean_pos_per_batch=f"{float(_diag_pick.get(('summary', 'mean_pos_per_batch'), float('nan'))):.3f}",
+        duplicate_rate=f"{float(_diag_pick.get(('summary', 'duplicate_rate'), float('nan'))):.6f}",
+    )
     use_fixed_epochs = fixed_train_epochs is not None
     target_epochs = int(fixed_train_epochs) if use_fixed_epochs else int(cfg.max_epochs)
     target_patience = int(max(int(cfg.patience), target_epochs + 5)) if use_fixed_epochs else int(cfg.patience)
@@ -1275,6 +1310,37 @@ def _run_mil_final_train_and_predict(
     }
     if bool(write_outputs):
         (family_dir / f"{output_prefix}_eval.json").write_text(json.dumps(eval_json, indent=2))
+        model_artifact_path = save_mil_model_artifact(
+            path=family_dir / f"{output_prefix}_model.pt",
+            model=model,
+            best_params=best_params,
+            pos_weight=posw,
+            gamma=gamma_t,
+            lam=lam,
+            train_info={
+                "use_fixed_epochs": bool(use_fixed_epochs),
+                "target_epochs": int(target_epochs),
+                "target_patience": int(target_patience),
+                "epochs_trained": int(epochs_trained),
+                "best_epoch": int(best_epoch),
+            },
+            metadata={
+                "family": str(family_data.family),
+                "output_prefix": str(output_prefix),
+                "mol_dim": int(family_data.X2d_train.shape[1]),
+                "inst_dim": int(family_data.Xinst_sorted.shape[1]),
+                "inst_geom_dim": int(family_data.inst_geom_dim),
+                "inst_qm_dim": int(family_data.inst_qm_dim),
+                "task_cols": [str(x) for x in TASK_COLS],
+            },
+        )
+        log_event(
+            "INFO",
+            "family.final.mil.model_saved",
+            family=str(family_data.family),
+            output_prefix=str(output_prefix),
+            path=str(model_artifact_path),
+        )
 
     model.eval()
     model.to(eval_device)
@@ -1302,7 +1368,7 @@ def _run_mil_final_train_and_predict(
     if bool(write_outputs):
         metrics.to_csv(outdir / f"{output_prefix}_metrics_{family_data.family}.csv", index=False)
         df_pred.to_csv(outdir / f"{output_prefix}_preds_{family_data.family}.csv", index=False)
-        if int(family_data.inst_geom_dim) > 0 or int(family_data.inst_qm_dim) > 0:
+        if bool(write_explainability_outputs) and (int(family_data.inst_geom_dim) > 0 or int(family_data.inst_qm_dim) > 0):
             export_ds = MILExportDataset(
                 ids=[str(x) for x in family_data.ids_lb],
                 X2d=np.asarray(family_data.X2d_lb, dtype=np.float32),
@@ -1351,6 +1417,17 @@ def _run_mil_final_train_and_predict(
         "epochs_trained": int(epochs_trained),
         "best_epoch": int(best_epoch),
     }
+    if bool(write_outputs):
+        simple_model_path = family_dir / f"{output_prefix}_model.pth"
+        model = model.to("cpu")
+        torch.save(model, simple_model_path)
+        log_event(
+            "INFO",
+            "family.final.mil.model_pickle_saved",
+            family=str(family_data.family),
+            output_prefix=str(output_prefix),
+            path=str(simple_model_path),
+        )
     del trainer, model, dl_tr, dl_val_internal, dl_eval, ds_tr, ds_val_internal, ds_eval
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -1514,13 +1591,13 @@ def _run_mil_oof_predictions(
     else:
         plus_one = [int(x) + 1 for x in fold_best_epochs]
         selected_from_plus_one = (
-            int(max(1, int(np.median(np.asarray(plus_one, dtype=np.int64)))))
+            float(np.mean(np.asarray(plus_one, dtype=np.float64)))
             if plus_one
-            else int(max(1, int(cfg.max_epochs)))
+            else float(max(1, int(cfg.max_epochs)))
         )
-        selected_epochs = int(selected_from_plus_one)
-        selection_source = "cv_median_best_epoch"
-        selection_stat = "median"
+        selected_epochs = int(max(1, int(round(float(selected_from_plus_one)))))
+        selection_source = "cv_mean_best_epoch"
+        selection_stat = "mean"
     summary = {
         "family": str(family),
         "fold_best_epochs": [int(x) for x in fold_best_epochs],
@@ -1538,7 +1615,7 @@ def _run_mil_oof_predictions(
         selected_epochs=int(selected_epochs),
         selection_stat=str(selection_stat),
         selected_from_fold_best_plus_one=(
-            int(selected_from_plus_one)
+            f"{float(selected_from_plus_one):.6f}"
             if isinstance(selected_from_plus_one, (float, int))
             else str(selected_from_plus_one)
         ),
@@ -1662,12 +1739,12 @@ def _run_catboost_oof_predictions(
     selected_iterations: Dict[int, int] = {}
     for t in range(4):
         plus_one = [int(x) + 1 for x in best_iters_by_task.get(int(t), [])]
-        raw_selected_median = (
-            int(max(1, int(np.median(np.asarray(plus_one, dtype=np.int64)))))
+        raw_selected_mean = (
+            float(np.mean(np.asarray(plus_one, dtype=np.float64)))
             if plus_one
-            else 4000
+            else 4000.0
         )
-        selected_iterations[int(t)] = int(raw_selected_median)
+        selected_iterations[int(t)] = int(max(1, int(round(float(raw_selected_mean)))))
         n_folds_t = int(folds_by_task.get(int(t), 0))
         cap_hits_t = int(cap_hits_by_task.get(int(t), 0))
         cap_hit_rate = float(cap_hits_t / float(max(1, n_folds_t)))
@@ -1678,8 +1755,8 @@ def _run_catboost_oof_predictions(
             fold_best_iterations=",".join([str(int(x)) for x in best_iters_by_task.get(int(t), [])]),
             selection_values=",".join([str(int(x)) for x in plus_one]),
             selected_iterations=int(selected_iterations[int(t)]),
-            selection_stat="median",
-            selected_from_fold_best_plus_one=int(raw_selected_median),
+            selection_stat="mean",
+            selected_from_fold_best_plus_one=f"{float(raw_selected_mean):.6f}",
             cap_hits=int(cap_hits_t),
             n_folds=int(n_folds_t),
             cap_hit_rate=f"{cap_hit_rate:.3f}",
@@ -1938,6 +2015,9 @@ def run_family_suite(args: Any) -> None:
         pruner_warmup_steps=int(args.pruner_warmup_steps),
         model_families=tuple(str(x) for x in (args.model_families or FAMILY_CHOICES)),
         calibration_method=str(args.calibration_method),
+        skip_family_explainability=bool(getattr(args, "skip_family_explainability", False)),
+        skip_family_calibration=bool(getattr(args, "skip_family_calibration", False)),
+        skip_family_blending=bool(getattr(args, "skip_family_blending", False)),
         best_params_dir=(None if args.best_params_dir is None else str(args.best_params_dir)),
         family_best_params_json=(
             None if getattr(args, "family_best_params_json", None) in (None, "") else str(args.family_best_params_json)
@@ -2481,7 +2561,7 @@ def run_family_suite(args: Any) -> None:
                         family=str(family),
                         model=str(model_key),
                         selected_epochs=int(sel_epochs),
-                        selection_source=str(sel_summary.get("selection_source", "cv_median_best_epoch")),
+                        selection_source=str(sel_summary.get("selection_source", "cv_mean_best_epoch")),
                         path=str(save_path),
                     )
         cv_oof_tables[str(model_key)] = df_oof
@@ -2544,6 +2624,7 @@ def run_family_suite(args: Any) -> None:
                     f"OOF fold mismatch across families: ref={ref_family} vs {fam}, mismatches={int(mismatches)}"
                 )
 
+    calibration_fit_method = "identity" if cfg.skip_family_calibration else str(cfg.calibration_method)
     calibrated_oof: Dict[str, pd.DataFrame] = {}
     calib_params_by_family: Dict[str, Dict[str, Any]] = {}
     for family, df_oof in cv_oof_tables.items():
@@ -2551,7 +2632,8 @@ def run_family_suite(args: Any) -> None:
             "family.calibration.fit",
             family=str(family),
             scope="train_oof",
-            method=str(cfg.calibration_method),
+            method=str(calibration_fit_method),
+            skipped=bool(cfg.skip_family_calibration),
             n_rows=int(len(df_oof)),
         ):
             arr = df_oof.copy()
@@ -2560,26 +2642,27 @@ def run_family_suite(args: Any) -> None:
             p_cal = np.zeros_like(p, dtype=np.float32)
             params_by_task: Dict[str, Any] = {}
             for t in range(4):
-                sw_t = (
-                    arr[f"w_t{t}"].to_numpy(dtype=np.float64)
-                    if f"w_t{t}" in arr.columns
+                raw_sw_t = arr[f"w_t{t}"].to_numpy(dtype=np.float64) if f"w_t{t}" in arr.columns else None
+                sw_t = _metric_sample_weight_for_task(raw_sw_t, t)
+                pos_rate = float(np.mean(y[:, t])) if int(y.shape[0]) > 0 else 0.0
+                sw_eff = (
+                    np.asarray(sw_t, dtype=np.float64)
+                    if sw_t is not None
                     else np.ones((int(y.shape[0]),), dtype=np.float64)
                 )
-                pos_rate = float(np.mean(y[:, t])) if int(y.shape[0]) > 0 else 0.0
-                sw_sum = float(np.sum(np.clip(np.nan_to_num(sw_t, nan=0.0), 0.0, np.inf)))
-                sw_pos = float(
-                    np.sum(
-                        np.clip(np.nan_to_num(sw_t, nan=0.0), 0.0, np.inf)
-                        * np.asarray(y[:, t], dtype=np.float64)
-                    )
-                )
+                sw_sum = float(np.sum(sw_eff))
+                sw_pos = float(np.sum(sw_eff * np.asarray(y[:, t], dtype=np.float64)))
                 pos_rate_weighted = float(sw_pos / sw_sum) if sw_sum > 0.0 else float("nan")
-                p_cal[:, t], t_params = _calibrate_task(
-                    y[:, t],
-                    p[:, t],
-                    cfg.calibration_method,
-                    sample_weight=sw_t,
-                )
+                if cfg.skip_family_calibration:
+                    p_cal[:, t] = np.asarray(p[:, t], dtype=np.float32)
+                    t_params = {"kind": "identity", "skip_reason": "skip_family_calibration"}
+                else:
+                    p_cal[:, t], t_params = _calibrate_task(
+                        y[:, t],
+                        p[:, t],
+                        cfg.calibration_method,
+                        sample_weight=sw_t,
+                    )
                 params_by_task[str(t)] = t_params
                 arr[f"p_cal_t{t}"] = p_cal[:, t]
                 log_event(
@@ -2589,8 +2672,10 @@ def run_family_suite(args: Any) -> None:
                     scope="train_oof",
                     task_idx=int(t),
                     kind=str(t_params.get("kind", "unknown")),
+                    skipped=bool(cfg.skip_family_calibration),
                     pos_rate=f"{pos_rate:.6f}",
                     pos_rate_weighted=f"{pos_rate_weighted:.6f}",
+                    weighting_policy="metrics_aligned" if sw_t is not None else "unweighted",
                     sample_weight_sum=f"{sw_sum:.3f}",
                     n_rows=int(y.shape[0]),
                 )
@@ -2604,7 +2689,8 @@ def run_family_suite(args: Any) -> None:
                     {
                         "family": str(family),
                         "fit_scope": "train_oof",
-                        "method": str(cfg.calibration_method),
+                        "method": str(calibration_fit_method),
+                        "skipped": bool(cfg.skip_family_calibration),
                         "task_params": params_by_task,
                     },
                     indent=2,
@@ -2629,6 +2715,7 @@ def run_family_suite(args: Any) -> None:
                     "family.calibration.fit.summary",
                     family=str(family),
                     scope="train_oof",
+                    skipped=bool(cfg.skip_family_calibration),
                     macro_pr_auc=f"{float(macro_row.iloc[0]['pr_auc']):.6f}",
                     macro_roc_auc=f"{float(macro_row.iloc[0]['roc_auc']):.6f}",
                     preds_path=str(cal_pred_path),
@@ -2636,159 +2723,163 @@ def run_family_suite(args: Any) -> None:
                     calib_json_path=str(cal_json_path),
                 )
 
-    with log_step("family.blend.fit", scope="train_oof"):
-        fams = list(calibrated_oof.keys())
-        if len(fams) == 0:
-            raise RuntimeError("No family predictions available for blending.")
-        common_ids = set(calibrated_oof[fams[0]]["ID"].astype(str).tolist())
-        for f in fams[1:]:
-            common_ids &= set(calibrated_oof[f]["ID"].astype(str).tolist())
-        common_ids = sorted(common_ids)
-        if len(common_ids) == 0:
-            raise RuntimeError("No common train OOF IDs across selected families for blending.")
+    blend_weights: Dict[str, Any] | None = None
+    blend_oof_metrics: pd.DataFrame | None = None
+    skip_blend_reason = ""
+    if cfg.skip_family_blending:
+        skip_blend_reason = "skip_family_blending_flag"
+    elif int(len(calibrated_oof)) <= 1:
+        skip_blend_reason = "single_model"
+
+    if skip_blend_reason:
         log_event(
             "INFO",
-            "family.blend.fit.scope",
+            "family.blend.fit.skipped",
             scope="train_oof",
-            n_families=int(len(fams)),
-            families=",".join([str(x) for x in fams]),
-            n_common_ids=int(len(common_ids)),
+            reason=str(skip_blend_reason),
+            n_families=int(len(calibrated_oof)),
         )
-
-        y_bl: Optional[np.ndarray] = None
-        w_bl: Optional[np.ndarray] = None
-        fold_bl: Optional[np.ndarray] = None
-        x_by_family_oof: Dict[str, np.ndarray] = {}
-        for f in fams:
-            d = calibrated_oof[f].copy()
-            d["ID"] = d["ID"].astype(str)
-            d = d.set_index("ID").loc[common_ids].reset_index(drop=False)
-            _require_calibrated_prob_columns(df=d, family=str(f), scope="train_oof")
-            x_by_family_oof[f] = np.stack([d[f"p_cal_t{t}"].to_numpy(dtype=np.float64) for t in range(4)], axis=1)
+    else:
+        with log_step("family.blend.fit", scope="train_oof"):
+            fams = list(calibrated_oof.keys())
+            if len(fams) == 0:
+                raise RuntimeError("No family predictions available for blending.")
+            common_ids = set(calibrated_oof[fams[0]]["ID"].astype(str).tolist())
+            for f in fams[1:]:
+                common_ids &= set(calibrated_oof[f]["ID"].astype(str).tolist())
+            common_ids = sorted(common_ids)
+            if len(common_ids) == 0:
+                raise RuntimeError("No common train OOF IDs across selected families for blending.")
             log_event(
                 "INFO",
-                "family.blend.fit.family_input",
+                "family.blend.fit.scope",
                 scope="train_oof",
-                family=str(f),
-                input_source="calibrated_probabilities",
-                n_rows=int(len(d)),
+                n_families=int(len(fams)),
+                families=",".join([str(x) for x in fams]),
+                n_common_ids=int(len(common_ids)),
             )
-            if y_bl is None:
-                y_bl = np.stack([d[f"y_t{t}"].to_numpy(dtype=np.int64) for t in range(4)], axis=1)
-                w_bl = np.stack(
-                    [
-                        d[f"w_t{t}"].to_numpy(dtype=np.float32)
-                        if f"w_t{t}" in d.columns
-                        else np.ones(len(d), dtype=np.float32)
-                        for t in range(4)
-                    ],
-                    axis=1,
+
+            y_bl: Optional[np.ndarray] = None
+            w_bl: Optional[np.ndarray] = None
+            fold_bl: Optional[np.ndarray] = None
+            x_by_family_oof: Dict[str, np.ndarray] = {}
+            for f in fams:
+                d = calibrated_oof[f].copy()
+                d["ID"] = d["ID"].astype(str)
+                d = d.set_index("ID").loc[common_ids].reset_index(drop=False)
+                _require_calibrated_prob_columns(df=d, family=str(f), scope="train_oof")
+                x_by_family_oof[f] = np.stack([d[f"p_cal_t{t}"].to_numpy(dtype=np.float64) for t in range(4)], axis=1)
+                log_event(
+                    "INFO",
+                    "family.blend.fit.family_input",
+                    scope="train_oof",
+                    family=str(f),
+                    input_source="calibrated_probabilities",
+                    n_rows=int(len(d)),
                 )
-                if "fold_id" in d.columns:
-                    fold_bl = d["fold_id"].to_numpy(dtype=np.int64)
-        assert y_bl is not None
-        assert w_bl is not None
+                if y_bl is None:
+                    y_bl = np.stack([d[f"y_t{t}"].to_numpy(dtype=np.int64) for t in range(4)], axis=1)
+                    w_bl = np.stack(
+                        [
+                            d[f"w_t{t}"].to_numpy(dtype=np.float32)
+                            if f"w_t{t}" in d.columns
+                            else np.ones(len(d), dtype=np.float32)
+                            for t in range(4)
+                        ],
+                        axis=1,
+                    )
+                    if "fold_id" in d.columns:
+                        fold_bl = d["fold_id"].to_numpy(dtype=np.int64)
+            assert y_bl is not None
+            assert w_bl is not None
 
-        blend_pred_oof = np.zeros_like(y_bl, dtype=np.float64)
-        blend_weights: Dict[str, Any] = {
-            "fit_scope": "train_oof",
-            "families": fams,
-            "input_source": "calibrated_probabilities",
-            "calibration_method": str(cfg.calibration_method),
-            "blend_method": "convex_blending_simplex",
-            "tasks": {},
-        }
-        bitmask_w_bl = make_bitmask_sample_weights(
-            y_bl,
-            alpha=0.5,
-            cap=5.0,
-        ).astype(np.float64)
-        log_event(
-            "INFO",
-            "family.blend.fit.bitmask_weights",
-            scope="train_oof",
-            n_rows=int(bitmask_w_bl.shape[0]),
-            min_w=f"{float(np.min(bitmask_w_bl)):.4f}",
-            max_w=f"{float(np.max(bitmask_w_bl)):.4f}",
-            mean_w=f"{float(np.mean(bitmask_w_bl)):.4f}",
-        )
-        for t in range(4):
-            x_task = np.column_stack([x_by_family_oof[f][:, t] for f in fams]).astype(np.float64)
-            y_task = y_bl[:, t].astype(int)
-            base_w = np.asarray(w_bl[:, t], dtype=np.float64)
-            blend_sw = np.clip(np.nan_to_num(base_w, nan=0.0), 0.0, np.inf) * bitmask_w_bl
-            task_cfg, p_task = _fit_blend_task(
-                x=x_task,
-                y=y_task,
-                fams=fams,
-                sample_weight=blend_sw,
-            )
-            blend_pred_oof[:, t] = np.asarray(p_task, dtype=np.float64)
-            blend_weights["tasks"][str(t)] = dict(task_cfg)
-            w_vec = np.asarray(list(task_cfg.get("weights", {}).values()), dtype=np.float64)
-            w_vec = w_vec if w_vec.size > 0 else np.asarray([1.0], dtype=np.float64)
-            w_sum = float(np.sum(np.clip(w_vec, 0.0, np.inf)))
-            w_norm = np.clip(w_vec, 0.0, np.inf) / float(max(w_sum, 1e-12))
-            w_entropy = -float(np.sum(w_norm * np.log(np.clip(w_norm, 1e-12, 1.0))))
-            log_event(
-                "INFO",
-                "family.blend.fit.task",
-                scope="train_oof",
-                task_idx=int(t),
-                kind=str(task_cfg.get("kind", "unknown")),
-                n_rows=int(y_task.shape[0]),
-                pos_rate=f"{float(np.mean(y_task)):.6f}",
-                constraint=str(task_cfg.get("constraint", "")),
-                optimizer=str(task_cfg.get("optimizer", "")),
-                objective=str(task_cfg.get("objective", "roc_auc")),
-                n_eval=int(task_cfg.get("n_eval", 0)),
-                train_roc_auc=f"{float(task_cfg.get('train_roc_auc', np.nan)):.6f}",
-                train_pr_auc_tiebreak=f"{float(task_cfg.get('train_pr_auc_tiebreak', np.nan)):.6f}",
-                weight_max=f"{float(np.max(w_norm)):.6f}",
-                weight_entropy=f"{float(w_entropy):.6f}",
-                weight_l1=f"{float(np.sum(np.abs(np.asarray(list(task_cfg.get('weights', {}).values()), dtype=np.float64)))):.6f}",
-                sample_weight_sum=f"{float(np.sum(blend_sw)):.3f}",
-            )
-        blend_weights_path = outdir / "blend_weights.json"
-        blend_weights_path.write_text(json.dumps(blend_weights, indent=2))
+            blend_pred_oof = np.zeros_like(y_bl, dtype=np.float64)
+            blend_weights = {
+                "fit_scope": "train_oof",
+                "families": fams,
+                "input_source": "calibrated_probabilities",
+                "calibration_method": str(calibration_fit_method),
+                "blend_method": "convex_blending_simplex",
+                "weighting_policy": "metrics_aligned",
+                "tasks": {},
+            }
+            for t in range(4):
+                x_task = np.column_stack([x_by_family_oof[f][:, t] for f in fams]).astype(np.float64)
+                y_task = y_bl[:, t].astype(int)
+                blend_sw = _metric_sample_weight_for_task(w_bl[:, t], t)
+                task_cfg, p_task = _fit_blend_task(
+                    x=x_task,
+                    y=y_task,
+                    fams=fams,
+                    sample_weight=blend_sw,
+                )
+                blend_pred_oof[:, t] = np.asarray(p_task, dtype=np.float64)
+                blend_weights["tasks"][str(t)] = dict(task_cfg)
+                w_vec = np.asarray(list(task_cfg.get("weights", {}).values()), dtype=np.float64)
+                w_vec = w_vec if w_vec.size > 0 else np.asarray([1.0], dtype=np.float64)
+                w_sum = float(np.sum(np.clip(w_vec, 0.0, np.inf)))
+                w_norm = np.clip(w_vec, 0.0, np.inf) / float(max(w_sum, 1e-12))
+                w_entropy = -float(np.sum(w_norm * np.log(np.clip(w_norm, 1e-12, 1.0))))
+                log_event(
+                    "INFO",
+                    "family.blend.fit.task",
+                    scope="train_oof",
+                    task_idx=int(t),
+                    kind=str(task_cfg.get("kind", "unknown")),
+                    n_rows=int(y_task.shape[0]),
+                    pos_rate=f"{float(np.mean(y_task)):.6f}",
+                    constraint=str(task_cfg.get("constraint", "")),
+                    optimizer=str(task_cfg.get("optimizer", "")),
+                    objective=str(task_cfg.get("objective", "roc_auc")),
+                    n_eval=int(task_cfg.get("n_eval", 0)),
+                    train_roc_auc=f"{float(task_cfg.get('train_roc_auc', np.nan)):.6f}",
+                    train_pr_auc_tiebreak=f"{float(task_cfg.get('train_pr_auc_tiebreak', np.nan)):.6f}",
+                    weight_max=f"{float(np.max(w_norm)):.6f}",
+                    weight_entropy=f"{float(w_entropy):.6f}",
+                    weight_l1=f"{float(np.sum(np.abs(np.asarray(list(task_cfg.get('weights', {}).values()), dtype=np.float64)))):.6f}",
+                    weighting_policy="metrics_aligned" if blend_sw is not None else "unweighted",
+                    sample_weight_sum=f"{float(np.sum(blend_sw)):.3f}" if blend_sw is not None else f"{float(y_task.shape[0]):.3f}",
+                )
+            blend_weights_path = outdir / "blend_weights.json"
+            blend_weights_path.write_text(json.dumps(blend_weights, indent=2))
 
-        blend_oof_df = pd.DataFrame({"ID": common_ids})
-        if fold_bl is not None:
-            blend_oof_df["fold_id"] = fold_bl.astype(int)
-        for t in range(4):
-            blend_oof_df[f"p_blend_t{t}"] = blend_pred_oof[:, t]
-            blend_oof_df[f"y_t{t}"] = y_bl[:, t]
-            blend_oof_df[f"pred_t{t}"] = (blend_pred_oof[:, t] >= 0.5).astype(int)
-        blend_oof_pred_path = outdir / "train_oof_preds_blend.csv"
-        blend_oof_df.to_csv(blend_oof_pred_path, index=False)
-        blend_oof_metric_path = outdir / "cv_oof_metrics_blend.csv"
-        blend_oof_metrics = _metric_table(y_true=y_bl, p_pred=blend_pred_oof, w_cls=w_bl)
-        blend_oof_metrics.to_csv(blend_oof_metric_path, index=False)
-        if fold_bl is not None:
-            fold_metric_rows_blend: List[Dict[str, Any]] = []
-            for fold_id in sorted([int(x) for x in np.unique(fold_bl).tolist() if int(x) >= 0]):
-                m = np.asarray(fold_bl == int(fold_id))
-                if int(np.sum(m)) <= 0:
-                    continue
-                mt = _metric_table(y_true=y_bl[m], p_pred=blend_pred_oof[m], w_cls=w_bl[m])
-                for row in mt.to_dict(orient="records"):
-                    row["fold"] = int(fold_id)
-                    row["family"] = "blend"
-                    fold_metric_rows_blend.append(row)
-            if len(fold_metric_rows_blend) > 0:
-                pd.DataFrame(fold_metric_rows_blend).to_csv(outdir / "cv_fold_metrics_blend.csv", index=False)
-        macro_row = blend_oof_metrics[blend_oof_metrics["task"] == "macro"]
-        if len(macro_row) == 1:
-            log_event(
-                "INFO",
-                "family.blend.fit.summary",
-                scope="train_oof",
-                macro_pr_auc=f"{float(macro_row.iloc[0]['pr_auc']):.6f}",
-                macro_roc_auc=f"{float(macro_row.iloc[0]['roc_auc']):.6f}",
-                preds_path=str(blend_oof_pred_path),
-                metrics_path=str(blend_oof_metric_path),
-                weights_path=str(blend_weights_path),
-            )
+            blend_oof_df = pd.DataFrame({"ID": common_ids})
+            if fold_bl is not None:
+                blend_oof_df["fold_id"] = fold_bl.astype(int)
+            for t in range(4):
+                blend_oof_df[f"p_blend_t{t}"] = blend_pred_oof[:, t]
+                blend_oof_df[f"y_t{t}"] = y_bl[:, t]
+                blend_oof_df[f"pred_t{t}"] = (blend_pred_oof[:, t] >= 0.5).astype(int)
+            blend_oof_pred_path = outdir / "train_oof_preds_blend.csv"
+            blend_oof_df.to_csv(blend_oof_pred_path, index=False)
+            blend_oof_metric_path = outdir / "cv_oof_metrics_blend.csv"
+            blend_oof_metrics = _metric_table(y_true=y_bl, p_pred=blend_pred_oof, w_cls=w_bl)
+            blend_oof_metrics.to_csv(blend_oof_metric_path, index=False)
+            if fold_bl is not None:
+                fold_metric_rows_blend: List[Dict[str, Any]] = []
+                for fold_id in sorted([int(x) for x in np.unique(fold_bl).tolist() if int(x) >= 0]):
+                    m = np.asarray(fold_bl == int(fold_id))
+                    if int(np.sum(m)) <= 0:
+                        continue
+                    mt = _metric_table(y_true=y_bl[m], p_pred=blend_pred_oof[m], w_cls=w_bl[m])
+                    for row in mt.to_dict(orient="records"):
+                        row["fold"] = int(fold_id)
+                        row["family"] = "blend"
+                        fold_metric_rows_blend.append(row)
+                if len(fold_metric_rows_blend) > 0:
+                    pd.DataFrame(fold_metric_rows_blend).to_csv(outdir / "cv_fold_metrics_blend.csv", index=False)
+            macro_row = blend_oof_metrics[blend_oof_metrics["task"] == "macro"]
+            if len(macro_row) == 1:
+                log_event(
+                    "INFO",
+                    "family.blend.fit.summary",
+                    scope="train_oof",
+                    macro_pr_auc=f"{float(macro_row.iloc[0]['pr_auc']):.6f}",
+                    macro_roc_auc=f"{float(macro_row.iloc[0]['roc_auc']):.6f}",
+                    preds_path=str(blend_oof_pred_path),
+                    metrics_path=str(blend_oof_metric_path),
+                    weights_path=str(blend_weights_path),
+                )
 
     pred_tables: Dict[str, pd.DataFrame] = {}
     leaderboard_metrics_by_family: Dict[str, pd.DataFrame] = {}
@@ -2808,6 +2899,8 @@ def run_family_suite(args: Any) -> None:
             catboost_task_params = dict(best_params[family])
             pred = np.zeros((len(ids_lb), 4), dtype=np.float64)
             selected_iter_map = catboost_selected_iterations.get(str(model_key), {})
+            family_model_dir = outdir / str(family)
+            family_model_dir.mkdir(parents=True, exist_ok=True)
             for t in range(4):
                 if f"task_{int(t)}" not in catboost_task_params:
                     raise KeyError(
@@ -2837,6 +2930,8 @@ def run_family_suite(args: Any) -> None:
                     use_best_model=False,
                     verbose=False,
                 )
+                cb_model_path = family_model_dir / f"leaderboard_{model_key}_task{int(t)}.cbm"
+                cb.save_model(str(cb_model_path))
                 pred[:, t] = cb.predict_proba(X2d_lb)[:, 1]
                 log_event(
                     "INFO",
@@ -2848,6 +2943,7 @@ def run_family_suite(args: Any) -> None:
                     task_idx=int(t),
                     selected_iterations=int(target_iterations),
                     scale_pos_weight=f"{float(spw):.6f}",
+                    model_path=str(cb_model_path),
                 )
             df_pred = pd.DataFrame({"ID": [str(x) for x in ids_lb]})
             for t in range(4):
@@ -2880,6 +2976,7 @@ def run_family_suite(args: Any) -> None:
             best_params=best_params[family],
             outdir=outdir,
             write_outputs=True,
+            write_explainability_outputs=bool(not cfg.skip_family_explainability),
             output_prefix=f"leaderboard_{model_key}",
             fixed_train_epochs=int(selected_epochs),
         )
@@ -2907,7 +3004,8 @@ def run_family_suite(args: Any) -> None:
             "family.calibration.apply",
             family=str(family),
             scope="leaderboard",
-            method=str(cfg.calibration_method),
+            method=str(calibration_fit_method),
+            skipped=bool(cfg.skip_family_calibration),
             n_rows=int(len(dfp)),
         ):
             arr = dfp.copy()
@@ -2951,170 +3049,192 @@ def run_family_suite(args: Any) -> None:
                     "family.calibration.apply.summary",
                     family=str(family),
                     scope="leaderboard",
+                    skipped=bool(cfg.skip_family_calibration),
                     macro_pr_auc=f"{float(macro_row.iloc[0]['pr_auc']):.6f}",
                     macro_roc_auc=f"{float(macro_row.iloc[0]['roc_auc']):.6f}",
                     preds_path=str(cal_lb_pred_path),
                     metrics_path=str(cal_lb_metric_path),
                 )
 
-    # Apply train-OOF fitted blender on calibrated leaderboard probabilities.
     blend_lb_metrics: pd.DataFrame | None = None
-    with log_step("family.blend.apply", scope="leaderboard"):
-        fams_lb = [str(x) for x in blend_weights.get("families", []) if str(x) in calibrated]
-        if len(fams_lb) == 0:
-            raise RuntimeError("No calibrated families available for leaderboard blending.")
-        common_ids = set(calibrated[fams_lb[0]]["ID"].astype(str).tolist())
-        for f in fams_lb[1:]:
-            common_ids &= set(calibrated[f]["ID"].astype(str).tolist())
-        common_ids = sorted(common_ids)
-        if len(common_ids) == 0:
-            raise RuntimeError("No common leaderboard IDs across selected families for blending.")
+    if blend_weights is None:
         log_event(
             "INFO",
-            "family.blend.apply.scope",
+            "family.blend.apply.skipped",
             scope="leaderboard",
-            n_families=int(len(fams_lb)),
-            families=",".join([str(x) for x in fams_lb]),
-            n_common_ids=int(len(common_ids)),
+            reason=str(skip_blend_reason or "blend_not_fitted"),
+            n_families=int(len(calibrated)),
         )
-
-        y_bl = None
-        w_bl = None
-        x_by_family: Dict[str, np.ndarray] = {}
-        for f in fams_lb:
-            d = calibrated[f].copy()
-            d["ID"] = d["ID"].astype(str)
-            d = d.set_index("ID").loc[common_ids].reset_index(drop=False)
-            _require_calibrated_prob_columns(df=d, family=str(f), scope="leaderboard")
-            x_by_family[f] = np.stack([d[f"p_cal_t{t}"].to_numpy(dtype=np.float64) for t in range(4)], axis=1)
+    else:
+        with log_step("family.blend.apply", scope="leaderboard"):
+            fams_lb = [str(x) for x in blend_weights.get("families", []) if str(x) in calibrated]
+            if len(fams_lb) == 0:
+                raise RuntimeError("No calibrated families available for leaderboard blending.")
+            common_ids = set(calibrated[fams_lb[0]]["ID"].astype(str).tolist())
+            for f in fams_lb[1:]:
+                common_ids &= set(calibrated[f]["ID"].astype(str).tolist())
+            common_ids = sorted(common_ids)
+            if len(common_ids) == 0:
+                raise RuntimeError("No common leaderboard IDs across selected families for blending.")
             log_event(
                 "INFO",
-                "family.blend.apply.family_input",
+                "family.blend.apply.scope",
                 scope="leaderboard",
-                family=str(f),
-                input_source="calibrated_probabilities",
-                n_rows=int(len(d)),
+                n_families=int(len(fams_lb)),
+                families=",".join([str(x) for x in fams_lb]),
+                n_common_ids=int(len(common_ids)),
             )
-            if y_bl is None:
-                y_bl = np.stack([d[f"y_t{t}"].to_numpy(dtype=np.int64) for t in range(4)], axis=1)
-                w_bl = np.stack(
-                    [d[f"w_t{t}"].to_numpy(dtype=np.float32) if f"w_t{t}" in d.columns else np.ones(len(d), dtype=np.float32) for t in range(4)],
-                    axis=1,
+
+            y_bl = None
+            w_bl = None
+            x_by_family: Dict[str, np.ndarray] = {}
+            for f in fams_lb:
+                d = calibrated[f].copy()
+                d["ID"] = d["ID"].astype(str)
+                d = d.set_index("ID").loc[common_ids].reset_index(drop=False)
+                _require_calibrated_prob_columns(df=d, family=str(f), scope="leaderboard")
+                x_by_family[f] = np.stack([d[f"p_cal_t{t}"].to_numpy(dtype=np.float64) for t in range(4)], axis=1)
+                log_event(
+                    "INFO",
+                    "family.blend.apply.family_input",
+                    scope="leaderboard",
+                    family=str(f),
+                    input_source="calibrated_probabilities",
+                    n_rows=int(len(d)),
                 )
-        assert y_bl is not None
-        assert w_bl is not None
+                if y_bl is None:
+                    y_bl = np.stack([d[f"y_t{t}"].to_numpy(dtype=np.int64) for t in range(4)], axis=1)
+                    w_bl = np.stack(
+                        [
+                            d[f"w_t{t}"].to_numpy(dtype=np.float32)
+                            if f"w_t{t}" in d.columns
+                            else np.ones(len(d), dtype=np.float32)
+                            for t in range(4)
+                        ],
+                        axis=1,
+                    )
+            assert y_bl is not None
+            assert w_bl is not None
 
-        blend_pred = np.zeros_like(y_bl, dtype=np.float64)
-        for t in range(4):
-            X_task = np.column_stack([x_by_family[f][:, t] for f in fams_lb]).astype(np.float64)
-            task_cfg = blend_weights.get("tasks", {}).get(
-                str(t),
-                {"kind": "convex_blending", "weights": {f: 1.0 / float(max(1, len(fams_lb))) for f in fams_lb}},
-            )
-            blend_pred[:, t] = _apply_blend_task(x=X_task, task_cfg=task_cfg, fams=fams_lb)
-            log_event(
-                "INFO",
-                "family.blend.apply.task",
-                scope="leaderboard",
-                task_idx=int(t),
-                kind=str(task_cfg.get("kind", "convex_blending")),
-                n_rows=int(X_task.shape[0]),
-            )
+            blend_pred = np.zeros_like(y_bl, dtype=np.float64)
+            for t in range(4):
+                X_task = np.column_stack([x_by_family[f][:, t] for f in fams_lb]).astype(np.float64)
+                task_cfg = blend_weights.get("tasks", {}).get(
+                    str(t),
+                    {"kind": "convex_blending", "weights": {f: 1.0 / float(max(1, len(fams_lb))) for f in fams_lb}},
+                )
+                blend_pred[:, t] = _apply_blend_task(x=X_task, task_cfg=task_cfg, fams=fams_lb)
+                log_event(
+                    "INFO",
+                    "family.blend.apply.task",
+                    scope="leaderboard",
+                    task_idx=int(t),
+                    kind=str(task_cfg.get("kind", "convex_blending")),
+                    n_rows=int(X_task.shape[0]),
+                )
 
-        blend_df = pd.DataFrame({"ID": common_ids})
-        for t in range(4):
-            blend_df[f"p_blend_t{t}"] = blend_pred[:, t]
-            blend_df[f"y_t{t}"] = y_bl[:, t]
-            blend_df[f"pred_t{t}"] = (blend_pred[:, t] >= 0.5).astype(int)
-        blend_lb_pred_path = outdir / "leaderboard_preds_blend.csv"
-        blend_df.to_csv(blend_lb_pred_path, index=False)
-        (outdir / "blend_weights.json").write_text(json.dumps(blend_weights, indent=2))
+            blend_df = pd.DataFrame({"ID": common_ids})
+            for t in range(4):
+                blend_df[f"p_blend_t{t}"] = blend_pred[:, t]
+                blend_df[f"y_t{t}"] = y_bl[:, t]
+                blend_df[f"pred_t{t}"] = (blend_pred[:, t] >= 0.5).astype(int)
+            blend_lb_pred_path = outdir / "leaderboard_preds_blend.csv"
+            blend_df.to_csv(blend_lb_pred_path, index=False)
+            (outdir / "blend_weights.json").write_text(json.dumps(blend_weights, indent=2))
 
-        blend_lb_metric_path = outdir / "leaderboard_metrics_blend.csv"
-        blend_lb_metrics = _metric_table(
-            y_true=y_bl,
-            p_pred=blend_pred,
-            w_cls=w_bl,
-        )
-        blend_lb_metrics.to_csv(blend_lb_metric_path, index=False)
-        macro_row = blend_lb_metrics[blend_lb_metrics["task"] == "macro"]
-        if len(macro_row) == 1:
-            log_event(
-                "INFO",
-                "family.blend.apply.summary",
-                scope="leaderboard",
-                macro_pr_auc=f"{float(macro_row.iloc[0]['pr_auc']):.6f}",
-                macro_roc_auc=f"{float(macro_row.iloc[0]['roc_auc']):.6f}",
-                preds_path=str(blend_lb_pred_path),
-                metrics_path=str(blend_lb_metric_path),
+            blend_lb_metric_path = outdir / "leaderboard_metrics_blend.csv"
+            blend_lb_metrics = _metric_table(
+                y_true=y_bl,
+                p_pred=blend_pred,
+                w_cls=w_bl,
             )
+            blend_lb_metrics.to_csv(blend_lb_metric_path, index=False)
+            macro_row = blend_lb_metrics[blend_lb_metrics["task"] == "macro"]
+            if len(macro_row) == 1:
+                log_event(
+                    "INFO",
+                    "family.blend.apply.summary",
+                    scope="leaderboard",
+                    macro_pr_auc=f"{float(macro_row.iloc[0]['pr_auc']):.6f}",
+                    macro_roc_auc=f"{float(macro_row.iloc[0]['roc_auc']):.6f}",
+                    preds_path=str(blend_lb_pred_path),
+                    metrics_path=str(blend_lb_metric_path),
+                )
 
     # Summary table for direct single-model vs blend comparison on leaderboard.
-    if blend_lb_metrics is not None:
-        blend_by_task = blend_lb_metrics.set_index("task")[["pr_auc", "roc_auc"]]
-        rows_summary: List[Dict[str, Any]] = []
-        for model_name, dfm in sorted(leaderboard_metrics_by_family.items(), key=lambda kv: str(kv[0])):
-            if dfm is None or len(dfm) == 0:
+    blend_by_task = (
+        blend_lb_metrics.set_index("task")[["pr_auc", "roc_auc"]]
+        if blend_lb_metrics is not None
+        else None
+    )
+    rows_summary: List[Dict[str, Any]] = []
+    for model_name, dfm in sorted(leaderboard_metrics_by_family.items(), key=lambda kv: str(kv[0])):
+        if dfm is None or len(dfm) == 0:
+            continue
+        fam_by_task = dfm.set_index("task")[["pr_auc", "roc_auc"]]
+        for task_name in [str(t) for t in TASK_COLS]:
+            if task_name not in fam_by_task.index:
                 continue
-            fam_by_task = dfm.set_index("task")[["pr_auc", "roc_auc"]]
-            for task_name in [str(t) for t in TASK_COLS]:
-                if task_name not in fam_by_task.index or task_name not in blend_by_task.index:
-                    continue
-                rows_summary.append(
-                    {
-                        "task": str(task_name),
-                        "model": str(model_name),
-                        "pr_auc_cv_mean": float("nan"),
-                        "pr_auc_cv_sd": float("nan"),
-                        "pr_auc_cv_ci95_low": float("nan"),
-                        "pr_auc_cv_ci95_high": float("nan"),
-                        "pr_auc_cv_ci95_halfwidth": float("nan"),
-                        "roc_auc_cv_mean": float("nan"),
-                        "roc_auc_cv_sd": float("nan"),
-                        "roc_auc_cv_ci95_low": float("nan"),
-                        "roc_auc_cv_ci95_high": float("nan"),
-                        "roc_auc_cv_ci95_halfwidth": float("nan"),
-                        "pr_auc_lbrd": float(fam_by_task.loc[task_name, "pr_auc"]),
-                        "roc_auc_lbrd": float(fam_by_task.loc[task_name, "roc_auc"]),
-                        "pr_auc_lbd_blend": float(blend_by_task.loc[task_name, "pr_auc"]),
-                        "roc_auc_lbd_blend": float(blend_by_task.loc[task_name, "roc_auc"]),
-                        "pr_auc_lbrd_blend": float(blend_by_task.loc[task_name, "pr_auc"]),
-                        "roc_auc_lbrd_blend": float(blend_by_task.loc[task_name, "roc_auc"]),
-                    }
-                )
-                dff = cv_fold_metrics_by_model.get(str(model_name))
-                if isinstance(dff, pd.DataFrame) and len(dff) > 0:
-                    cur = dff[dff["task"].astype(str) == str(task_name)].copy()
-                    if len(cur) > 0:
-                        pr_vals = pd.to_numeric(cur["pr_auc"], errors="coerce").to_numpy(dtype=np.float64)
-                        roc_vals = pd.to_numeric(cur["roc_auc"], errors="coerce").to_numpy(dtype=np.float64)
-                        pr_vals = pr_vals[np.isfinite(pr_vals)]
-                        roc_vals = roc_vals[np.isfinite(roc_vals)]
-                        if pr_vals.size > 0:
-                            mean, sd, lo, hi, half = _mean_sd_ci95(pr_vals)
-                            rows_summary[-1]["pr_auc_cv_mean"] = mean
-                            rows_summary[-1]["pr_auc_cv_sd"] = sd
-                            rows_summary[-1]["pr_auc_cv_ci95_low"] = lo
-                            rows_summary[-1]["pr_auc_cv_ci95_high"] = hi
-                            rows_summary[-1]["pr_auc_cv_ci95_halfwidth"] = half
-                        if roc_vals.size > 0:
-                            mean, sd, lo, hi, half = _mean_sd_ci95(roc_vals)
-                            rows_summary[-1]["roc_auc_cv_mean"] = mean
-                            rows_summary[-1]["roc_auc_cv_sd"] = sd
-                            rows_summary[-1]["roc_auc_cv_ci95_low"] = lo
-                            rows_summary[-1]["roc_auc_cv_ci95_high"] = hi
-                            rows_summary[-1]["roc_auc_cv_ci95_halfwidth"] = half
-        if len(rows_summary) > 0:
-            results_path = outdir / "results.csv"
-            pd.DataFrame(rows_summary).to_csv(results_path, index=False)
-            log_event(
-                "INFO",
-                "family.results.summary_written",
-                path=str(results_path),
-                n_rows=int(len(rows_summary)),
-                n_models=int(len(leaderboard_metrics_by_family)),
-                n_tasks=int(len(TASK_COLS)),
-            )
+            row_summary: Dict[str, Any] = {
+                "task": str(task_name),
+                "model": str(model_name),
+                "pr_auc_cv_mean": float("nan"),
+                "pr_auc_cv_sd": float("nan"),
+                "pr_auc_cv_ci95_low": float("nan"),
+                "pr_auc_cv_ci95_high": float("nan"),
+                "pr_auc_cv_ci95_halfwidth": float("nan"),
+                "roc_auc_cv_mean": float("nan"),
+                "roc_auc_cv_sd": float("nan"),
+                "roc_auc_cv_ci95_low": float("nan"),
+                "roc_auc_cv_ci95_high": float("nan"),
+                "roc_auc_cv_ci95_halfwidth": float("nan"),
+                "pr_auc_lbrd": float(fam_by_task.loc[task_name, "pr_auc"]),
+                "roc_auc_lbrd": float(fam_by_task.loc[task_name, "roc_auc"]),
+                "pr_auc_lbd_blend": float("nan"),
+                "roc_auc_lbd_blend": float("nan"),
+                "pr_auc_lbrd_blend": float("nan"),
+                "roc_auc_lbrd_blend": float("nan"),
+            }
+            if blend_by_task is not None and task_name in blend_by_task.index:
+                row_summary["pr_auc_lbd_blend"] = float(blend_by_task.loc[task_name, "pr_auc"])
+                row_summary["roc_auc_lbd_blend"] = float(blend_by_task.loc[task_name, "roc_auc"])
+                row_summary["pr_auc_lbrd_blend"] = float(blend_by_task.loc[task_name, "pr_auc"])
+                row_summary["roc_auc_lbrd_blend"] = float(blend_by_task.loc[task_name, "roc_auc"])
+            rows_summary.append(row_summary)
+            dff = cv_fold_metrics_by_model.get(str(model_name))
+            if isinstance(dff, pd.DataFrame) and len(dff) > 0:
+                cur = dff[dff["task"].astype(str) == str(task_name)].copy()
+                if len(cur) > 0:
+                    pr_vals = pd.to_numeric(cur["pr_auc"], errors="coerce").to_numpy(dtype=np.float64)
+                    roc_vals = pd.to_numeric(cur["roc_auc"], errors="coerce").to_numpy(dtype=np.float64)
+                    pr_vals = pr_vals[np.isfinite(pr_vals)]
+                    roc_vals = roc_vals[np.isfinite(roc_vals)]
+                    if pr_vals.size > 0:
+                        mean, sd, lo, hi, half = _mean_sd_ci95(pr_vals)
+                        rows_summary[-1]["pr_auc_cv_mean"] = mean
+                        rows_summary[-1]["pr_auc_cv_sd"] = sd
+                        rows_summary[-1]["pr_auc_cv_ci95_low"] = lo
+                        rows_summary[-1]["pr_auc_cv_ci95_high"] = hi
+                        rows_summary[-1]["pr_auc_cv_ci95_halfwidth"] = half
+                    if roc_vals.size > 0:
+                        mean, sd, lo, hi, half = _mean_sd_ci95(roc_vals)
+                        rows_summary[-1]["roc_auc_cv_mean"] = mean
+                        rows_summary[-1]["roc_auc_cv_sd"] = sd
+                        rows_summary[-1]["roc_auc_cv_ci95_low"] = lo
+                        rows_summary[-1]["roc_auc_cv_ci95_high"] = hi
+                        rows_summary[-1]["roc_auc_cv_ci95_halfwidth"] = half
+    if len(rows_summary) > 0:
+        results_path = outdir / "results.csv"
+        pd.DataFrame(rows_summary).to_csv(results_path, index=False)
+        log_event(
+            "INFO",
+            "family.results.summary_written",
+            path=str(results_path),
+            n_rows=int(len(rows_summary)),
+            n_models=int(len(leaderboard_metrics_by_family)),
+            n_tasks=int(len(TASK_COLS)),
+            blend_available=bool(blend_lb_metrics is not None),
+        )
     log_event(
         "DONE",
         "family_suite.run",

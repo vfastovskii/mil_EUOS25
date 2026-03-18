@@ -51,8 +51,8 @@ AUX_FLUO_BASE_COLS = ["wl_pred_nm", "qy_pred"]
 WEIGHT_COLS = {
     0: "sample_weight_340",
     1: "sample_weight_450",
-    2: "w_ad",
-    3: "w_ad",
+    2: None,
+    3: None,
 }
 
 NONFEAT_2D = {"ID", "curated_SMILES", "split"}
@@ -109,12 +109,12 @@ def build_task_weights(df_lab: pd.DataFrame) -> np.ndarray:
     Per-sample per-task weights used in BOTH MLP and MIL classification loss.
       - task0: sample_weight_340
       - task1: sample_weight_450
-      - task2/3: w_ad (as in your current pipeline)
+      - task2/3: unweighted
     """
     W = np.ones((len(df_lab), 4), dtype=np.float32)
     for t in range(4):
-        col = WEIGHT_COLS[t]
-        if col in df_lab.columns:
+        col = WEIGHT_COLS.get(t)
+        if col and col in df_lab.columns:
             w = df_lab[col].astype(float).fillna(1.0).to_numpy()
             W[:, t] = w.astype(np.float32)
     return np.clip(W, 0.0, np.inf)
@@ -1310,7 +1310,7 @@ def main():
     print(f"[DATA-2D] n_ids={len(ids_all)} | X2d_dim={X2d_scaled.shape[1]}")
     print(f"[DATALOADER] num_workers={num_workers} pin_memory={pin_memory} precision={args.precision}")
     print(f"[EARLYSTOP] patience={int(args.patience)} (validation checks)")
-    print(f"[WEIGHTS] task0={WEIGHT_COLS[0]} task1={WEIGHT_COLS[1]} task2={WEIGHT_COLS[2]} task3={WEIGHT_COLS[3]}")
+    print(f"[WEIGHTS] task0={WEIGHT_COLS[0]} task1={WEIGHT_COLS[1]} task2=None task3=None")
     print(f"[WEIGHTS] global means: w0={float(np.mean(w_cls[:,0])):.3f} w1={float(np.mean(w_cls[:,1])):.3f}")
 
     sampler = optuna.samplers.TPESampler(seed=args.seed)

@@ -128,6 +128,8 @@ class MILModelBuilder:
                     else None
                 ),
             ),
+            objective_mode=str(config.objective.mode),
+            objective_min_w=float(config.objective.min_w),
         )
         return MILTaskAttnMixerWithAux.from_config(
             config=model_cfg,

@@ -25,11 +25,11 @@ from ..utils.ops import (
     build_bitmask_group_definition,
     build_aux_targets_and_masks,
     build_aux_weights,
+    build_sampler_diagnostics_df,
     build_task_weights,
     coerce_binary_labels,
     fit_standardizer,
     make_balanced_batch_sampler,
-    make_bitmask_sample_weights,
     make_weighted_sampler,
     pos_weight_per_task,
     set_all_seeds,
@@ -860,13 +860,6 @@ class MILFoldTrainer:
         y_fluo_sc = apply_standardizer(self.data.y_fluo, mu_f, sd_f)
 
         w_cls_tr = np.asarray(self.data.w_cls[train_idx], dtype=np.float32).copy()
-        if bool(cfg.sampler.use_bitmask_loss_weight):
-            bitmask_w = make_bitmask_sample_weights(
-                self.data.y_cls[train_idx],
-                alpha=float(cfg.sampler.bitmask_weight_alpha),
-                cap=float(cfg.sampler.bitmask_weight_cap),
-            )
-            w_cls_tr = (w_cls_tr * bitmask_w.reshape(-1, 1)).astype(np.float32)
 
         ids_tr = [self.data.ids[i] for i in train_idx]
         ids_va = [self.data.ids[i] for i in val_idx]
@@ -935,10 +928,6 @@ class MILFoldTrainer:
                 sample_weight_cap=float(cfg.sampler.sample_weight_cap),
                 batch_pos_fraction=float(cfg.sampler.batch_pos_fraction),
                 min_pos_per_batch=int(cfg.sampler.min_pos_per_batch),
-                enforce_bitmask_quota=bool(cfg.sampler.enforce_bitmask_quota),
-                quota_t450_per_256=int(cfg.sampler.quota_t450_per_256),
-                quota_fgt480_per_256=int(cfg.sampler.quota_fgt480_per_256),
-                quota_multi_per_256=int(cfg.sampler.quota_multi_per_256),
                 rare_prev_thr=cfg.sampler.rare_prev_thr,
                 seed=int(self.run_config.seed) + 1000 * int(fold_id) + int(self.trial.number),
             )
@@ -963,6 +952,35 @@ class MILFoldTrainer:
                 sampler=sampler,
                 collate_fn=collate_train,
             )
+        sampler_diag_dir = self.run_config.ckpt_root.parent / "sampler_diagnostics"
+        sampler_diag_dir.mkdir(parents=True, exist_ok=True)
+        sampler_diag_path = sampler_diag_dir / (
+            f"hpo_trial{int(self.trial.number):05d}_fold{int(fold_id):02d}_sampler_diagnostics.csv"
+        )
+        sampler_diag_df = build_sampler_diagnostics_df(
+            y=self.data.y_cls[train_idx],
+            batch_size=int(cfg.runtime.batch_size),
+            use_balanced_batch_sampler=bool(cfg.sampler.use_balanced_batch_sampler),
+            rare_mult=float(cfg.sampler.rare_oversample_mult),
+            rare_target_prev=float(cfg.sampler.rare_target_prev),
+            sample_weight_cap=float(cfg.sampler.sample_weight_cap),
+            batch_pos_fraction=float(cfg.sampler.batch_pos_fraction),
+            min_pos_per_batch=int(cfg.sampler.min_pos_per_batch),
+            rare_prev_thr=cfg.sampler.rare_prev_thr,
+            seed=int(self.run_config.seed) + 1000 * int(fold_id) + int(self.trial.number),
+        )
+        sampler_diag_df.to_csv(sampler_diag_path, index=False)
+        _diag_pick = sampler_diag_df.set_index(["section", "metric"])["value"].to_dict()
+        log_event(
+            "INFO",
+            "hpo.fold.sampler_diagnostics",
+            trial=int(self.trial.number),
+            fold=int(fold_id),
+            path=str(sampler_diag_path),
+            sampler_mode=str("balanced_batch" if bool(cfg.sampler.use_balanced_batch_sampler) else "weighted_sampler"),
+            mean_pos_per_batch=f"{float(_diag_pick.get(('summary', 'mean_pos_per_batch'), float('nan'))):.3f}",
+            duplicate_rate=f"{float(_diag_pick.get(('summary', 'duplicate_rate'), float('nan'))):.6f}",
+        )
         dl_va = self.loader_builder.eval_loader(
             ds_va,
             batch_size=min(128, int(cfg.runtime.batch_size)),
@@ -1049,8 +1067,14 @@ class MILFoldTrainer:
             best_macro, best_aps, best_macro_auc, best_aucs = evaluator.eval_best_epoch(model, dl_va)
         best_min = float(np.min(best_aps))
 
+        objective_mode = str(cfg.objective.mode)
         min_w = float(cfg.objective.min_w)
-        fold_score = float((1.0 - min_w) * float(best_macro) + min_w * best_min)
+        if objective_mode in {"macro_pr_auc", "macro_ap"}:
+            fold_score = float(best_macro)
+        elif objective_mode == "macro_plus_min":
+            fold_score = float((1.0 - min_w) * float(best_macro) + min_w * best_min)
+        else:
+            raise ValueError(f"Unsupported objective_mode={objective_mode}")
 
         banner = str(run_tag).strip().replace("_", "-").upper()
         if not banner:
@@ -1085,6 +1109,7 @@ class MILFoldTrainer:
             "trained_epochs": epochs_trained,
             "best_epoch": best_epoch,
             "best_ckpt_path": best_ckpt_path,
+            "objective_macro_ap": float(best_macro),
             "macro_ap_best_epoch": float(best_macro),
             "macro_pr_auc_best_epoch": float(best_macro),
             "macro_auc_best_epoch": float(best_macro_auc),
@@ -1179,9 +1204,10 @@ def _persist_trial_best_epoch_artifacts(
 
     payload = {
         "trial_number": int(trial.number),
-        "objective_value_macro_plus_min_cv": float(mean_score),
+        "objective_value_cv": float(mean_score),
         "best_fold_id": str(best_fold_id),
-        "best_fold_score": float(best_fold_score),
+        "best_fold_objective_value": float(best_fold_score),
+        "objective_mode": str(best_fold_payload.get("objective_mode", "unknown")),
         "best_epoch": best_fold_payload.get("best_epoch"),
         "best_ckpt_path": best_fold_payload.get("best_ckpt_path"),
         "params": dict(params),
@@ -1223,9 +1249,10 @@ class MILCrossValidator:
         log_event("START", "hpo.trial.evaluate", trial=int(trial.number))
         params = search_space(trial)
         cfg = HPOConfig.from_params(params)
-        if str(cfg.objective.mode) != "macro_plus_min":
+        if str(cfg.objective.mode) not in {"macro_pr_auc", "macro_ap", "macro_plus_min"}:
             raise ValueError(
-                f"Unsupported objective_mode={cfg.objective.mode}; only macro_plus_min is allowed."
+                f"Unsupported objective_mode={cfg.objective.mode}; "
+                "allowed values are macro_pr_auc, macro_ap, macro_plus_min."
             )
 
         fold_runner = MILFoldTrainer(
@@ -1245,12 +1272,17 @@ class MILCrossValidator:
                 cv_step=int(step),
                 fold=int(fold_id),
             )
-            fold_score, detail = fold_runner.run_fold(
+            _fold_score, detail = fold_runner.run_fold(
                 train_idx=np.asarray(tr, dtype=np.int64),
                 val_idx=np.asarray(va, dtype=np.int64),
                 fold_id=int(fold_id),
             )
-            scores.append(float(fold_score))
+            objective_mode = str(cfg.objective.mode)
+            if objective_mode in {"macro_pr_auc", "macro_ap"}:
+                trial_score = float(detail.get("macro_pr_auc_best_epoch", detail.get("macro_ap_best_epoch", 0.0)))
+            else:
+                trial_score = float(_fold_score)
+            scores.append(float(trial_score))
             fold_detail[str(fold_id)] = detail
 
             trial.report(float(np.mean(scores)), step=step)
@@ -1507,16 +1539,6 @@ class MILFinalTrainer:
         posw = pos_weight_per_task(y_tr, clip=compute_posw_clips(cfg.loss, fallback_clip=50.0))
         gamma_t = compute_gamma(cfg.loss)
 
-        if bool(cfg.sampler.use_bitmask_loss_weight):
-            bitmask_w_tr = make_bitmask_sample_weights(
-                y_tr,
-                alpha=float(cfg.sampler.bitmask_weight_alpha),
-                cap=float(cfg.sampler.bitmask_weight_cap),
-            )
-            w_tr = (np.asarray(w_tr, dtype=np.float32) * bitmask_w_tr.reshape(-1, 1)).astype(
-                np.float32
-            )
-
         bitmask_group_top_ids, bitmask_group_class_weight = build_bitmask_group_definition(
             y_tr,
             top_k=int(cfg.loss.bitmask_group_top_k),
@@ -1687,10 +1709,6 @@ class MILFinalTrainer:
                 sample_weight_cap=float(cfg.sampler.sample_weight_cap),
                 batch_pos_fraction=float(cfg.sampler.batch_pos_fraction),
                 min_pos_per_batch=int(cfg.sampler.min_pos_per_batch),
-                enforce_bitmask_quota=bool(cfg.sampler.enforce_bitmask_quota),
-                quota_t450_per_256=int(cfg.sampler.quota_t450_per_256),
-                quota_fgt480_per_256=int(cfg.sampler.quota_fgt480_per_256),
-                quota_multi_per_256=int(cfg.sampler.quota_multi_per_256),
                 rare_prev_thr=cfg.sampler.rare_prev_thr,
                 seed=int(self.config.seed) + 4242,
             )
@@ -1714,6 +1732,29 @@ class MILFinalTrainer:
                 sampler=sampler_tr,
                 collate_fn=collate_train,
             )
+        sampler_diag_path = final_dir / "sampler_diagnostics.csv"
+        sampler_diag_df = build_sampler_diagnostics_df(
+            y=y_tr,
+            batch_size=int(cfg.runtime.batch_size),
+            use_balanced_batch_sampler=bool(cfg.sampler.use_balanced_batch_sampler),
+            rare_mult=float(cfg.sampler.rare_oversample_mult),
+            rare_target_prev=float(cfg.sampler.rare_target_prev),
+            sample_weight_cap=float(cfg.sampler.sample_weight_cap),
+            batch_pos_fraction=float(cfg.sampler.batch_pos_fraction),
+            min_pos_per_batch=int(cfg.sampler.min_pos_per_batch),
+            rare_prev_thr=cfg.sampler.rare_prev_thr,
+            seed=int(self.config.seed) + 4242,
+        )
+        sampler_diag_df.to_csv(sampler_diag_path, index=False)
+        _diag_pick = sampler_diag_df.set_index(["section", "metric"])["value"].to_dict()
+        log_event(
+            "INFO",
+            "final.sampler_diagnostics",
+            path=str(sampler_diag_path),
+            sampler_mode=str("balanced_batch" if bool(cfg.sampler.use_balanced_batch_sampler) else "weighted_sampler"),
+            mean_pos_per_batch=f"{float(_diag_pick.get(('summary', 'mean_pos_per_batch'), float('nan'))):.3f}",
+            duplicate_rate=f"{float(_diag_pick.get(('summary', 'duplicate_rate'), float('nan'))):.6f}",
+        )
         dl_val = self.loader_builder.eval_loader(
             ds_lb,
             batch_size=min(128, int(cfg.runtime.batch_size)),

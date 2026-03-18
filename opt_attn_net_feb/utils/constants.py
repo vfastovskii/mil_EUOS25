@@ -19,8 +19,8 @@ AUX_FLUO_BASE_COLS = ["wl_pred_nm", "qy_pred"]
 WEIGHT_COLS = {
     0: "sample_weight_340",
     1: "sample_weight_450",
-    2: "w_ad",
-    3: "w_ad",
+    2: None,
+    3: None,
 }
 
 # Non-feature columns per modality

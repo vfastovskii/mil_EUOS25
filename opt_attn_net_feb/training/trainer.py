@@ -79,8 +79,9 @@ class LightningTrainerFactory:
         trial: Optional["optuna.trial.Trial"] = None,
         extra_callbacks: Optional[List[Callback]] = None,
     ) -> Tuple[pl.Trainer, Optional[pl.callbacks.ModelCheckpoint]]:
+        monitor_metric = "val_objective_ap"
         es = pl.callbacks.EarlyStopping(
-            monitor="val_macro_ap",
+            monitor=monitor_metric,
             mode="max",
             patience=int(self.config.patience),
         )
@@ -90,7 +91,7 @@ class LightningTrainerFactory:
             ckpt = pl.callbacks.ModelCheckpoint(
                 dirpath=ckpt_dir,
                 filename="best",
-                monitor="val_macro_ap",
+                monitor=monitor_metric,
                 mode="max",
                 save_top_k=1,
                 save_last=False,
@@ -99,7 +100,7 @@ class LightningTrainerFactory:
             )
             callbacks.append(ckpt)
         if trial is not None:
-            callbacks.append(OptunaPruningCallbackLocal(trial, monitor="val_macro_ap"))
+            callbacks.append(OptunaPruningCallbackLocal(trial, monitor=monitor_metric))
         if extra_callbacks:
             callbacks.extend(list(extra_callbacks))
 

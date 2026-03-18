@@ -1716,6 +1716,28 @@ def _parse_args(argv: Any | None = None):
         help="Post-hoc calibration method for family probabilities on leaderboard.",
     )
     ap.add_argument(
+        "--skip_family_calibration",
+        action="store_true",
+        help=(
+            "In --run_family_suite mode, skip post-hoc calibration and use identity probabilities "
+            "for downstream outputs."
+        ),
+    )
+    ap.add_argument(
+        "--skip_family_explainability",
+        action="store_true",
+        help=(
+            "In --run_family_suite mode, skip explainability/attention export artifacts for final MIL runs."
+        ),
+    )
+    ap.add_argument(
+        "--skip_family_blending",
+        action="store_true",
+        help=(
+            "In --run_family_suite mode, skip OOF/leaderboard blending and write single-model outputs only."
+        ),
+    )
+    ap.add_argument(
         "--catboost_hpo_parallel_tasks",
         type=int,
         default=1,
@@ -2279,6 +2301,9 @@ def main(argv: Any | None = None) -> None:
                 study_dir=str(args.study_dir),
                 families=[str(x) for x in (args.model_families or [])],
                 calibration_method=str(args.calibration_method),
+                skip_family_explainability=bool(getattr(args, "skip_family_explainability", False)),
+                skip_family_calibration=bool(getattr(args, "skip_family_calibration", False)),
+                skip_family_blending=bool(getattr(args, "skip_family_blending", False)),
             )
             run_family_suite(args)
             return
