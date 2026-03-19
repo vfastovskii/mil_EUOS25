@@ -64,6 +64,19 @@ def _normalize_conf_id(value: Any) -> str:
     return s
 
 
+def _sampler_diag_lookup(df: pd.DataFrame) -> Dict[Tuple[Any, ...], float]:
+    lookup: Dict[Tuple[Any, ...], float] = {}
+    for row in df.itertuples(index=False):
+        section = str(row.section)
+        metric = str(row.metric)
+        task_idx = getattr(row, "task_idx", "")
+        if section == "task" and str(task_idx) != "":
+            lookup[(section, metric, int(task_idx))] = float(row.value)
+        else:
+            lookup[(section, metric)] = float(row.value)
+    return lookup
+
+
 def _load_conformer_signature_maps(
     *,
     signature_csv: str | None,
@@ -852,6 +865,24 @@ class MILFoldTrainer:
             clip=compute_posw_clips(cfg.loss),
         )
         gamma_t = compute_gamma(cfg.loss)
+        log_event(
+            "INFO",
+            "hpo.fold.loss_weighting",
+            trial=int(self.trial.number),
+            fold=int(fold_id),
+            lam_t0=float(lam[0]),
+            lam_t1=float(lam[1]),
+            lam_t2=float(lam[2]),
+            lam_t3=float(lam[3]),
+            pos_weight_t0=float(posw[0].item()),
+            pos_weight_t1=float(posw[1].item()),
+            pos_weight_t2=float(posw[2].item()),
+            pos_weight_t3=float(posw[3].item()),
+            gamma_t0=float(gamma_t[0].item()),
+            gamma_t1=float(gamma_t[1].item()),
+            gamma_t2=float(gamma_t[2].item()),
+            gamma_t3=float(gamma_t[3].item()),
+        )
 
         log_event("INFO", "hpo.fold.standardize_aux_targets", trial=int(self.trial.number), fold=int(fold_id))
         mu_abs, sd_abs = fit_standardizer(self.data.y_abs, self.data.m_abs, train_idx)
@@ -917,6 +948,11 @@ class MILFoldTrainer:
             fold=int(fold_id),
             batch_size=int(cfg.runtime.batch_size),
             balanced_sampler=bool(cfg.sampler.use_balanced_batch_sampler),
+            rare_mult=float(cfg.sampler.rare_oversample_mult),
+            rare_target_prev=float(cfg.sampler.rare_target_prev),
+            sample_weight_cap=float(cfg.sampler.sample_weight_cap),
+            batch_pos_fraction=float(cfg.sampler.batch_pos_fraction),
+            min_pos_per_batch=int(cfg.sampler.min_pos_per_batch),
             run_tag=str(run_tag),
         )
         if bool(cfg.sampler.use_balanced_batch_sampler):
@@ -970,7 +1006,7 @@ class MILFoldTrainer:
             seed=int(self.run_config.seed) + 1000 * int(fold_id) + int(self.trial.number),
         )
         sampler_diag_df.to_csv(sampler_diag_path, index=False)
-        _diag_pick = sampler_diag_df.set_index(["section", "metric"])["value"].to_dict()
+        _diag_pick = _sampler_diag_lookup(sampler_diag_df)
         log_event(
             "INFO",
             "hpo.fold.sampler_diagnostics",
@@ -978,9 +1014,29 @@ class MILFoldTrainer:
             fold=int(fold_id),
             path=str(sampler_diag_path),
             sampler_mode=str("balanced_batch" if bool(cfg.sampler.use_balanced_batch_sampler) else "weighted_sampler"),
+            dataset_any_positive_prevalence=f"{float(_diag_pick.get(('summary', 'dataset_any_positive_prevalence'), float('nan'))):.6f}",
+            sampled_any_positive_prevalence=f"{float(_diag_pick.get(('summary', 'sampled_any_positive_prevalence'), float('nan'))):.6f}",
             mean_pos_per_batch=f"{float(_diag_pick.get(('summary', 'mean_pos_per_batch'), float('nan'))):.3f}",
+            mean_neg_per_batch=f"{float(_diag_pick.get(('summary', 'mean_neg_per_batch'), float('nan'))):.3f}",
+            mean_unique_per_batch=f"{float(_diag_pick.get(('summary', 'mean_unique_per_batch'), float('nan'))):.3f}",
             duplicate_rate=f"{float(_diag_pick.get(('summary', 'duplicate_rate'), float('nan'))):.6f}",
+            unique_row_coverage_rate=f"{float(_diag_pick.get(('summary', 'unique_row_coverage_rate'), float('nan'))):.6f}",
         )
+        for task_idx, task_name in enumerate(TASK_COLS):
+            log_event(
+                "INFO",
+                "hpo.fold.sampler_diagnostics.task",
+                trial=int(self.trial.number),
+                fold=int(fold_id),
+                task_idx=int(task_idx),
+                task=str(task_name),
+                dataset_prevalence=f"{float(_diag_pick.get(('task', 'dataset_prevalence', task_idx), float('nan'))):.6f}",
+                sampled_prevalence=f"{float(_diag_pick.get(('task', 'sampled_prevalence', task_idx), float('nan'))):.6f}",
+                exposure_lift=f"{float(_diag_pick.get(('task', 'exposure_lift', task_idx), float('nan'))):.6f}",
+                batch_hit_rate=f"{float(_diag_pick.get(('task', 'batch_hit_rate', task_idx), float('nan'))):.6f}",
+                unique_positive_coverage_rate=f"{float(_diag_pick.get(('task', 'unique_positive_coverage_rate', task_idx), float('nan'))):.6f}",
+                positive_draws_per_positive_sample=f"{float(_diag_pick.get(('task', 'positive_draws_per_positive_sample', task_idx), float('nan'))):.6f}",
+            )
         dl_va = self.loader_builder.eval_loader(
             ds_va,
             batch_size=min(128, int(cfg.runtime.batch_size)),
@@ -1013,6 +1069,14 @@ class MILFoldTrainer:
             bitmask_group_top_ids=bitmask_group_top_ids,
             bitmask_group_class_weight=bitmask_group_class_weight,
         )
+        log_event(
+            "INFO",
+            "hpo.fold.model_training_setup",
+            trial=int(self.trial.number),
+            fold=int(fold_id),
+            run_tag=str(run_tag),
+            **model.get_training_debug_summary(),
+        )
 
         fold_ckpt_dir = self.run_config.ckpt_root / f"mil_trial{self.trial.number}_fold{fold_id}"
         fold_ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -1027,6 +1091,19 @@ class MILFoldTrainer:
             # Save fold-best checkpoint so each trial can persist best-epoch params.
             save_checkpoint=True,
             save_weights_only=True,
+        )
+        log_event(
+            "INFO",
+            "hpo.fold.trainer_plan",
+            trial=int(self.trial.number),
+            fold=int(fold_id),
+            run_tag=str(run_tag),
+            max_epochs=int(trainer_cfg.max_epochs),
+            patience=int(trainer_cfg.patience),
+            accumulate_grad_batches=int(trainer_cfg.accumulate_grad_batches),
+            accelerator=str(trainer_cfg.accelerator),
+            devices=int(trainer_cfg.devices),
+            precision=str(trainer_cfg.precision),
         )
         trainer, ckpt_cb = LightningTrainerFactory(trainer_cfg).build(
             ckpt_dir=str(fold_ckpt_dir),
@@ -1244,11 +1321,72 @@ class MILCrossValidator:
     def __init__(self, *, data: MILCVData, run_config: CVRunConfig):
         self.data = data
         self.run_config = run_config
+        self.full_cv_warmup_trials = 5
+        self._focus_fold_id: int | None = None
+        self._focus_fold_source_trials: int = 0
+
+    def _resolve_eval_folds(
+        self,
+        *,
+        trial: Trial,
+    ) -> tuple[list[tuple[np.ndarray, np.ndarray, int]], str, int | None, int]:
+        all_folds = list(self.data.folds_info)
+        n_all_folds = int(len(all_folds))
+        warmup_trials = int(max(0, self.full_cv_warmup_trials))
+        if int(trial.number) < warmup_trials:
+            return all_folds, "full_cv_warmup", None, 0
+        if self._focus_fold_id is None:
+            completed = trial.study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,))
+            fold_scores: Dict[int, List[float]] = {}
+            n_source_trials = 0
+            for prev in completed:
+                if str(prev.user_attrs.get("hpo_eval_mode", "")) != "full_cv_warmup":
+                    continue
+                fold_detail = prev.user_attrs.get("fold_detail", {})
+                if not isinstance(fold_detail, Mapping) or len(fold_detail) != n_all_folds:
+                    continue
+                valid_trial = True
+                for fold_id_str, payload in fold_detail.items():
+                    if not isinstance(payload, Mapping):
+                        valid_trial = False
+                        break
+                    if "objective_value" in payload:
+                        score = float(payload["objective_value"])
+                    elif "score" in payload:
+                        score = float(payload["score"])
+                    else:
+                        valid_trial = False
+                        break
+                    fold_scores.setdefault(int(fold_id_str), []).append(float(score))
+                if valid_trial:
+                    n_source_trials += 1
+            if n_source_trials > 0 and len(fold_scores) == n_all_folds:
+                self._focus_fold_id = int(
+                    min(
+                        sorted(fold_scores),
+                        key=lambda fid: float(np.mean(np.asarray(fold_scores[int(fid)], dtype=np.float64))),
+                    )
+                )
+                self._focus_fold_source_trials = int(n_source_trials)
+            else:
+                return all_folds, "full_cv_fallback", None, int(n_source_trials)
+        selected = [fold for fold in all_folds if int(fold[2]) == int(self._focus_fold_id)]
+        if len(selected) == 0:
+            return all_folds, "full_cv_fallback", None, int(self._focus_fold_source_trials)
+        return selected, "focus_fold_only", int(self._focus_fold_id), int(self._focus_fold_source_trials)
 
     def evaluate_trial(self, trial: Trial) -> float:
         log_event("START", "hpo.trial.evaluate", trial=int(trial.number))
         params = search_space(trial)
         cfg = HPOConfig.from_params(params)
+        log_event(
+            "INFO",
+            "hpo.trial.params",
+            trial=int(trial.number),
+            objective_mode=str(cfg.objective.mode),
+            objective_min_w=float(cfg.objective.min_w),
+            params_json=json.dumps(params, sort_keys=True),
+        )
         if str(cfg.objective.mode) not in {"macro_pr_auc", "macro_ap", "macro_plus_min"}:
             raise ValueError(
                 f"Unsupported objective_mode={cfg.objective.mode}; "
@@ -1261,10 +1399,27 @@ class MILCrossValidator:
             data=self.data,
             run_config=self.run_config,
         )
+        eval_folds, eval_mode, selected_fold_id, source_trials = self._resolve_eval_folds(trial=trial)
+        trial.set_user_attr("hpo_eval_mode", str(eval_mode))
+        trial.set_user_attr(
+            "hpo_eval_fold_id",
+            (None if selected_fold_id is None else int(selected_fold_id)),
+        )
+        trial.set_user_attr("hpo_eval_fold_source_trials", int(source_trials))
+        log_event(
+            "INFO",
+            "hpo.trial.fold_strategy",
+            trial=int(trial.number),
+            eval_mode=str(eval_mode),
+            warmup_full_cv_trials=int(self.full_cv_warmup_trials),
+            n_eval_folds=int(len(eval_folds)),
+            selected_fold=("all" if selected_fold_id is None else int(selected_fold_id)),
+            source_trials=int(source_trials),
+        )
 
         scores: List[float] = []
         fold_detail: Dict[str, Any] = {}
-        for step, (tr, va, fold_id) in enumerate(self.data.folds_info):
+        for step, (tr, va, fold_id) in enumerate(eval_folds):
             log_event(
                 "INFO",
                 "hpo.trial.fold_start",
@@ -1538,6 +1693,22 @@ class MILFinalTrainer:
         )
         posw = pos_weight_per_task(y_tr, clip=compute_posw_clips(cfg.loss, fallback_clip=50.0))
         gamma_t = compute_gamma(cfg.loss)
+        log_event(
+            "INFO",
+            "final.loss_weighting",
+            lam_t0=float(lam[0]),
+            lam_t1=float(lam[1]),
+            lam_t2=float(lam[2]),
+            lam_t3=float(lam[3]),
+            pos_weight_t0=float(posw[0].item()),
+            pos_weight_t1=float(posw[1].item()),
+            pos_weight_t2=float(posw[2].item()),
+            pos_weight_t3=float(posw[3].item()),
+            gamma_t0=float(gamma_t[0].item()),
+            gamma_t1=float(gamma_t[1].item()),
+            gamma_t2=float(gamma_t[2].item()),
+            gamma_t3=float(gamma_t[3].item()),
+        )
 
         bitmask_group_top_ids, bitmask_group_class_weight = build_bitmask_group_definition(
             y_tr,
@@ -1746,15 +1917,33 @@ class MILFinalTrainer:
             seed=int(self.config.seed) + 4242,
         )
         sampler_diag_df.to_csv(sampler_diag_path, index=False)
-        _diag_pick = sampler_diag_df.set_index(["section", "metric"])["value"].to_dict()
+        _diag_pick = _sampler_diag_lookup(sampler_diag_df)
         log_event(
             "INFO",
             "final.sampler_diagnostics",
             path=str(sampler_diag_path),
             sampler_mode=str("balanced_batch" if bool(cfg.sampler.use_balanced_batch_sampler) else "weighted_sampler"),
+            dataset_any_positive_prevalence=f"{float(_diag_pick.get(('summary', 'dataset_any_positive_prevalence'), float('nan'))):.6f}",
+            sampled_any_positive_prevalence=f"{float(_diag_pick.get(('summary', 'sampled_any_positive_prevalence'), float('nan'))):.6f}",
             mean_pos_per_batch=f"{float(_diag_pick.get(('summary', 'mean_pos_per_batch'), float('nan'))):.3f}",
+            mean_neg_per_batch=f"{float(_diag_pick.get(('summary', 'mean_neg_per_batch'), float('nan'))):.3f}",
+            mean_unique_per_batch=f"{float(_diag_pick.get(('summary', 'mean_unique_per_batch'), float('nan'))):.3f}",
             duplicate_rate=f"{float(_diag_pick.get(('summary', 'duplicate_rate'), float('nan'))):.6f}",
+            unique_row_coverage_rate=f"{float(_diag_pick.get(('summary', 'unique_row_coverage_rate'), float('nan'))):.6f}",
         )
+        for task_idx, task_name in enumerate(TASK_COLS):
+            log_event(
+                "INFO",
+                "final.sampler_diagnostics.task",
+                task_idx=int(task_idx),
+                task=str(task_name),
+                dataset_prevalence=f"{float(_diag_pick.get(('task', 'dataset_prevalence', task_idx), float('nan'))):.6f}",
+                sampled_prevalence=f"{float(_diag_pick.get(('task', 'sampled_prevalence', task_idx), float('nan'))):.6f}",
+                exposure_lift=f"{float(_diag_pick.get(('task', 'exposure_lift', task_idx), float('nan'))):.6f}",
+                batch_hit_rate=f"{float(_diag_pick.get(('task', 'batch_hit_rate', task_idx), float('nan'))):.6f}",
+                unique_positive_coverage_rate=f"{float(_diag_pick.get(('task', 'unique_positive_coverage_rate', task_idx), float('nan'))):.6f}",
+                positive_draws_per_positive_sample=f"{float(_diag_pick.get(('task', 'positive_draws_per_positive_sample', task_idx), float('nan'))):.6f}",
+            )
         dl_val = self.loader_builder.eval_loader(
             ds_lb,
             batch_size=min(128, int(cfg.runtime.batch_size)),
@@ -1798,6 +1987,7 @@ class MILFinalTrainer:
             bitmask_group_top_ids=bitmask_group_top_ids,
             bitmask_group_class_weight=bitmask_group_class_weight,
         )
+        log_event("INFO", "final.model_training_setup", **model.get_training_debug_summary())
 
         if rl_active and explain_cfg is not None and chem_bundle is not None:
             train_set = {str(x) for x in ids_tr}
@@ -1898,6 +2088,16 @@ class MILFinalTrainer:
             # Keep a single best checkpoint for the final run only.
             save_checkpoint=True,
             save_weights_only=True,
+        )
+        log_event(
+            "INFO",
+            "final.trainer_plan",
+            max_epochs=int(trainer_cfg.max_epochs),
+            patience=int(trainer_cfg.patience),
+            accumulate_grad_batches=int(trainer_cfg.accumulate_grad_batches),
+            accelerator=str(trainer_cfg.accelerator),
+            devices=int(trainer_cfg.devices),
+            precision=str(trainer_cfg.precision),
         )
         trainer, ckpt_cb = LightningTrainerFactory(trainer_cfg).build(
             ckpt_dir=str(final_dir),

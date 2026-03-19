@@ -64,6 +64,19 @@ from ..utils.progress import log_event, log_step
 FAMILY_CHOICES: tuple[str, ...] = ("catboost_st", "mt_2d", "mt_2d3d", "mt_3d")
 
 
+def _sampler_diag_lookup(df: pd.DataFrame) -> Dict[Tuple[Any, ...], float]:
+    lookup: Dict[Tuple[Any, ...], float] = {}
+    for row in df.itertuples(index=False):
+        section = str(row.section)
+        metric = str(row.metric)
+        task_idx = getattr(row, "task_idx", "")
+        if section == "task" and str(task_idx) != "":
+            lookup[(section, metric, int(task_idx))] = float(row.value)
+        else:
+            lookup[(section, metric)] = float(row.value)
+    return lookup
+
+
 def _mean_sd_ci95(values: np.ndarray) -> tuple[float, float, float, float, float]:
     arr = np.asarray(values, dtype=np.float64).reshape(-1)
     arr = arr[np.isfinite(arr)]
@@ -713,6 +726,59 @@ class _MILMacroCrossValidator:
         self.data = data
         self.run_config = run_config
         self.family = str(family)
+        self.full_cv_warmup_trials = 5
+        self._focus_fold_id: int | None = None
+        self._focus_fold_source_trials: int = 0
+
+    def _resolve_eval_folds(
+        self,
+        *,
+        trial: optuna.Trial,
+    ) -> tuple[list[tuple[np.ndarray, np.ndarray, int]], str, int | None, int]:
+        all_folds = list(self.data.folds_info)
+        n_all_folds = int(len(all_folds))
+        warmup_trials = int(max(0, self.full_cv_warmup_trials))
+        if int(trial.number) < warmup_trials:
+            return all_folds, "full_cv_warmup", None, 0
+        if self._focus_fold_id is None:
+            completed = trial.study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,))
+            fold_scores: Dict[int, List[float]] = {}
+            n_source_trials = 0
+            for prev in completed:
+                if str(prev.user_attrs.get("hpo_eval_mode", "")) != "full_cv_warmup":
+                    continue
+                fold_detail = prev.user_attrs.get("fold_detail", {})
+                if not isinstance(fold_detail, Mapping) or len(fold_detail) != n_all_folds:
+                    continue
+                valid_trial = True
+                for fold_id_str, payload in fold_detail.items():
+                    if not isinstance(payload, Mapping):
+                        valid_trial = False
+                        break
+                    if "objective_value" in payload:
+                        score = float(payload["objective_value"])
+                    elif "score" in payload:
+                        score = float(payload["score"])
+                    else:
+                        valid_trial = False
+                        break
+                    fold_scores.setdefault(int(fold_id_str), []).append(float(score))
+                if valid_trial:
+                    n_source_trials += 1
+            if n_source_trials > 0 and len(fold_scores) == n_all_folds:
+                self._focus_fold_id = int(
+                    min(
+                        sorted(fold_scores),
+                        key=lambda fid: float(np.mean(np.asarray(fold_scores[int(fid)], dtype=np.float64))),
+                    )
+                )
+                self._focus_fold_source_trials = int(n_source_trials)
+            else:
+                return all_folds, "full_cv_fallback", None, int(n_source_trials)
+        selected = [fold for fold in all_folds if int(fold[2]) == int(self._focus_fold_id)]
+        if len(selected) == 0:
+            return all_folds, "full_cv_fallback", None, int(self._focus_fold_source_trials)
+        return selected, "focus_fold_only", int(self._focus_fold_id), int(self._focus_fold_source_trials)
 
     def evaluate_trial(self, trial: optuna.Trial) -> float:
         log_event("START", "family.hpo.trial.evaluate", trial=int(trial.number), family=str(self.family))
@@ -720,6 +786,15 @@ class _MILMacroCrossValidator:
         # Keep fixed objective weighting across MIL-family trials.
         params["min_w"] = 0.4
         cfg = HPOConfig.from_params(params)
+        log_event(
+            "INFO",
+            "family.hpo.trial.params",
+            trial=int(trial.number),
+            family=str(self.family),
+            objective_mode=str(cfg.objective.mode),
+            objective_min_w=float(cfg.objective.min_w),
+            params_json=json.dumps(params, sort_keys=True),
+        )
 
         fold_runner = MILFoldTrainer(
             trial=trial,
@@ -727,9 +802,27 @@ class _MILMacroCrossValidator:
             data=self.data,
             run_config=self.run_config,
         )
+        eval_folds, eval_mode, selected_fold_id, source_trials = self._resolve_eval_folds(trial=trial)
+        trial.set_user_attr("hpo_eval_mode", str(eval_mode))
+        trial.set_user_attr(
+            "hpo_eval_fold_id",
+            (None if selected_fold_id is None else int(selected_fold_id)),
+        )
+        trial.set_user_attr("hpo_eval_fold_source_trials", int(source_trials))
+        log_event(
+            "INFO",
+            "family.hpo.trial.fold_strategy",
+            trial=int(trial.number),
+            family=str(self.family),
+            eval_mode=str(eval_mode),
+            warmup_full_cv_trials=int(self.full_cv_warmup_trials),
+            n_eval_folds=int(len(eval_folds)),
+            selected_fold=("all" if selected_fold_id is None else int(selected_fold_id)),
+            source_trials=int(source_trials),
+        )
         fold_scores: List[float] = []
         fold_detail: Dict[str, Any] = {}
-        for step, (tr, va, fold_id) in enumerate(self.data.folds_info):
+        for step, (tr, va, fold_id) in enumerate(eval_folds):
             try:
                 fold_score, detail = fold_runner.run_fold(
                     train_idx=np.asarray(tr, dtype=np.int64),
@@ -1184,6 +1277,24 @@ def _run_mil_final_train_and_predict(
         clip=compute_posw_clips(hpo_cfg.loss),
     )
     gamma_t = compute_gamma(hpo_cfg.loss)
+    log_event(
+        "INFO",
+        "family.final.mil.loss_weighting",
+        family=str(family_data.family),
+        output_prefix=str(output_prefix),
+        lam_t0=float(lam[0]),
+        lam_t1=float(lam[1]),
+        lam_t2=float(lam[2]),
+        lam_t3=float(lam[3]),
+        pos_weight_t0=float(posw[0].item()),
+        pos_weight_t1=float(posw[1].item()),
+        pos_weight_t2=float(posw[2].item()),
+        pos_weight_t3=float(posw[3].item()),
+        gamma_t0=float(gamma_t[0].item()),
+        gamma_t1=float(gamma_t[1].item()),
+        gamma_t2=float(gamma_t[2].item()),
+        gamma_t3=float(gamma_t[3].item()),
+    )
 
     train_idx_all = np.arange(len(family_data.y_abs_train), dtype=np.int64)
     mu_abs, sd_abs = fit_standardizer(
@@ -1323,6 +1434,13 @@ def _run_mil_final_train_and_predict(
         bitmask_group_top_ids=bitmask_group_top_ids,
         bitmask_group_class_weight=bitmask_group_class_weight,
     )
+    log_event(
+        "INFO",
+        "family.final.mil.model_training_setup",
+        family=str(family_data.family),
+        output_prefix=str(output_prefix),
+        **model.get_training_debug_summary(),
+    )
 
     family_dir = outdir / family_data.family
     family_dir.mkdir(parents=True, exist_ok=True)
@@ -1340,7 +1458,7 @@ def _run_mil_final_train_and_predict(
         seed=int(cfg.seed) + 1000,
     )
     sampler_diag_df.to_csv(sampler_diag_path, index=False)
-    _diag_pick = sampler_diag_df.set_index(["section", "metric"])["value"].to_dict()
+    _diag_pick = _sampler_diag_lookup(sampler_diag_df)
     log_event(
         "INFO",
         "family.final.mil.sampler_diagnostics",
@@ -1348,9 +1466,29 @@ def _run_mil_final_train_and_predict(
         output_prefix=str(output_prefix),
         path=str(sampler_diag_path),
         sampler_mode=str("balanced_batch" if bool(hpo_cfg.sampler.use_balanced_batch_sampler) else "weighted_sampler"),
+        dataset_any_positive_prevalence=f"{float(_diag_pick.get(('summary', 'dataset_any_positive_prevalence'), float('nan'))):.6f}",
+        sampled_any_positive_prevalence=f"{float(_diag_pick.get(('summary', 'sampled_any_positive_prevalence'), float('nan'))):.6f}",
         mean_pos_per_batch=f"{float(_diag_pick.get(('summary', 'mean_pos_per_batch'), float('nan'))):.3f}",
+        mean_neg_per_batch=f"{float(_diag_pick.get(('summary', 'mean_neg_per_batch'), float('nan'))):.3f}",
+        mean_unique_per_batch=f"{float(_diag_pick.get(('summary', 'mean_unique_per_batch'), float('nan'))):.3f}",
         duplicate_rate=f"{float(_diag_pick.get(('summary', 'duplicate_rate'), float('nan'))):.6f}",
+        unique_row_coverage_rate=f"{float(_diag_pick.get(('summary', 'unique_row_coverage_rate'), float('nan'))):.6f}",
     )
+    for task_idx, task_name in enumerate(TASK_COLS):
+        log_event(
+            "INFO",
+            "family.final.mil.sampler_diagnostics.task",
+            family=str(family_data.family),
+            output_prefix=str(output_prefix),
+            task_idx=int(task_idx),
+            task=str(task_name),
+            dataset_prevalence=f"{float(_diag_pick.get(('task', 'dataset_prevalence', task_idx), float('nan'))):.6f}",
+            sampled_prevalence=f"{float(_diag_pick.get(('task', 'sampled_prevalence', task_idx), float('nan'))):.6f}",
+            exposure_lift=f"{float(_diag_pick.get(('task', 'exposure_lift', task_idx), float('nan'))):.6f}",
+            batch_hit_rate=f"{float(_diag_pick.get(('task', 'batch_hit_rate', task_idx), float('nan'))):.6f}",
+            unique_positive_coverage_rate=f"{float(_diag_pick.get(('task', 'unique_positive_coverage_rate', task_idx), float('nan'))):.6f}",
+            positive_draws_per_positive_sample=f"{float(_diag_pick.get(('task', 'positive_draws_per_positive_sample', task_idx), float('nan'))):.6f}",
+        )
     use_fixed_epochs = fixed_train_epochs is not None
     target_epochs = int(fixed_train_epochs) if use_fixed_epochs else int(cfg.max_epochs)
     target_patience = int(max(int(cfg.patience), target_epochs + 5)) if use_fixed_epochs else int(cfg.patience)
@@ -1363,6 +1501,19 @@ def _run_mil_final_train_and_predict(
         accumulate_grad_batches=int(hpo_cfg.runtime.accumulate_grad_batches),
         save_checkpoint=bool(not use_fixed_epochs),
         save_weights_only=True,
+    )
+    log_event(
+        "INFO",
+        "family.final.mil.trainer_plan",
+        family=str(family_data.family),
+        output_prefix=str(output_prefix),
+        use_fixed_epochs=bool(use_fixed_epochs),
+        max_epochs=int(trainer_cfg.max_epochs),
+        patience=int(trainer_cfg.patience),
+        accumulate_grad_batches=int(trainer_cfg.accumulate_grad_batches),
+        accelerator=str(trainer_cfg.accelerator),
+        devices=int(trainer_cfg.devices),
+        precision=str(trainer_cfg.precision),
     )
     trainer, ckpt_cb = LightningTrainerFactory(trainer_cfg).build(
         ckpt_dir=str(family_dir),

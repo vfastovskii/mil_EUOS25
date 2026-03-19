@@ -11,6 +11,7 @@ from torch.cuda.amp import autocast
 
 from ...losses.multi_task_focal import MultiTaskFocal
 from ...utils.metrics import ap_per_task
+from ...utils.progress import log_event
 from .aggregators import build_aggregator
 from .configs import MILModelConfig
 from .constants import NUM_ABS_HEADS, NUM_FLUO_HEADS, NUM_TASKS
@@ -241,6 +242,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self.stage_2d_only_epochs = int(max(0, stage_2d_only_epochs))
         self.stage_3d_only_epochs = int(max(0, stage_3d_only_epochs))
         self._stagewise_active = False
+        self._optimizer_group_names: Tuple[str, ...] = tuple()
         self._group_2d_prefixes = (
             "mol_enc.",
             "mol_post_embed_norm.",
@@ -645,17 +647,142 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 param.requires_grad = True
         self._last_stage_trainability = state
 
+    def _named_parameters_by_group(self) -> Dict[str, List[Tuple[str, torch.nn.Parameter]]]:
+        groups: Dict[str, List[Tuple[str, torch.nn.Parameter]]] = {
+            "2d": [],
+            "3d": [],
+            "fusion": [],
+            "heads": [],
+        }
+        for name, param in self.named_parameters():
+            groups[self._parameter_group_name(str(name))].append((str(name), param))
+        return groups
+
+    def get_training_debug_summary(self) -> Dict[str, Any]:
+        return {
+            "mol_dim": int(self.mol_dim),
+            "inst_dim": int(self.inst_dim),
+            "inst_geom_dim": int(self.inst_geom_dim),
+            "inst_qm_dim": int(self.inst_qm_dim),
+            "inst_hidden": int(self.inst_hidden),
+            "proj_dim": int(self.proj_dim),
+            "active_modalities": ",".join(str(x) for x in self.active_modalities) if len(self.active_modalities) > 0 else "none",
+            "n_active_modalities": int(len(self.active_modalities)),
+            "fusion_task_2d_adapter": bool(self.fusion_use_task_2d_adapter),
+            "fusion_modality_gates": bool(self.fusion_use_modality_gates),
+            "fusion_modality_interaction": bool(self.fusion_use_modality_interaction),
+            "objective_mode": str(self.objective_mode),
+            "objective_min_w": float(self.objective_min_w),
+            "lambda_aux_abs": float(self.lambda_aux_abs),
+            "lambda_aux_fluo": float(self.lambda_aux_fluo),
+            "lambda_aux_bitmask": float(self.lambda_aux_bitmask),
+            "lambda_contrastive_cross_modal": float(self.lambda_contrastive_cross_modal),
+            "lambda_contrastive_3d_consistency": float(self.lambda_contrastive_3d_consistency),
+            "lambda_contrastive_supervised": float(self.lambda_contrastive_supervised),
+            "contrastive_proj_dim": int(self.contrastive_proj_dim),
+            "contrastive_temperature": float(self.contrastive_temperature),
+            "consistency_view_keep_rate": float(self.consistency_view_keep_rate),
+            "cross_modal_include_geom_qm": bool(self.cross_modal_include_geom_qm),
+            "stage_2d_only_epochs": int(self.stage_2d_only_epochs),
+            "stage_3d_only_epochs": int(self.stage_3d_only_epochs),
+            "base_lr": float(self.lr),
+            "base_weight_decay": float(self.weight_decay),
+            "lr_scale_2d": float(self.lr_group_scales["2d"]),
+            "lr_scale_3d": float(self.lr_group_scales["3d"]),
+            "lr_scale_fusion": float(self.lr_group_scales["fusion"]),
+            "lr_scale_heads": float(self.lr_group_scales["heads"]),
+            "weight_decay_scale_2d": float(self.weight_decay_group_scales["2d"]),
+            "weight_decay_scale_3d": float(self.weight_decay_group_scales["3d"]),
+            "weight_decay_scale_fusion": float(self.weight_decay_group_scales["fusion"]),
+            "weight_decay_scale_heads": float(self.weight_decay_group_scales["heads"]),
+        }
+
+    def get_optimizer_group_summaries(self) -> List[Dict[str, Any]]:
+        groups = self._named_parameters_by_group()
+        summaries: List[Dict[str, Any]] = []
+        for group_name in ("2d", "3d", "fusion", "heads"):
+            named_params = groups[group_name]
+            if len(named_params) == 0:
+                continue
+            n_params = int(sum(int(param.numel()) for _, param in named_params))
+            n_trainable_params = int(sum(int(param.numel()) for _, param in named_params if bool(param.requires_grad)))
+            sample_param_names = ",".join([str(name) for name, _ in named_params[:3]])
+            summaries.append(
+                {
+                    "group": str(group_name),
+                    "lr": float(self.lr) * float(self.lr_group_scales[group_name]),
+                    "weight_decay": float(self.weight_decay) * float(self.weight_decay_group_scales[group_name]),
+                    "n_tensors": int(len(named_params)),
+                    "n_trainable_tensors": int(sum(1 for _, param in named_params if bool(param.requires_grad))),
+                    "n_params": int(n_params),
+                    "n_trainable_params": int(n_trainable_params),
+                    "sample_params": str(sample_param_names),
+                }
+            )
+        return summaries
+
+    def _current_optimizer_group_values(self) -> Dict[str, Dict[str, float]]:
+        values: Dict[str, Dict[str, float]] = {}
+        trainer = getattr(self, "trainer", None)
+        opt_list = getattr(trainer, "optimizers", None) if trainer is not None else None
+        if opt_list:
+            opt = opt_list[0]
+            for idx, group_name in enumerate(self._optimizer_group_names):
+                if idx >= len(opt.param_groups):
+                    continue
+                group_cfg = opt.param_groups[idx]
+                values[str(group_name)] = {
+                    "lr": float(group_cfg.get("lr", self.lr)),
+                    "weight_decay": float(group_cfg.get("weight_decay", self.weight_decay)),
+                }
+        if len(values) == 0:
+            for summary in self.get_optimizer_group_summaries():
+                values[str(summary["group"])] = {
+                    "lr": float(summary["lr"]),
+                    "weight_decay": float(summary["weight_decay"]),
+                }
+        return values
+
+    def _current_stage_log_fields(self) -> Dict[str, Any]:
+        mode = self._stage_mode_for_epoch(int(getattr(self, "current_epoch", 0)))
+        enabled_modalities = sorted(str(x) for x in self._enabled_modalities_for_current_stage())
+        groups = self._named_parameters_by_group()
+        opt_values = self._current_optimizer_group_values()
+        fields: Dict[str, Any] = {
+            "epoch": int(getattr(self, "current_epoch", 0)),
+            "stage_mode": str(mode),
+            "enabled_modalities": ",".join(enabled_modalities) if len(enabled_modalities) > 0 else "none",
+            "active_modalities": ",".join(str(x) for x in self.active_modalities) if len(self.active_modalities) > 0 else "none",
+        }
+        for group_name in ("2d", "3d", "fusion", "heads"):
+            named_params = groups[group_name]
+            if len(named_params) == 0:
+                continue
+            n_trainable_tensors = int(sum(1 for _, param in named_params if bool(param.requires_grad)))
+            n_trainable_params = int(sum(int(param.numel()) for _, param in named_params if bool(param.requires_grad)))
+            fields[f"group_{group_name}_trainable"] = bool(n_trainable_tensors > 0)
+            fields[f"group_{group_name}_n_tensors"] = int(len(named_params))
+            fields[f"group_{group_name}_n_trainable_tensors"] = int(n_trainable_tensors)
+            fields[f"group_{group_name}_n_trainable_params"] = int(n_trainable_params)
+            if group_name in opt_values:
+                fields[f"group_{group_name}_lr"] = float(opt_values[group_name]["lr"])
+                fields[f"group_{group_name}_weight_decay"] = float(opt_values[group_name]["weight_decay"])
+        return fields
+
     def on_fit_start(self) -> None:
         self._stagewise_active = True
         self._apply_stage_trainability()
+        log_event("INFO", "mil.fit.training_setup", **self.get_training_debug_summary())
 
     def on_train_epoch_start(self) -> None:
         self._apply_stage_trainability()
+        log_event("INFO", "mil.train.epoch_start", **self._current_stage_log_fields())
 
     def on_fit_end(self) -> None:
         self._stagewise_active = False
         self._last_stage_trainability = None
         self._apply_stage_trainability()
+        log_event("INFO", "mil.fit.stage_reset", stagewise_active=bool(self._stagewise_active))
 
     def configure_rl_concept_guidance(
         self,
@@ -1598,6 +1725,19 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self.log("val_macro_ap", float(macro_ap), prog_bar=True, on_step=False, on_epoch=True)
         self.log("val_min_ap", float(min_ap), prog_bar=False, on_step=False, on_epoch=True)
         self.log("val_objective_ap", float(objective_ap), prog_bar=False, on_step=False, on_epoch=True)
+        log_event(
+            "INFO",
+            "mil.val.epoch_metrics",
+            epoch=int(getattr(self, "current_epoch", 0)),
+            stage_mode=str(self._stage_mode_for_epoch(int(getattr(self, "current_epoch", 0)))),
+            val_macro_ap=float(macro_ap),
+            val_min_ap=float(min_ap),
+            val_objective_ap=float(objective_ap),
+            val_ap_t0=float(aps[0]),
+            val_ap_t1=float(aps[1]),
+            val_ap_t2=float(aps[2]),
+            val_ap_t3=float(aps[3]),
+        )
 
     def configure_optimizers(self):
         param_groups: Dict[str, List[torch.nn.Parameter]] = {"2d": [], "3d": [], "fusion": [], "heads": []}
@@ -1606,10 +1746,12 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             param_groups[group].append(param)
 
         optimizer_groups: List[Dict[str, Any]] = []
+        active_group_names: List[str] = []
         for group_name in ("2d", "3d", "fusion", "heads"):
             params = param_groups[group_name]
             if len(params) == 0:
                 continue
+            active_group_names.append(str(group_name))
             optimizer_groups.append(
                 {
                     "params": params,
@@ -1617,4 +1759,19 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                     "weight_decay": float(self.weight_decay) * float(self.weight_decay_group_scales[group_name]),
                 }
             )
+        self._optimizer_group_names = tuple(active_group_names)
+        group_summaries = [s for s in self.get_optimizer_group_summaries() if str(s["group"]) in set(self._optimizer_group_names)]
+        total_params = int(sum(int(s["n_params"]) for s in group_summaries))
+        total_trainable_params = int(sum(int(s["n_trainable_params"]) for s in group_summaries))
+        log_event(
+            "INFO",
+            "mil.optimizer.plan",
+            optimizer="AdamW",
+            n_groups=int(len(self._optimizer_group_names)),
+            group_order=",".join(self._optimizer_group_names) if len(self._optimizer_group_names) > 0 else "none",
+            total_params=int(total_params),
+            total_trainable_params=int(total_trainable_params),
+        )
+        for summary in group_summaries:
+            log_event("INFO", "mil.optimizer.group", **summary)
         return torch.optim.AdamW(optimizer_groups, lr=self.lr, weight_decay=self.weight_decay)
