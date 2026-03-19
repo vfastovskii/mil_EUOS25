@@ -64,6 +64,10 @@ def search_space(
          "activation": trial.suggest_categorical("activation", ["GELU", "ReLU", "LeakyReLU"]),
          "lr": trial.suggest_float("lr", 8e-5, 8e-3, log=True),
          "weight_decay": trial.suggest_float("weight_decay", 3e-6, 3e-4, log=True),
+         "lr_scale_2d": trial.suggest_float("lr_scale_2d", 0.5, 1.5, log=True),
+         "lr_scale_3d": trial.suggest_float("lr_scale_3d", 0.5, 2.0, log=True),
+         "lr_scale_fusion": trial.suggest_float("lr_scale_fusion", 0.5, 1.5, log=True),
+         "lr_scale_heads": trial.suggest_float("lr_scale_heads", 0.5, 2.0, log=True),
          "batch_size": trial.suggest_categorical("batch_size", batch_values),
 
          # Task mapping
@@ -97,10 +101,15 @@ def search_space(
         "lambda_aux_abs": trial.suggest_float("lambda_aux_abs", 0.05, 0.3),
         "lambda_aux_fluo": trial.suggest_float("lambda_aux_fluo", 0.05, 0.3),
         "lambda_aux_bitmask": trial.suggest_float("lambda_aux_bitmask", 0.02, 0.1),
+        "lambda_contrastive_cross_modal": trial.suggest_float("lambda_contrastive_cross_modal", 0.005, 0.2, log=True),
+        "lambda_contrastive_3d_consistency": trial.suggest_float("lambda_contrastive_3d_consistency", 0.005, 0.2, log=True),
+        "lambda_contrastive_supervised": trial.suggest_float("lambda_contrastive_supervised", 0.005, 0.2, log=True),
         "reg_loss_type": trial.suggest_categorical("reg_loss_type", ["mse"]),
          # Fixed objective mixing weight across all MIL trials to keep trials comparable
          # and consistently push optimization toward the weakest task.
          "min_w": 0.40,
+         "stage_2d_only_epochs": trial.suggest_categorical("stage_2d_only_epochs", [0, 1, 2, 3]),
+         "stage_3d_only_epochs": trial.suggest_categorical("stage_3d_only_epochs", [0, 1, 2, 3]),
          "accumulate_grad_batches": trial.suggest_categorical("accumulate_grad_batches", [8, 16]),
          "head_stochastic_depth": trial.suggest_float("head_stochastic_depth", 0.0, 0.1)}
 

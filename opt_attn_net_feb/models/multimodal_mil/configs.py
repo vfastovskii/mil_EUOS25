@@ -47,6 +47,16 @@ class MILPredictorConfig:
 class MILOptimizationConfig:
     lr: float = 8e-5
     weight_decay: float = 3e-6
+    lr_scale_2d: float = 1.0
+    lr_scale_3d: float = 1.0
+    lr_scale_fusion: float = 1.0
+    lr_scale_heads: float = 1.0
+    weight_decay_scale_2d: float = 1.0
+    weight_decay_scale_3d: float = 1.0
+    weight_decay_scale_fusion: float = 1.0
+    weight_decay_scale_heads: float = 1.0
+    stage_2d_only_epochs: int = 0
+    stage_3d_only_epochs: int = 0
 
 
 @dataclass(frozen=True)
@@ -54,6 +64,13 @@ class MILLossConfig:
     lambda_aux_abs: float = 0.05
     lambda_aux_fluo: float = 0.05
     lambda_aux_bitmask: float = 0.05
+    lambda_contrastive_cross_modal: float = 0.05
+    lambda_contrastive_3d_consistency: float = 0.05
+    lambda_contrastive_supervised: float = 0.05
+    contrastive_proj_dim: int = 64
+    contrastive_temperature: float = 0.10
+    consistency_view_keep_rate: float = 0.70
+    cross_modal_include_geom_qm: bool = True
     reg_loss_type: str = "mse"
     bitmask_group_top_ids: Optional[List[int]] = None
     bitmask_group_class_weight: Optional[List[float]] = None

@@ -6,6 +6,7 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.cuda.amp import autocast
 
 from ...losses.multi_task_focal import MultiTaskFocal
@@ -99,12 +100,29 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             mixer_dropout=float(b.mixer_dropout),
             lr=float(opt.lr),
             weight_decay=float(opt.weight_decay),
+            lr_scale_2d=float(opt.lr_scale_2d),
+            lr_scale_3d=float(opt.lr_scale_3d),
+            lr_scale_fusion=float(opt.lr_scale_fusion),
+            lr_scale_heads=float(opt.lr_scale_heads),
+            weight_decay_scale_2d=float(opt.weight_decay_scale_2d),
+            weight_decay_scale_3d=float(opt.weight_decay_scale_3d),
+            weight_decay_scale_fusion=float(opt.weight_decay_scale_fusion),
+            weight_decay_scale_heads=float(opt.weight_decay_scale_heads),
+            stage_2d_only_epochs=int(opt.stage_2d_only_epochs),
+            stage_3d_only_epochs=int(opt.stage_3d_only_epochs),
             pos_weight=pos_weight,
             gamma=gamma,
             lam=lam,
             lambda_aux_abs=float(loss.lambda_aux_abs),
             lambda_aux_fluo=float(loss.lambda_aux_fluo),
             lambda_aux_bitmask=float(loss.lambda_aux_bitmask),
+            lambda_contrastive_cross_modal=float(loss.lambda_contrastive_cross_modal),
+            lambda_contrastive_3d_consistency=float(loss.lambda_contrastive_3d_consistency),
+            lambda_contrastive_supervised=float(loss.lambda_contrastive_supervised),
+            contrastive_proj_dim=int(loss.contrastive_proj_dim),
+            contrastive_temperature=float(loss.contrastive_temperature),
+            consistency_view_keep_rate=float(loss.consistency_view_keep_rate),
+            cross_modal_include_geom_qm=bool(loss.cross_modal_include_geom_qm),
             reg_loss_type=str(loss.reg_loss_type),
             bitmask_group_top_ids=(
                 [int(x) for x in (loss.bitmask_group_top_ids or [])]
@@ -153,6 +171,16 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         mixer_dropout: float,
         lr: float,
         weight_decay: float,
+        lr_scale_2d: float,
+        lr_scale_3d: float,
+        lr_scale_fusion: float,
+        lr_scale_heads: float,
+        weight_decay_scale_2d: float,
+        weight_decay_scale_3d: float,
+        weight_decay_scale_fusion: float,
+        weight_decay_scale_heads: float,
+        stage_2d_only_epochs: int,
+        stage_3d_only_epochs: int,
         pos_weight: torch.Tensor,
         gamma: torch.Tensor,
         lam: np.ndarray,
@@ -160,6 +188,13 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         lambda_aux_fluo: float,
         lambda_aux_bitmask: float,
         reg_loss_type: str,
+        lambda_contrastive_cross_modal: float = 0.05,
+        lambda_contrastive_3d_consistency: float = 0.05,
+        lambda_contrastive_supervised: float = 0.05,
+        contrastive_proj_dim: int = 64,
+        contrastive_temperature: float = 0.10,
+        consistency_view_keep_rate: float = 0.70,
+        cross_modal_include_geom_qm: bool = True,
         bitmask_group_top_ids: Optional[List[int]] = None,
         bitmask_group_class_weight: Optional[List[float]] = None,
         activation: str = "GELU",
@@ -191,6 +226,49 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self.proj_dim = int(proj_dim)
         self.objective_mode = str(objective_mode)
         self.objective_min_w = float(objective_min_w)
+        self.lr_group_scales = {
+            "2d": float(max(1e-4, lr_scale_2d)),
+            "3d": float(max(1e-4, lr_scale_3d)),
+            "fusion": float(max(1e-4, lr_scale_fusion)),
+            "heads": float(max(1e-4, lr_scale_heads)),
+        }
+        self.weight_decay_group_scales = {
+            "2d": float(max(0.0, weight_decay_scale_2d)),
+            "3d": float(max(0.0, weight_decay_scale_3d)),
+            "fusion": float(max(0.0, weight_decay_scale_fusion)),
+            "heads": float(max(0.0, weight_decay_scale_heads)),
+        }
+        self.stage_2d_only_epochs = int(max(0, stage_2d_only_epochs))
+        self.stage_3d_only_epochs = int(max(0, stage_3d_only_epochs))
+        self._stagewise_active = False
+        self._group_2d_prefixes = (
+            "mol_enc.",
+            "mol_post_embed_norm.",
+            "proj2d.",
+            "task_2d_adapter.",
+            "task_2d_post_norm.",
+        )
+        self._group_3d_prefixes = (
+            "inst_geom_enc.",
+            "inst_qm_enc.",
+            "inst_geom_post_embed_norm.",
+            "inst_qm_post_embed_norm.",
+            "attn_pool_geom.",
+            "attn_pool_qm.",
+            "agg_geom_post_norm.",
+            "agg_qm_post_norm.",
+            "proj3d_geom.",
+            "proj3d_qm.",
+        )
+        self._group_head_prefixes = (
+            "cls_heads.",
+            "abs_heads.",
+            "fluo_heads.",
+            "bitmask_head.",
+            "contrastive_heads.",
+            "task_contrastive_head.",
+        )
+        self._last_stage_trainability: Optional[Tuple[bool, bool]] = None
         use_2d = self.mol_dim > 0
         use_geom = self.inst_geom_dim > 0
         use_qm = self.inst_qm_dim > 0
@@ -369,6 +447,30 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self.modality_interaction_ln2 = (
             None if not self.fusion_use_modality_interaction else nn.LayerNorm(self.proj_dim)
         )
+        self.lambda_contrastive_cross_modal = float(max(0.0, lambda_contrastive_cross_modal))
+        self.lambda_contrastive_3d_consistency = float(max(0.0, lambda_contrastive_3d_consistency))
+        self.lambda_contrastive_supervised = float(max(0.0, lambda_contrastive_supervised))
+        self.contrastive_proj_dim = int(max(8, contrastive_proj_dim))
+        self.contrastive_temperature = float(max(1e-4, contrastive_temperature))
+        self.consistency_view_keep_rate = float(np.clip(consistency_view_keep_rate, 0.25, 1.0))
+        self.cross_modal_include_geom_qm = bool(cross_modal_include_geom_qm)
+        self.contrastive_heads = nn.ModuleDict(
+            {
+                str(name): nn.Sequential(
+                    nn.Linear(self.proj_dim, self.proj_dim),
+                    _make_activation_module(str(activation)),
+                    nn.Dropout(float(mixer_dropout)),
+                    nn.Linear(self.proj_dim, self.contrastive_proj_dim),
+                )
+                for name in self.active_modalities
+            }
+        )
+        self.task_contrastive_head = nn.Sequential(
+            nn.Linear(int(mixer_hidden), int(mixer_hidden)),
+            _make_activation_module(str(activation)),
+            nn.Dropout(float(mixer_dropout)),
+            nn.Linear(int(mixer_hidden), self.contrastive_proj_dim),
+        )
         mixer_in_dim = int(max(1, len(self.active_modalities)) * int(proj_dim))
 
         self.mixer = build_mlp_v3_embedder(
@@ -491,6 +593,69 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self.rl_task_target_concepts: list[tuple[str, ...]] = [tuple() for _ in range(NUM_TASKS)]
         self.rl_target_conf_pairs_by_task: list[set[tuple[str, str]]] = [set() for _ in range(NUM_TASKS)]
         self.rl_target_mols_by_task: list[set[str]] = [set() for _ in range(NUM_TASKS)]
+
+    def _parameter_group_name(self, param_name: str) -> str:
+        if param_name == "task_2d_tokens":
+            return "2d"
+        if param_name.startswith(self._group_2d_prefixes):
+            return "2d"
+        if param_name.startswith(self._group_3d_prefixes):
+            return "3d"
+        if param_name.startswith(self._group_head_prefixes):
+            return "heads"
+        return "fusion"
+
+    def _stage_mode_for_epoch(self, epoch_idx: int) -> str:
+        epoch = int(max(0, epoch_idx))
+        has_2d = bool("2d" in self.active_modalities)
+        has_3d = bool(("3d_geom" in self.active_modalities) or ("3d_qm" in self.active_modalities))
+        if has_2d and has_3d and epoch < int(self.stage_2d_only_epochs):
+            return "2d_only"
+        if has_2d and has_3d and epoch < int(self.stage_2d_only_epochs + self.stage_3d_only_epochs):
+            return "3d_only"
+        return "joint"
+
+    def _enabled_modalities_for_current_stage(self) -> Set[str]:
+        if not bool(self._stagewise_active):
+            return set(self.active_modalities)
+        mode = self._stage_mode_for_epoch(int(getattr(self, "current_epoch", 0)))
+        if mode == "2d_only":
+            return {"2d"} & set(self.active_modalities)
+        if mode == "3d_only":
+            return {"3d_geom", "3d_qm"} & set(self.active_modalities)
+        return set(self.active_modalities)
+
+    def _apply_stage_trainability(self) -> None:
+        if not bool(self._stagewise_active):
+            enable_2d, enable_3d = True, True
+        else:
+            mode = self._stage_mode_for_epoch(int(getattr(self, "current_epoch", 0)))
+            enable_2d = (mode != "3d_only")
+            enable_3d = (mode != "2d_only")
+        state = (bool(enable_2d), bool(enable_3d))
+        if self._last_stage_trainability == state:
+            return
+        for name, param in self.named_parameters():
+            group = self._parameter_group_name(str(name))
+            if group == "2d":
+                param.requires_grad = bool(enable_2d)
+            elif group == "3d":
+                param.requires_grad = bool(enable_3d)
+            else:
+                param.requires_grad = True
+        self._last_stage_trainability = state
+
+    def on_fit_start(self) -> None:
+        self._stagewise_active = True
+        self._apply_stage_trainability()
+
+    def on_train_epoch_start(self) -> None:
+        self._apply_stage_trainability()
+
+    def on_fit_end(self) -> None:
+        self._stagewise_active = False
+        self._last_stage_trainability = None
+        self._apply_stage_trainability()
 
     def configure_rl_concept_guidance(
         self,
@@ -653,23 +818,19 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
     ):
         self._validate_forward_inputs(x2d=x2d, x3d_pad=x3d_pad, key_padding_mask=key_padding_mask)
         need_attn = bool(return_attn or return_attn_modalities)
-        pooled_geom, pooled_qm, attn_geom, attn_qm = self._pool_task_tokens(
+        forward_out = self._compute_outputs(
+            x2d=x2d,
             x3d_pad=x3d_pad,
             key_padding_mask=key_padding_mask,
-            return_attn=need_attn,
+            need_attn=need_attn,
         )
-        z_tasks, fusion_info = self._build_task_representations(
-            x2d=x2d,
-            pooled_geom=pooled_geom,
-            pooled_qm=pooled_qm,
-        )
-
-        logits = apply_task_heads(z_tasks, self.cls_heads)  # [B,4]
-
-        z_aux = z_tasks.mean(dim=1)  # [B,mixer_hidden]
-        abs_out = apply_shared_heads(z_aux, self.abs_heads)    # [B,2]
-        fluo_out = apply_shared_heads(z_aux, self.fluo_heads)  # [B,4]
-        bitmask_logits = self.bitmask_head(z_aux) if self.bitmask_head is not None else None
+        logits = forward_out["logits"]
+        abs_out = forward_out["abs_out"]
+        fluo_out = forward_out["fluo_out"]
+        bitmask_logits = forward_out["bitmask_logits"]
+        fusion_info = forward_out["fusion_info"]
+        attn_geom = forward_out["attn_geom"]
+        attn_qm = forward_out["attn_qm"]
 
         attn_fused = None
         if return_attn and (not return_attn_modalities):
@@ -834,6 +995,11 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             modality_parts["3d_qm"] = e3d_qm
         if len(modality_parts) == 0:
             raise RuntimeError("No active modality projections found for mixer input.")
+        enabled_modalities = self._enabled_modalities_for_current_stage()
+        if len(enabled_modalities) > 0 and enabled_modalities != set(self.active_modalities):
+            for name in tuple(modality_parts.keys()):
+                if str(name) not in enabled_modalities:
+                    modality_parts[str(name)] = torch.zeros_like(modality_parts[str(name)])
         tokens = torch.stack(
             [modality_parts[str(name)] for name in self.active_modalities],
             dim=2,
@@ -841,6 +1007,11 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         n_modalities = int(tokens.shape[2])
         type_embed = self.modality_type_embeddings[:n_modalities].view(1, 1, n_modalities, self.proj_dim)
         tokens_with_type = tokens + type_embed
+        active_mask = torch.tensor(
+            [1.0 if str(name) in enabled_modalities else 0.0 for name in self.active_modalities],
+            dtype=tokens.dtype,
+            device=tokens.device,
+        ).view(1, 1, n_modalities)
 
         if n_modalities == 1:
             modality_scores = torch.ones(
@@ -852,10 +1023,13 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         else:
             flat_tokens = tokens_with_type.reshape(batch_size * NUM_TASKS * n_modalities, self.proj_dim)
             modality_scores = self.modality_gate_net(flat_tokens).reshape(batch_size, NUM_TASKS, n_modalities)
+            if bool(torch.any(active_mask < 0.5)):
+                modality_scores = modality_scores.masked_fill(active_mask < 0.5, -1e9)
             if self.fusion_use_modality_gates:
                 modality_gates = torch.softmax(modality_scores, dim=-1)
             else:
-                modality_gates = torch.full_like(modality_scores, fill_value=1.0 / float(n_modalities))
+                denom = active_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                modality_gates = active_mask / denom
 
         gated_tokens = tokens * modality_gates.unsqueeze(-1)
         modality_attn = None
@@ -893,8 +1067,346 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             "modality_scores": modality_scores,
             "modality_gates": modality_gates,
             "modality_attn": modality_attn,
+            "modality_parts": modality_parts,
         }
         return z_tasks, fusion_info
+
+    @staticmethod
+    def _summary_latents_from_modality_parts(modality_parts: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        return {
+            str(name): part.mean(dim=1)
+            for name, part in modality_parts.items()
+            if torch.is_tensor(part) and part.ndim == 3 and int(part.shape[1]) > 0
+        }
+
+    def _project_contrastive_latents(self, summaries: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        out: Dict[str, torch.Tensor] = {}
+        for name, tensor in summaries.items():
+            if str(name) not in self.contrastive_heads:
+                continue
+            out[str(name)] = F.normalize(self.contrastive_heads[str(name)](tensor), p=2, dim=-1)
+        return out
+
+    @staticmethod
+    def _positive_mask_from_ids(
+        *,
+        batch_size: int,
+        device: torch.device,
+        mol_ids: Optional[Sequence[Any]],
+    ) -> torch.Tensor:
+        if mol_ids is None or len(mol_ids) != int(batch_size):
+            return torch.eye(int(batch_size), dtype=torch.bool, device=device)
+        ids = [str(x) for x in mol_ids]
+        mask = [[ids[i] == ids[j] for j in range(len(ids))] for i in range(len(ids))]
+        return torch.tensor(mask, dtype=torch.bool, device=device)
+
+    @staticmethod
+    def _multi_positive_info_nce(
+        logits: torch.Tensor,
+        positive_mask: torch.Tensor,
+        anchor_weight: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if logits.ndim != 2 or positive_mask.shape != logits.shape:
+            raise ValueError(
+                f"Expected logits/positive_mask shape [B,B], got logits={tuple(logits.shape)} mask={tuple(positive_mask.shape)}"
+            )
+        row_has_pos = positive_mask.any(dim=1)
+        if not bool(torch.any(row_has_pos)):
+            return torch.zeros((), dtype=logits.dtype, device=logits.device)
+        logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+        log_denom = torch.logsumexp(logits, dim=1)
+        pos_logits = logits.masked_fill(~positive_mask, float("-inf"))
+        log_num = torch.logsumexp(pos_logits, dim=1)
+        per_row = -(log_num[row_has_pos] - log_denom[row_has_pos])
+        if anchor_weight is None:
+            return per_row.mean()
+        row_weight = anchor_weight[row_has_pos].to(dtype=per_row.dtype).clamp_min(0.0)
+        denom = row_weight.sum()
+        if not bool(torch.isfinite(denom)) or float(denom.detach().item()) <= 0.0:
+            return per_row.mean()
+        return (per_row * row_weight).sum() / denom
+
+    def _contrastive_pair_loss(
+        self,
+        *,
+        za: Optional[torch.Tensor],
+        zb: Optional[torch.Tensor],
+        positive_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if za is None or zb is None:
+            return positive_mask.new_zeros((), dtype=torch.float32)
+        if int(za.shape[0]) <= 1 or int(zb.shape[0]) <= 1:
+            return za.new_zeros(())
+        logits = (za @ zb.transpose(0, 1)) / float(self.contrastive_temperature)
+        loss_ab = self._multi_positive_info_nce(logits, positive_mask)
+        loss_ba = self._multi_positive_info_nce(logits.transpose(0, 1), positive_mask.transpose(0, 1))
+        return 0.5 * (loss_ab + loss_ba)
+
+    def _task_supervised_contrastive_loss(
+        self,
+        *,
+        z_task: torch.Tensor,
+        labels: torch.Tensor,
+        anchor_weight: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if int(z_task.shape[0]) <= 1:
+            return z_task.new_zeros(())
+        labels = (labels > 0.5).long().reshape(-1)
+        if int(labels.numel()) != int(z_task.shape[0]):
+            raise ValueError(
+                f"Expected task labels to match embeddings, got labels={tuple(labels.shape)} z_task={tuple(z_task.shape)}"
+            )
+        unique_labels = torch.unique(labels)
+        if int(unique_labels.numel()) < 2:
+            return z_task.new_zeros(())
+        logits = (z_task @ z_task.transpose(0, 1)) / float(self.contrastive_temperature)
+        eye = torch.eye(int(z_task.shape[0]), dtype=torch.bool, device=z_task.device)
+        logits = logits.masked_fill(eye, float("-inf"))
+
+        class_losses: List[torch.Tensor] = []
+        for cls in unique_labels.tolist():
+            class_mask = labels == int(cls)
+            if int(class_mask.sum().item()) < 2:
+                continue
+            positive_mask = class_mask.unsqueeze(1) & class_mask.unsqueeze(0) & (~eye)
+            if not bool(torch.any(positive_mask)):
+                continue
+            class_weight = None
+            if anchor_weight is not None:
+                class_weight = anchor_weight.to(dtype=z_task.dtype).reshape(-1)
+            class_losses.append(
+                self._multi_positive_info_nce(
+                    logits,
+                    positive_mask,
+                    anchor_weight=class_weight,
+                )
+            )
+        if len(class_losses) == 0:
+            return z_task.new_zeros(())
+        return torch.stack(class_losses, dim=0).mean()
+
+    def _cross_modal_contrastive_loss(
+        self,
+        *,
+        fusion_info: Dict[str, Any],
+        mol_ids: Optional[Sequence[Any]],
+    ) -> torch.Tensor:
+        modality_parts = fusion_info.get("modality_parts")
+        if not isinstance(modality_parts, dict) or len(modality_parts) <= 1:
+            return self.lam.new_zeros(())
+        enabled_modalities = self._enabled_modalities_for_current_stage()
+        modality_parts = {
+            str(name): tensor
+            for name, tensor in modality_parts.items()
+            if str(name) in enabled_modalities
+        }
+        if len(modality_parts) <= 1:
+            return self.lam.new_zeros(())
+        summaries = self._summary_latents_from_modality_parts(modality_parts)
+        proj = self._project_contrastive_latents(summaries)
+        if len(proj) <= 1:
+            return self.lam.new_zeros(())
+        ref = next(iter(proj.values()))
+        positive_mask = self._positive_mask_from_ids(
+            batch_size=int(ref.shape[0]),
+            device=ref.device,
+            mol_ids=mol_ids,
+        )
+        pair_losses: List[torch.Tensor] = []
+        for name_a, name_b in (("2d", "3d_geom"), ("2d", "3d_qm")):
+            if name_a in proj and name_b in proj:
+                pair_losses.append(
+                    self._contrastive_pair_loss(
+                        za=proj[name_a],
+                        zb=proj[name_b],
+                        positive_mask=positive_mask,
+                    )
+                )
+        if self.cross_modal_include_geom_qm and ("3d_geom" in proj) and ("3d_qm" in proj):
+            pair_losses.append(
+                self._contrastive_pair_loss(
+                    za=proj["3d_geom"],
+                    zb=proj["3d_qm"],
+                    positive_mask=positive_mask,
+                )
+            )
+        if len(pair_losses) == 0:
+            return self.lam.new_zeros(())
+        return torch.stack(pair_losses, dim=0).mean()
+
+    @staticmethod
+    def _sample_subset_padding_mask(
+        *,
+        key_padding_mask: torch.Tensor,
+        keep_rate: float,
+    ) -> torch.Tensor:
+        keep = float(np.clip(keep_rate, 0.25, 1.0))
+        valid = ~key_padding_mask
+        subset_valid = torch.zeros_like(valid)
+        for b in range(int(valid.shape[0])):
+            idx = torch.nonzero(valid[b], as_tuple=False).squeeze(1)
+            n = int(idx.numel())
+            if n <= 0:
+                continue
+            keep_n = int(round(keep * float(n)))
+            keep_n = max(1, min(n, keep_n))
+            if keep_n >= n:
+                subset_valid[b, idx] = True
+                continue
+            perm = torch.randperm(n, device=idx.device)[:keep_n]
+            subset_valid[b, idx.index_select(0, perm)] = True
+        return ~subset_valid
+
+    def _project_3d_modality_parts(
+        self,
+        *,
+        pooled_geom: torch.Tensor,
+        pooled_qm: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        batch_size = int(pooled_geom.shape[0])
+        modality_parts: Dict[str, torch.Tensor] = {}
+        if self.proj3d_geom is not None and self.agg_geom_post_norm is not None:
+            pooled_geom = self.agg_geom_post_norm(pooled_geom)
+            modality_parts["3d_geom"] = self.proj3d_geom(
+                pooled_geom.reshape(batch_size * NUM_TASKS, -1)
+            ).reshape(batch_size, NUM_TASKS, -1)
+        if self.proj3d_qm is not None and self.agg_qm_post_norm is not None:
+            pooled_qm = self.agg_qm_post_norm(pooled_qm)
+            modality_parts["3d_qm"] = self.proj3d_qm(
+                pooled_qm.reshape(batch_size * NUM_TASKS, -1)
+            ).reshape(batch_size, NUM_TASKS, -1)
+        return modality_parts
+
+    def _three_d_view_consistency_loss(
+        self,
+        *,
+        x3d_pad: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+        mol_ids: Optional[Sequence[Any]],
+    ) -> torch.Tensor:
+        enabled_modalities = self._enabled_modalities_for_current_stage()
+        if ("3d_geom" not in enabled_modalities) and ("3d_qm" not in enabled_modalities):
+            return self.lam.new_zeros(())
+        if (self.proj3d_geom is None) and (self.proj3d_qm is None):
+            return self.lam.new_zeros(())
+        mask_a = self._sample_subset_padding_mask(
+            key_padding_mask=key_padding_mask,
+            keep_rate=float(self.consistency_view_keep_rate),
+        )
+        mask_b = self._sample_subset_padding_mask(
+            key_padding_mask=key_padding_mask,
+            keep_rate=float(self.consistency_view_keep_rate),
+        )
+        pooled_geom_a, pooled_qm_a, _, _ = self._pool_task_tokens(
+            x3d_pad=x3d_pad,
+            key_padding_mask=mask_a,
+            return_attn=False,
+        )
+        pooled_geom_b, pooled_qm_b, _, _ = self._pool_task_tokens(
+            x3d_pad=x3d_pad,
+            key_padding_mask=mask_b,
+            return_attn=False,
+        )
+        proj_a = self._project_contrastive_latents(
+            self._summary_latents_from_modality_parts(
+                self._project_3d_modality_parts(pooled_geom=pooled_geom_a, pooled_qm=pooled_qm_a)
+            )
+        )
+        proj_b = self._project_contrastive_latents(
+            self._summary_latents_from_modality_parts(
+                self._project_3d_modality_parts(pooled_geom=pooled_geom_b, pooled_qm=pooled_qm_b)
+            )
+        )
+        if len(proj_a) == 0 or len(proj_b) == 0:
+            return self.lam.new_zeros(())
+        ref = next(iter(proj_a.values()))
+        positive_mask = self._positive_mask_from_ids(
+            batch_size=int(ref.shape[0]),
+            device=ref.device,
+            mol_ids=mol_ids,
+        )
+        losses: List[torch.Tensor] = []
+        for name in ("3d_geom", "3d_qm"):
+            if name in proj_a and name in proj_b:
+                losses.append(
+                    self._contrastive_pair_loss(
+                        za=proj_a[name],
+                        zb=proj_b[name],
+                        positive_mask=positive_mask,
+                    )
+                )
+        if len(losses) == 0:
+            return self.lam.new_zeros(())
+        return torch.stack(losses, dim=0).mean()
+
+    def _supervised_task_contrastive_loss(
+        self,
+        *,
+        z_tasks: torch.Tensor,
+        y_cls: torch.Tensor,
+        w_cls: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if z_tasks.ndim != 3:
+            raise ValueError(f"Expected z_tasks shape [B,T,H], got {tuple(z_tasks.shape)}")
+        batch_size, n_tasks, _ = z_tasks.shape
+        if int(batch_size) <= 1 or int(n_tasks) <= 0:
+            return z_tasks.new_zeros(())
+        proj = self.task_contrastive_head(
+            z_tasks.reshape(batch_size * n_tasks, -1)
+        ).reshape(batch_size, n_tasks, -1)
+        proj = F.normalize(proj, p=2, dim=-1)
+
+        task_losses: List[torch.Tensor] = []
+        for task_idx in range(int(n_tasks)):
+            anchor_weight = None
+            if w_cls is not None:
+                anchor_weight = w_cls[:, task_idx]
+            task_loss = self._task_supervised_contrastive_loss(
+                z_task=proj[:, task_idx, :],
+                labels=y_cls[:, task_idx],
+                anchor_weight=anchor_weight,
+            )
+            labels = (y_cls[:, task_idx] > 0.5).long()
+            has_both_classes = int(torch.unique(labels).numel()) >= 2
+            if has_both_classes and bool(torch.isfinite(task_loss)):
+                task_losses.append(task_loss)
+        if len(task_losses) == 0:
+            return z_tasks.new_zeros(())
+        return torch.stack(task_losses, dim=0).mean()
+
+    def _compute_outputs(
+        self,
+        *,
+        x2d: torch.Tensor,
+        x3d_pad: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+        need_attn: bool,
+    ) -> Dict[str, Any]:
+        pooled_geom, pooled_qm, attn_geom, attn_qm = self._pool_task_tokens(
+            x3d_pad=x3d_pad,
+            key_padding_mask=key_padding_mask,
+            return_attn=need_attn,
+        )
+        z_tasks, fusion_info = self._build_task_representations(
+            x2d=x2d,
+            pooled_geom=pooled_geom,
+            pooled_qm=pooled_qm,
+        )
+        logits = apply_task_heads(z_tasks, self.cls_heads)
+        z_aux = z_tasks.mean(dim=1)
+        abs_out = apply_shared_heads(z_aux, self.abs_heads)
+        fluo_out = apply_shared_heads(z_aux, self.fluo_heads)
+        bitmask_logits = self.bitmask_head(z_aux) if self.bitmask_head is not None else None
+        return {
+            "logits": logits,
+            "abs_out": abs_out,
+            "fluo_out": fluo_out,
+            "bitmask_logits": bitmask_logits,
+            "z_tasks": z_tasks,
+            "fusion_info": fusion_info,
+            "attn_geom": attn_geom,
+            "attn_qm": attn_qm,
+        }
 
     def training_step(self, batch, batch_idx):
         x2d, x3d, kpm, y_cls, w_cls, y_abs, m_abs, w_abs, y_fluo, m_fluo, w_fluo = batch[:11]
@@ -902,23 +1414,26 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         conf_pad = batch[12] if len(batch) >= 13 else None
         use_attn_guidance = bool(self.rl_enabled and mol_ids is not None and conf_pad is not None)
 
+        forward_out = self._compute_outputs(
+            x2d=x2d,
+            x3d_pad=x3d,
+            key_padding_mask=kpm,
+            need_attn=bool(use_attn_guidance),
+        )
+        logits = forward_out["logits"]
+        abs_out = forward_out["abs_out"]
+        fluo_out = forward_out["fluo_out"]
+        bitmask_logits = forward_out["bitmask_logits"]
+        attn = None
         if use_attn_guidance:
-            logits, abs_out, fluo_out, bitmask_logits, attn = self(
-                x2d,
-                x3d,
-                kpm,
-                return_attn_modalities=True,
-                return_bitmask=True,
-            )
-        else:
-            logits, abs_out, fluo_out, bitmask_logits = self(
-                x2d,
-                x3d,
-                kpm,
-                return_attn=False,
-                return_bitmask=True,
-            )
-            attn = None
+            attn = {
+                "attn_geom": forward_out.get("attn_geom"),
+                "attn_qm": forward_out.get("attn_qm"),
+                "modality_gates": forward_out["fusion_info"].get("modality_gates"),
+                "modality_scores": forward_out["fusion_info"].get("modality_scores"),
+                "modality_order": forward_out["fusion_info"].get("modality_order"),
+                "modality_attn": forward_out["fusion_info"].get("modality_attn"),
+            }
         bitmask_targets = self._bitmask_group_targets(y_cls)
 
         with autocast(enabled=False):
@@ -948,6 +1463,33 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 lambda_aux_fluo=self.lambda_aux_fluo,
                 lambda_aux_bitmask=self.lambda_aux_bitmask,
             )
+            contrastive_cross_modal = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
+            contrastive_3d_consistency = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
+            contrastive_supervised = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
+            if float(self.lambda_contrastive_cross_modal) > 0.0:
+                contrastive_cross_modal = self._cross_modal_contrastive_loss(
+                    fusion_info=forward_out["fusion_info"],
+                    mol_ids=mol_ids,
+                ).to(dtype=losses.total.dtype)
+            if float(self.lambda_contrastive_3d_consistency) > 0.0:
+                contrastive_3d_consistency = self._three_d_view_consistency_loss(
+                    x3d_pad=x3d,
+                    key_padding_mask=kpm,
+                    mol_ids=mol_ids,
+                ).to(dtype=losses.total.dtype)
+            if float(self.lambda_contrastive_supervised) > 0.0:
+                contrastive_supervised = self._supervised_task_contrastive_loss(
+                    z_tasks=forward_out["z_tasks"],
+                    y_cls=y_cls,
+                    w_cls=w_cls,
+                ).to(dtype=losses.total.dtype)
+            weighted_contrastive_cross_modal = float(self.lambda_contrastive_cross_modal) * contrastive_cross_modal
+            weighted_contrastive_3d_consistency = (
+                float(self.lambda_contrastive_3d_consistency) * contrastive_3d_consistency
+            )
+            weighted_contrastive_supervised = (
+                float(self.lambda_contrastive_supervised) * contrastive_supervised
+            )
             concept_alignment = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
             concept_bonus = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
             if use_attn_guidance and attn is not None and float(self.rl_guidance_scale) > 0.0:
@@ -959,7 +1501,13 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                     conf_pad=conf_pad,
                 )
                 concept_bonus = float(self.rl_guidance_scale) * concept_alignment
-            total_loss = losses.total - concept_bonus
+            total_loss = (
+                losses.total
+                + weighted_contrastive_cross_modal
+                + weighted_contrastive_3d_consistency
+                + weighted_contrastive_supervised
+                - concept_bonus
+            )
 
         bs = int(y_cls.shape[0])
         self.log("train_loss", total_loss, on_step=False, on_epoch=True, batch_size=bs)
@@ -976,6 +1524,42 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self.log("train_concept_alignment", concept_alignment, on_step=False, on_epoch=True, batch_size=bs)
         self.log("train_concept_bonus", concept_bonus, on_step=False, on_epoch=True, batch_size=bs)
         self.log("train_rl_guidance_scale", float(self.rl_guidance_scale), on_step=False, on_epoch=True, batch_size=bs)
+        self.log("train_contrastive_cross_modal", contrastive_cross_modal, on_step=False, on_epoch=True, batch_size=bs)
+        self.log(
+            "train_contrastive_cross_modal_weighted",
+            weighted_contrastive_cross_modal,
+            on_step=False,
+            on_epoch=True,
+            batch_size=bs,
+        )
+        self.log(
+            "train_contrastive_3d_consistency",
+            contrastive_3d_consistency,
+            on_step=False,
+            on_epoch=True,
+            batch_size=bs,
+        )
+        self.log(
+            "train_contrastive_3d_consistency_weighted",
+            weighted_contrastive_3d_consistency,
+            on_step=False,
+            on_epoch=True,
+            batch_size=bs,
+        )
+        self.log(
+            "train_contrastive_supervised",
+            contrastive_supervised,
+            on_step=False,
+            on_epoch=True,
+            batch_size=bs,
+        )
+        self.log(
+            "train_contrastive_supervised_weighted",
+            weighted_contrastive_supervised,
+            on_step=False,
+            on_epoch=True,
+            batch_size=bs,
+        )
         return total_loss
 
     def on_validation_epoch_start(self):
@@ -1016,4 +1600,21 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self.log("val_objective_ap", float(objective_ap), prog_bar=False, on_step=False, on_epoch=True)
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        param_groups: Dict[str, List[torch.nn.Parameter]] = {"2d": [], "3d": [], "fusion": [], "heads": []}
+        for name, param in self.named_parameters():
+            group = self._parameter_group_name(str(name))
+            param_groups[group].append(param)
+
+        optimizer_groups: List[Dict[str, Any]] = []
+        for group_name in ("2d", "3d", "fusion", "heads"):
+            params = param_groups[group_name]
+            if len(params) == 0:
+                continue
+            optimizer_groups.append(
+                {
+                    "params": params,
+                    "lr": float(self.lr) * float(self.lr_group_scales[group_name]),
+                    "weight_decay": float(self.weight_decay) * float(self.weight_decay_group_scales[group_name]),
+                }
+            )
+        return torch.optim.AdamW(optimizer_groups, lr=self.lr, weight_decay=self.weight_decay)

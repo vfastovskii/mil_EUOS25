@@ -111,11 +111,28 @@ class MILModelBuilder:
             optimization=MILOptimizationConfig(
                 lr=float(opt.lr),
                 weight_decay=float(opt.weight_decay),
+                lr_scale_2d=float(opt.lr_scale_2d),
+                lr_scale_3d=float(opt.lr_scale_3d),
+                lr_scale_fusion=float(opt.lr_scale_fusion),
+                lr_scale_heads=float(opt.lr_scale_heads),
+                weight_decay_scale_2d=float(opt.weight_decay_scale_2d),
+                weight_decay_scale_3d=float(opt.weight_decay_scale_3d),
+                weight_decay_scale_fusion=float(opt.weight_decay_scale_fusion),
+                weight_decay_scale_heads=float(opt.weight_decay_scale_heads),
+                stage_2d_only_epochs=int(opt.stage_2d_only_epochs),
+                stage_3d_only_epochs=int(opt.stage_3d_only_epochs),
             ),
             loss=MILLossConfig(
                 lambda_aux_abs=float(loss.lambda_aux_abs),
                 lambda_aux_fluo=float(loss.lambda_aux_fluo),
                 lambda_aux_bitmask=float(loss.lambda_aux_bitmask),
+                lambda_contrastive_cross_modal=float(loss.lambda_contrastive_cross_modal),
+                lambda_contrastive_3d_consistency=float(loss.lambda_contrastive_3d_consistency),
+                lambda_contrastive_supervised=float(loss.lambda_contrastive_supervised),
+                contrastive_proj_dim=int(loss.contrastive_proj_dim),
+                contrastive_temperature=float(loss.contrastive_temperature),
+                consistency_view_keep_rate=float(loss.consistency_view_keep_rate),
+                cross_modal_include_geom_qm=bool(loss.cross_modal_include_geom_qm),
                 reg_loss_type=str(loss.reg_loss_type),
                 bitmask_group_top_ids=(
                     [int(x) for x in bitmask_group_top_ids]

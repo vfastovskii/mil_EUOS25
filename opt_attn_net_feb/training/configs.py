@@ -100,6 +100,16 @@ class OptimizationConfig:
     """
     lr: float = 8e-5
     weight_decay: float = 3e-6
+    lr_scale_2d: float = 1.0
+    lr_scale_3d: float = 1.0
+    lr_scale_fusion: float = 1.0
+    lr_scale_heads: float = 1.0
+    weight_decay_scale_2d: float = 1.0
+    weight_decay_scale_3d: float = 1.0
+    weight_decay_scale_fusion: float = 1.0
+    weight_decay_scale_heads: float = 1.0
+    stage_2d_only_epochs: int = 0
+    stage_3d_only_epochs: int = 0
 
 
 @dataclass(frozen=True)
@@ -208,6 +218,13 @@ class LossWeightingConfig:
     lambda_aux_abs: float = 0.05
     lambda_aux_fluo: float = 0.05
     lambda_aux_bitmask: float = 0.05
+    lambda_contrastive_cross_modal: float = 0.05
+    lambda_contrastive_3d_consistency: float = 0.05
+    lambda_contrastive_supervised: float = 0.05
+    contrastive_proj_dim: int = 64
+    contrastive_temperature: float = 0.10
+    consistency_view_keep_rate: float = 0.70
+    cross_modal_include_geom_qm: bool = True
     bitmask_group_top_k: int = 6
     bitmask_group_weight_alpha: float = 0.5
     bitmask_group_weight_cap: float = 5.0
@@ -255,6 +272,13 @@ class LossWeightingConfig:
             lambda_aux_abs=float(params.get("lambda_aux_abs", 0.05)),
             lambda_aux_fluo=float(params.get("lambda_aux_fluo", 0.05)),
             lambda_aux_bitmask=float(params.get("lambda_aux_bitmask", 0.05)),
+            lambda_contrastive_cross_modal=float(params.get("lambda_contrastive_cross_modal", 0.05)),
+            lambda_contrastive_3d_consistency=float(params.get("lambda_contrastive_3d_consistency", 0.05)),
+            lambda_contrastive_supervised=float(params.get("lambda_contrastive_supervised", 0.05)),
+            contrastive_proj_dim=int(params.get("contrastive_proj_dim", 64)),
+            contrastive_temperature=float(params.get("contrastive_temperature", 0.10)),
+            consistency_view_keep_rate=float(params.get("consistency_view_keep_rate", 0.70)),
+            cross_modal_include_geom_qm=bool(params.get("cross_modal_include_geom_qm", True)),
             bitmask_group_top_k=int(params.get("bitmask_group_top_k", 6)),
             bitmask_group_weight_alpha=float(params.get("bitmask_group_weight_alpha", 0.5)),
             bitmask_group_weight_cap=float(params.get("bitmask_group_weight_cap", 5.0)),
@@ -376,6 +400,16 @@ class HPOConfig:
         optimization = OptimizationConfig(
             lr=float(params.get("lr", 8e-5)),
             weight_decay=float(params.get("weight_decay", 3e-6)),
+            lr_scale_2d=float(params.get("lr_scale_2d", 1.0)),
+            lr_scale_3d=float(params.get("lr_scale_3d", 1.0)),
+            lr_scale_fusion=float(params.get("lr_scale_fusion", 1.0)),
+            lr_scale_heads=float(params.get("lr_scale_heads", 1.0)),
+            weight_decay_scale_2d=float(params.get("weight_decay_scale_2d", 1.0)),
+            weight_decay_scale_3d=float(params.get("weight_decay_scale_3d", 1.0)),
+            weight_decay_scale_fusion=float(params.get("weight_decay_scale_fusion", 1.0)),
+            weight_decay_scale_heads=float(params.get("weight_decay_scale_heads", 1.0)),
+            stage_2d_only_epochs=int(params.get("stage_2d_only_epochs", 0)),
+            stage_3d_only_epochs=int(params.get("stage_3d_only_epochs", 0)),
         )
 
         runtime = RuntimeConfig(
