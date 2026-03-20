@@ -586,6 +586,10 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self._val_p: List[np.ndarray] = []
         self._val_y: List[np.ndarray] = []
         self._val_w: List[np.ndarray] = []
+        self._train_real_3d_with: int = 0
+        self._train_real_3d_without: int = 0
+        self._val_real_3d_with: int = 0
+        self._val_real_3d_without: int = 0
 
         # Optional concept-guidance RL controls (configured externally for final runs).
         self.rl_enabled: bool = False
@@ -769,6 +773,53 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 fields[f"group_{group_name}_weight_decay"] = float(opt_values[group_name]["weight_decay"])
         return fields
 
+    def _accumulate_real_3d_counts(
+        self,
+        *,
+        split: str,
+        x3d_pad: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+    ) -> None:
+        real_valid = self._non_dummy_valid_instance_mask(
+            x3d_pad=x3d_pad,
+            key_padding_mask=key_padding_mask,
+        )
+        n_with = int(real_valid.any(dim=1).sum().detach().item())
+        batch_size = int(x3d_pad.shape[0])
+        n_without = int(max(0, batch_size - n_with))
+        if str(split) == "train":
+            self._train_real_3d_with += int(n_with)
+            self._train_real_3d_without += int(n_without)
+        elif str(split) == "val":
+            self._val_real_3d_with += int(n_with)
+            self._val_real_3d_without += int(n_without)
+        else:
+            raise ValueError(f"Unsupported split={split}")
+
+    def _log_real_3d_epoch_summary(self, *, split: str) -> None:
+        if str(split) == "train":
+            n_with = int(self._train_real_3d_with)
+            n_without = int(self._train_real_3d_without)
+            event_name = "mil.train.epoch_real3d"
+        elif str(split) == "val":
+            n_with = int(self._val_real_3d_with)
+            n_without = int(self._val_real_3d_without)
+            event_name = "mil.val.epoch_real3d"
+        else:
+            raise ValueError(f"Unsupported split={split}")
+        total = int(n_with + n_without)
+        if total <= 0:
+            return
+        log_event(
+            "INFO",
+            event_name,
+            epoch=int(getattr(self, "current_epoch", 0)),
+            stage_mode=str(self._stage_mode_for_epoch(int(getattr(self, "current_epoch", 0)))),
+            n_samples_with_real_3d=int(n_with),
+            n_samples_without_real_3d=int(n_without),
+            frac_with_real_3d=float(n_with / float(total)),
+        )
+
     def on_fit_start(self) -> None:
         self._stagewise_active = True
         self._apply_stage_trainability()
@@ -776,7 +827,12 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
 
     def on_train_epoch_start(self) -> None:
         self._apply_stage_trainability()
+        self._train_real_3d_with = 0
+        self._train_real_3d_without = 0
         log_event("INFO", "mil.train.epoch_start", **self._current_stage_log_fields())
+
+    def on_train_epoch_end(self) -> None:
+        self._log_real_3d_epoch_summary(split="train")
 
     def on_fit_end(self) -> None:
         self._stagewise_active = False
@@ -1089,6 +1145,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self,
         *,
         x2d: torch.Tensor,
+        x3d_pad: torch.Tensor,
+        key_padding_mask: torch.Tensor,
         pooled_geom: torch.Tensor,
         pooled_qm: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -1123,10 +1181,26 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         if len(modality_parts) == 0:
             raise RuntimeError("No active modality projections found for mixer input.")
         enabled_modalities = self._enabled_modalities_for_current_stage()
-        if len(enabled_modalities) > 0 and enabled_modalities != set(self.active_modalities):
-            for name in tuple(modality_parts.keys()):
-                if str(name) not in enabled_modalities:
-                    modality_parts[str(name)] = torch.zeros_like(modality_parts[str(name)])
+        sample_has_real_3d = self._non_dummy_valid_instance_mask(
+            x3d_pad=x3d_pad,
+            key_padding_mask=key_padding_mask,
+        ).any(dim=1)
+        modality_presence: Dict[str, torch.Tensor] = {}
+        for name in self.active_modalities:
+            name_str = str(name)
+            present = torch.ones((batch_size,), dtype=torch.bool, device=x2d.device)
+            if name_str not in enabled_modalities:
+                present = torch.zeros((batch_size,), dtype=torch.bool, device=x2d.device)
+            elif name_str in {"3d_geom", "3d_qm"}:
+                present = sample_has_real_3d
+            modality_presence[name_str] = present
+        for name in tuple(modality_parts.keys()):
+            presence = modality_presence.get(str(name))
+            if presence is None:
+                continue
+            modality_parts[str(name)] = modality_parts[str(name)] * presence.to(
+                dtype=modality_parts[str(name)].dtype
+            ).view(batch_size, 1, 1)
         tokens = torch.stack(
             [modality_parts[str(name)] for name in self.active_modalities],
             dim=2,
@@ -1134,11 +1208,14 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         n_modalities = int(tokens.shape[2])
         type_embed = self.modality_type_embeddings[:n_modalities].view(1, 1, n_modalities, self.proj_dim)
         tokens_with_type = tokens + type_embed
-        active_mask = torch.tensor(
-            [1.0 if str(name) in enabled_modalities else 0.0 for name in self.active_modalities],
-            dtype=tokens.dtype,
-            device=tokens.device,
-        ).view(1, 1, n_modalities)
+        active_mask = torch.stack(
+            [
+                modality_presence[str(name)].to(dtype=tokens.dtype, device=tokens.device)
+                for name in self.active_modalities
+            ],
+            dim=1,
+        ).view(batch_size, 1, n_modalities)
+        active_mask_bt = active_mask.expand(batch_size, NUM_TASKS, n_modalities)
 
         if n_modalities == 1:
             modality_scores = torch.ones(
@@ -1146,17 +1223,22 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 dtype=tokens.dtype,
                 device=tokens.device,
             )
-            modality_gates = modality_scores
+            modality_gates = active_mask_bt
         else:
             flat_tokens = tokens_with_type.reshape(batch_size * NUM_TASKS * n_modalities, self.proj_dim)
             modality_scores = self.modality_gate_net(flat_tokens).reshape(batch_size, NUM_TASKS, n_modalities)
-            if bool(torch.any(active_mask < 0.5)):
-                modality_scores = modality_scores.masked_fill(active_mask < 0.5, -1e9)
+            if bool(torch.any(active_mask_bt < 0.5)):
+                # Use a dtype-safe floor so mixed-precision runs do not overflow on fp16.
+                modality_scores = modality_scores.masked_fill(
+                    active_mask_bt < 0.5,
+                    float(torch.finfo(modality_scores.dtype).min),
+                )
             if self.fusion_use_modality_gates:
                 modality_gates = torch.softmax(modality_scores, dim=-1)
+                modality_gates = modality_gates * active_mask_bt
+                modality_gates = modality_gates / modality_gates.sum(dim=-1, keepdim=True).clamp_min(1.0)
             else:
-                denom = active_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
-                modality_gates = active_mask / denom
+                modality_gates = active_mask_bt / active_mask_bt.sum(dim=-1, keepdim=True).clamp_min(1.0)
 
         gated_tokens = tokens * modality_gates.unsqueeze(-1)
         modality_attn = None
@@ -1170,21 +1252,39 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             and n_modalities > 1
         ):
             seq = gated_tokens.reshape(batch_size * NUM_TASKS, n_modalities, self.proj_dim)
+            seq_active_mask = active_mask_bt.reshape(batch_size * NUM_TASKS, n_modalities).bool()
             seq_type = type_embed.expand(batch_size, NUM_TASKS, -1, -1).reshape(
                 batch_size * NUM_TASKS, n_modalities, self.proj_dim
             )
-            seq_in = seq + seq_type
-            attn_out, attn_w = self.modality_interaction_attn(
-                query=seq_in,
-                key=seq_in,
-                value=seq_in,
-                need_weights=True,
-                average_attn_weights=False,
+            seq_in = seq + (seq_type * seq_active_mask.to(dtype=seq.dtype).unsqueeze(-1))
+            row_has_active = seq_active_mask.any(dim=1)
+            fused_seq = seq
+            modality_attn_full = torch.zeros(
+                (batch_size * NUM_TASKS, n_modalities, n_modalities),
+                dtype=seq.dtype,
+                device=seq.device,
             )
-            seq = self.modality_interaction_ln1(seq + self.modality_interaction_dropout(attn_out))
-            seq = self.modality_interaction_ln2(seq + self.modality_interaction_ffn(seq))
-            fused_tokens = seq.reshape(batch_size, NUM_TASKS, n_modalities, self.proj_dim)
-            modality_attn = attn_w.mean(dim=1).reshape(batch_size, NUM_TASKS, n_modalities, n_modalities)
+            if bool(torch.any(row_has_active)):
+                active_rows = torch.nonzero(row_has_active, as_tuple=False).squeeze(1)
+                seq_in_sel = seq_in.index_select(0, active_rows)
+                seq_sel = seq.index_select(0, active_rows)
+                seq_mask_sel = seq_active_mask.index_select(0, active_rows)
+                attn_out, attn_w = self.modality_interaction_attn(
+                    query=seq_in_sel,
+                    key=seq_in_sel,
+                    value=seq_in_sel,
+                    need_weights=True,
+                    average_attn_weights=False,
+                    key_padding_mask=(~seq_mask_sel),
+                )
+                seq_sel = self.modality_interaction_ln1(seq_sel + self.modality_interaction_dropout(attn_out))
+                seq_sel = self.modality_interaction_ln2(seq_sel + self.modality_interaction_ffn(seq_sel))
+                seq_sel = seq_sel * seq_mask_sel.to(dtype=seq_sel.dtype).unsqueeze(-1)
+                fused_seq = fused_seq.clone()
+                fused_seq.index_copy_(0, active_rows, seq_sel)
+                modality_attn_full.index_copy_(0, active_rows, attn_w.mean(dim=1))
+            fused_tokens = fused_seq.reshape(batch_size, NUM_TASKS, n_modalities, self.proj_dim)
+            modality_attn = modality_attn_full.reshape(batch_size, NUM_TASKS, n_modalities, n_modalities)
 
         mix_in = fused_tokens.reshape(batch_size * NUM_TASKS, n_modalities * self.proj_dim)
         z_tasks = self.mixer(mix_in).reshape(batch_size, NUM_TASKS, -1)  # [B,4,mixer_hidden]
@@ -1195,6 +1295,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             "modality_gates": modality_gates,
             "modality_attn": modality_attn,
             "modality_parts": modality_parts,
+            "sample_has_real_3d": sample_has_real_3d,
+            "modality_presence": {str(k): v for k, v in modality_presence.items()},
         }
         return z_tasks, fusion_info
 
@@ -1226,6 +1328,42 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         ids = [str(x) for x in mol_ids]
         mask = [[ids[i] == ids[j] for j in range(len(ids))] for i in range(len(ids))]
         return torch.tensor(mask, dtype=torch.bool, device=device)
+
+    @staticmethod
+    def _mask_positive_pairs_by_sample_eligibility(
+        positive_mask: torch.Tensor,
+        sample_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if sample_mask is None:
+            return positive_mask
+        sample_mask = sample_mask.to(device=positive_mask.device, dtype=torch.bool).reshape(-1)
+        if int(sample_mask.numel()) != int(positive_mask.shape[0]):
+            raise ValueError(
+                f"Expected sample eligibility to have length {int(positive_mask.shape[0])}, "
+                f"got {int(sample_mask.numel())}"
+            )
+        pair_mask = sample_mask.unsqueeze(1) & sample_mask.unsqueeze(0)
+        return positive_mask & pair_mask
+
+    @staticmethod
+    def _non_dummy_valid_instance_mask(
+        *,
+        x3d_pad: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+        zero_tol: float = 1e-12,
+    ) -> torch.Tensor:
+        if x3d_pad.ndim != 3:
+            raise ValueError(f"Expected x3d_pad shape [B,N,F], got {tuple(x3d_pad.shape)}")
+        if key_padding_mask.ndim != 2:
+            raise ValueError(f"Expected key_padding_mask shape [B,N], got {tuple(key_padding_mask.shape)}")
+        if tuple(x3d_pad.shape[:2]) != tuple(key_padding_mask.shape):
+            raise ValueError(
+                f"Expected x3d_pad/key_padding_mask to agree on [B,N], "
+                f"got {tuple(x3d_pad.shape[:2])} vs {tuple(key_padding_mask.shape)}"
+            )
+        valid_mask = ~key_padding_mask.bool()
+        nonzero_mask = x3d_pad.abs().sum(dim=-1) > float(zero_tol)
+        return valid_mask & nonzero_mask
 
     @staticmethod
     def _multi_positive_info_nce(
@@ -1317,6 +1455,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         *,
         fusion_info: Dict[str, Any],
         mol_ids: Optional[Sequence[Any]],
+        x3d_pad: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         modality_parts = fusion_info.get("modality_parts")
         if not isinstance(modality_parts, dict) or len(modality_parts) <= 1:
@@ -1339,22 +1479,31 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             device=ref.device,
             mol_ids=mol_ids,
         )
+        has_real_3d: Optional[torch.Tensor] = None
+        if x3d_pad is not None and key_padding_mask is not None:
+            real_valid = self._non_dummy_valid_instance_mask(
+                x3d_pad=x3d_pad,
+                key_padding_mask=key_padding_mask,
+            )
+            has_real_3d = real_valid.any(dim=1)
         pair_losses: List[torch.Tensor] = []
         for name_a, name_b in (("2d", "3d_geom"), ("2d", "3d_qm")):
             if name_a in proj and name_b in proj:
+                pair_positive_mask = self._mask_positive_pairs_by_sample_eligibility(positive_mask, has_real_3d)
                 pair_losses.append(
                     self._contrastive_pair_loss(
                         za=proj[name_a],
                         zb=proj[name_b],
-                        positive_mask=positive_mask,
+                        positive_mask=pair_positive_mask,
                     )
                 )
         if self.cross_modal_include_geom_qm and ("3d_geom" in proj) and ("3d_qm" in proj):
+            pair_positive_mask = self._mask_positive_pairs_by_sample_eligibility(positive_mask, has_real_3d)
             pair_losses.append(
                 self._contrastive_pair_loss(
                     za=proj["3d_geom"],
                     zb=proj["3d_qm"],
-                    positive_mask=positive_mask,
+                    positive_mask=pair_positive_mask,
                 )
             )
         if len(pair_losses) == 0:
@@ -1416,12 +1565,21 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             return self.lam.new_zeros(())
         if (self.proj3d_geom is None) and (self.proj3d_qm is None):
             return self.lam.new_zeros(())
-        mask_a = self._sample_subset_padding_mask(
+        real_valid = self._non_dummy_valid_instance_mask(
+            x3d_pad=x3d_pad,
             key_padding_mask=key_padding_mask,
+        )
+        n_real_conformers = real_valid.sum(dim=1)
+        eligible_samples = n_real_conformers >= 2
+        if not bool(torch.any(eligible_samples)):
+            return self.lam.new_zeros(())
+        effective_kpm = key_padding_mask | (~real_valid)
+        mask_a = self._sample_subset_padding_mask(
+            key_padding_mask=effective_kpm,
             keep_rate=float(self.consistency_view_keep_rate),
         )
         mask_b = self._sample_subset_padding_mask(
-            key_padding_mask=key_padding_mask,
+            key_padding_mask=effective_kpm,
             keep_rate=float(self.consistency_view_keep_rate),
         )
         pooled_geom_a, pooled_qm_a, _, _ = self._pool_task_tokens(
@@ -1452,6 +1610,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             device=ref.device,
             mol_ids=mol_ids,
         )
+        positive_mask = self._mask_positive_pairs_by_sample_eligibility(positive_mask, eligible_samples)
         losses: List[torch.Tensor] = []
         for name in ("3d_geom", "3d_qm"):
             if name in proj_a and name in proj_b:
@@ -1516,6 +1675,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         )
         z_tasks, fusion_info = self._build_task_representations(
             x2d=x2d,
+            x3d_pad=x3d_pad,
+            key_padding_mask=key_padding_mask,
             pooled_geom=pooled_geom,
             pooled_qm=pooled_qm,
         )
@@ -1537,6 +1698,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x2d, x3d, kpm, y_cls, w_cls, y_abs, m_abs, w_abs, y_fluo, m_fluo, w_fluo = batch[:11]
+        self._accumulate_real_3d_counts(split="train", x3d_pad=x3d, key_padding_mask=kpm)
         mol_ids = batch[11] if len(batch) >= 13 else None
         conf_pad = batch[12] if len(batch) >= 13 else None
         use_attn_guidance = bool(self.rl_enabled and mol_ids is not None and conf_pad is not None)
@@ -1597,6 +1759,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 contrastive_cross_modal = self._cross_modal_contrastive_loss(
                     fusion_info=forward_out["fusion_info"],
                     mol_ids=mol_ids,
+                    x3d_pad=x3d,
+                    key_padding_mask=kpm,
                 ).to(dtype=losses.total.dtype)
             if float(self.lambda_contrastive_3d_consistency) > 0.0:
                 contrastive_3d_consistency = self._three_d_view_consistency_loss(
@@ -1691,9 +1855,12 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
 
     def on_validation_epoch_start(self):
         self._val_p, self._val_y, self._val_w = [], [], []
+        self._val_real_3d_with = 0
+        self._val_real_3d_without = 0
 
     def validation_step(self, batch, batch_idx):
         x2d, x3d, kpm, y_cls, w_cls, *_ = batch
+        self._accumulate_real_3d_counts(split="val", x3d_pad=x3d, key_padding_mask=kpm)
         logits, _, _ = self(x2d, x3d, kpm, return_attn=False)
 
         logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
@@ -1706,6 +1873,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self._val_w.append(w)
 
     def on_validation_epoch_end(self):
+        self._log_real_3d_epoch_summary(split="val")
         if not self._val_p:
             return
         p_all = np.concatenate(self._val_p, axis=0)
@@ -1720,19 +1888,29 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         else:
             objective_ap = float(macro_ap)
 
+        stage_mode = str(self._stage_mode_for_epoch(int(getattr(self, "current_epoch", 0))))
+        has_2d = bool("2d" in self.active_modalities)
+        has_3d = bool(("3d_geom" in self.active_modalities) or ("3d_qm" in self.active_modalities))
+        is_stagewise_multimodal = bool(self._stagewise_active and has_2d and has_3d)
+        stage_is_selection_eligible = (not is_stagewise_multimodal) or (stage_mode == "joint")
+        monitored_objective_ap = float(objective_ap if stage_is_selection_eligible else -1.0)
+
         for task_idx in range(NUM_TASKS):
             self.log(f"val_ap_{task_idx}", float(aps[task_idx]), prog_bar=False, on_step=False, on_epoch=True)
         self.log("val_macro_ap", float(macro_ap), prog_bar=True, on_step=False, on_epoch=True)
         self.log("val_min_ap", float(min_ap), prog_bar=False, on_step=False, on_epoch=True)
-        self.log("val_objective_ap", float(objective_ap), prog_bar=False, on_step=False, on_epoch=True)
+        self.log("val_objective_ap", float(monitored_objective_ap), prog_bar=False, on_step=False, on_epoch=True)
+        self.log("val_objective_ap_stage", float(objective_ap), prog_bar=False, on_step=False, on_epoch=True)
         log_event(
             "INFO",
             "mil.val.epoch_metrics",
             epoch=int(getattr(self, "current_epoch", 0)),
-            stage_mode=str(self._stage_mode_for_epoch(int(getattr(self, "current_epoch", 0)))),
+            stage_mode=str(stage_mode),
+            stage_selection_eligible=bool(stage_is_selection_eligible),
             val_macro_ap=float(macro_ap),
             val_min_ap=float(min_ap),
             val_objective_ap=float(objective_ap),
+            val_objective_ap_monitored=float(monitored_objective_ap),
             val_ap_t0=float(aps[0]),
             val_ap_t1=float(aps[1]),
             val_ap_t2=float(aps[2]),

@@ -108,8 +108,9 @@ def search_space(
          # Fixed objective mixing weight across all MIL trials to keep trials comparable
          # and consistently push optimization toward the weakest task.
          "min_w": 0.40,
-         "stage_2d_only_epochs": trial.suggest_categorical("stage_2d_only_epochs", [0, 1, 2, 3]),
-         "stage_3d_only_epochs": trial.suggest_categorical("stage_3d_only_epochs", [0, 1, 2, 3]),
+         # Keep multimodal HPO warmup short so trials reach the joint stage quickly.
+         "stage_2d_only_epochs": 1,
+         "stage_3d_only_epochs": 1,
          "accumulate_grad_batches": trial.suggest_categorical("accumulate_grad_batches", [8, 16]),
          "head_stochastic_depth": trial.suggest_float("head_stochastic_depth", 0.0, 0.1)}
 
