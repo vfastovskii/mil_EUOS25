@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --time=23:59:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
+#SBATCH --cpus-per-task=16
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
@@ -68,8 +68,8 @@ MAX_EPOCHS="${MAX_EPOCHS:-150}"
 PATIENCE="${PATIENCE:-15}"
 SEED="${SEED:-0}"
 PRECISION="${PRECISION:-16-mixed}"
-NUM_WORKERS="${NUM_WORKERS:-12}"
-CPU_WORKERS="${CPU_WORKERS:-12}"
+NUM_WORKERS="${NUM_WORKERS:-15}"
+CPU_WORKERS="${CPU_WORKERS:-15}"
 PIN_MEMORY="${PIN_MEMORY:-0}"
 
 LEADERBOARD_SPLIT="${LEADERBOARD_SPLIT:-leaderboard}"
@@ -127,6 +127,9 @@ fi
 
 # -------------------- copy code + inputs to node-local scratch --------------------
 echo "[INFO] Copy code + inputs to node-local scratch..."
+
+# same logic pattern as the working Blend13 job:
+# copy the package tree into WORKDIR, then copy the entry script separately
 rsync -av \
   --exclude="__pycache__" \
   --exclude="*.pyc" \
@@ -151,7 +154,27 @@ fi
 
 export PYTHONPATH="$WORKDIR:${PYTHONPATH:-}"
 
-python3 -c "import opt_attn_net_feb; print('[INFO] opt_attn_net_feb import OK from', opt_attn_net_feb.__file__)"
+# same validation style, but stronger:
+python3 - <<'PY'
+import importlib.util
+import sys
+
+mods = [
+    "opt_attn_net_feb",
+    "opt_attn_net_feb.entrypoints",
+    "opt_attn_net_feb.entrypoints.hpo_pipeline",
+]
+
+for m in mods:
+    spec = importlib.util.find_spec(m)
+    print(f"[INFO] find_spec({m}) = {spec}")
+    if spec is None:
+        print(f"[ERROR] Missing import target: {m}")
+        sys.exit(4)
+
+import opt_attn_net_feb
+print("[INFO] opt_attn_net_feb import OK from", opt_attn_net_feb.__file__)
+PY
 
 CMD=(
   python3 "$WORKDIR/opt_net_fast.py"

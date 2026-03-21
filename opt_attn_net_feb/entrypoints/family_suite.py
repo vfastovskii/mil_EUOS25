@@ -276,6 +276,7 @@ def _save_family_best_params(*, outdir: Path, family: str, best_params: Mapping[
         "family": str(family),
         "best_params": dict(best_params),
         "best_value_macro_ap_cv": float(best_value),
+        "best_value_hpo_objective": float(best_value),
     }
     path.write_text(json.dumps(payload, indent=2))
     _maybe_mirror_best_params(path)
@@ -780,6 +781,68 @@ class _MILMacroCrossValidator:
             return all_folds, "full_cv_fallback", None, int(self._focus_fold_source_trials)
         return selected, "focus_fold_only", int(self._focus_fold_id), int(self._focus_fold_source_trials)
 
+    @staticmethod
+    def _selection_value_from_fold_detail(
+        *,
+        fold_detail: Mapping[str, Any],
+        eval_mode: str,
+        focus_fold_id: int | None,
+        fallback_value: float | None,
+    ) -> float | None:
+        scores: list[float] = []
+        focus_score: float | None = None
+        for fold_id_str, payload in fold_detail.items():
+            if not isinstance(payload, Mapping):
+                continue
+            raw = payload.get("objective_value", payload.get("score"))
+            if raw is None:
+                continue
+            score = float(raw)
+            if not np.isfinite(score):
+                continue
+            scores.append(float(score))
+            if focus_fold_id is not None and int(fold_id_str) == int(focus_fold_id):
+                focus_score = float(score)
+        if focus_score is not None:
+            return float(focus_score)
+        if len(scores) == 0:
+            if fallback_value is None:
+                return None
+            fallback = float(fallback_value)
+            return float(fallback) if np.isfinite(fallback) else None
+        if str(eval_mode) in {"full_cv_warmup", "full_cv_fallback"}:
+            return float(np.min(np.asarray(scores, dtype=np.float64)))
+        if fallback_value is not None:
+            fallback = float(fallback_value)
+            if np.isfinite(fallback):
+                return float(fallback)
+        return float(scores[0])
+
+    def get_best_completed_trial(self, study: optuna.Study) -> optuna.trial.FrozenTrial | None:
+        completed = study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,))
+        best_trial: optuna.trial.FrozenTrial | None = None
+        best_value = float("-inf")
+        for trial in completed:
+            selection_value = self._selection_value_from_fold_detail(
+                fold_detail=trial.user_attrs.get("fold_detail", {}),
+                eval_mode=str(trial.user_attrs.get("hpo_eval_mode", "")),
+                focus_fold_id=self._focus_fold_id,
+                fallback_value=(None if trial.value is None else float(trial.value)),
+            )
+            if selection_value is None:
+                continue
+            if (
+                best_trial is None
+                or float(selection_value) > float(best_value)
+                or (
+                    float(selection_value) == float(best_value)
+                    and int(trial.number) < int(best_trial.number)
+                )
+            ):
+                best_trial = trial
+                best_value = float(selection_value)
+        return best_trial
+
     def evaluate_trial(self, trial: optuna.Trial) -> float:
         log_event("START", "family.hpo.trial.evaluate", trial=int(trial.number), family=str(self.family))
         params = _mil_search_space_for_family(trial=trial, family=str(self.family))
@@ -870,19 +933,50 @@ class _MILMacroCrossValidator:
             fold_scores.append(float(trial_score))
             detail["objective_value"] = float(trial_score)
             fold_detail[str(fold_id)] = detail
-            trial.report(float(np.mean(fold_scores)), step=int(step))
+            if str(eval_mode) in {"full_cv_warmup", "full_cv_fallback"}:
+                interim_value = float(np.min(np.asarray(fold_scores, dtype=np.float64)))
+            else:
+                interim_value = float(np.mean(np.asarray(fold_scores, dtype=np.float64)))
+            trial.report(float(interim_value), step=int(step))
             if trial.should_prune():
                 raise optuna.TrialPruned()
         mean_score = float(np.mean(fold_scores))
+        min_fold_score = float(np.min(fold_scores))
+        selection_value = self._selection_value_from_fold_detail(
+            fold_detail=fold_detail,
+            eval_mode=str(eval_mode),
+            focus_fold_id=selected_fold_id,
+            fallback_value=float(mean_score),
+        )
+        if selection_value is None:
+            selection_value = float(mean_score)
         trial.set_user_attr("fold_detail", fold_detail)
+        trial.set_user_attr("hpo_mean_cv_value", float(mean_score))
+        trial.set_user_attr("hpo_min_fold_value", float(min_fold_score))
+        trial.set_user_attr("hpo_selection_value", float(selection_value))
+        trial.set_user_attr(
+            "hpo_selection_basis",
+            (
+                "resolved_focus_fold"
+                if selected_fold_id is not None
+                else "full_cv_min_fold_proxy"
+            ),
+        )
         log_event(
             "DONE",
             "family.hpo.trial.evaluate",
             trial=int(trial.number),
             family=str(self.family),
             mean_score=f"{mean_score:.6f}",
+            min_fold_score=f"{min_fold_score:.6f}",
+            selection_value=f"{float(selection_value):.6f}",
+            selection_basis=(
+                "resolved_focus_fold"
+                if selected_fold_id is not None
+                else "full_cv_min_fold_proxy"
+            ),
         )
-        return mean_score
+        return float(selection_value)
 
 
 def _catboost_search_space(trial: optuna.Trial, *, task_idx: int) -> Dict[str, Any]:
@@ -2652,16 +2746,32 @@ def run_family_suite(args: Any) -> None:
             pd.DataFrame(
                 study.trials_dataframe(attrs=("number", "value", "state", "params", "user_attrs"))
             ).to_csv(outdir / f"{study_name}_trials.csv", index=False)
-            bp = dict(study.best_params)
+            best_trial = cv.get_best_completed_trial(study)
+            if best_trial is None:
+                best_trial = study.best_trial
+            bp = dict(best_trial.params)
             bp["min_w"] = 0.4
             if str(family) == "mt_2d":
                 bp.update(_mt_2d_fixed_inactive_params())
             best_params[family] = bp
+            best_value = float(best_trial.user_attrs.get("hpo_selection_value", best_trial.value))
+            log_event(
+                "INFO",
+                "family.hpo.best_trial.selected",
+                family=str(family),
+                trial=int(best_trial.number),
+                hpo_value=f"{best_value:.6f}",
+                eval_mode=str(best_trial.user_attrs.get("hpo_eval_mode", "")),
+                eval_fold=best_trial.user_attrs.get("hpo_eval_fold_id"),
+                focus_fold=(None if cv._focus_fold_id is None else int(cv._focus_fold_id)),
+                internal_study_best_value=f"{float(study.best_value):.6f}",
+                internal_study_best_trial=int(study.best_trial.number),
+            )
             _save_family_best_params(
                 outdir=best_params_dir,
                 family=family,
                 best_params=bp,
-                best_value=float(study.best_value),
+                best_value=float(best_value),
             )
             log_event("INFO", "family.hpo.best_params.saved", family=str(family), path=str(best_params_dir / f"{family}.json"))
     else:

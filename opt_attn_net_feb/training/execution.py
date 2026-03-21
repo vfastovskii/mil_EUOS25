@@ -1375,6 +1375,68 @@ class MILCrossValidator:
             return all_folds, "full_cv_fallback", None, int(self._focus_fold_source_trials)
         return selected, "focus_fold_only", int(self._focus_fold_id), int(self._focus_fold_source_trials)
 
+    @staticmethod
+    def _selection_value_from_fold_detail(
+        *,
+        fold_detail: Mapping[str, Any],
+        eval_mode: str,
+        focus_fold_id: int | None,
+        fallback_value: float | None,
+    ) -> float | None:
+        scores: List[float] = []
+        focus_score: float | None = None
+        for fold_id_str, payload in fold_detail.items():
+            if not isinstance(payload, Mapping):
+                continue
+            raw = payload.get("objective_value", payload.get("score"))
+            if raw is None:
+                continue
+            score = float(raw)
+            if not np.isfinite(score):
+                continue
+            scores.append(float(score))
+            if focus_fold_id is not None and int(fold_id_str) == int(focus_fold_id):
+                focus_score = float(score)
+        if focus_score is not None:
+            return float(focus_score)
+        if len(scores) == 0:
+            if fallback_value is None:
+                return None
+            fallback = float(fallback_value)
+            return float(fallback) if np.isfinite(fallback) else None
+        if str(eval_mode) in {"full_cv_warmup", "full_cv_fallback"}:
+            return float(np.min(np.asarray(scores, dtype=np.float64)))
+        if fallback_value is not None:
+            fallback = float(fallback_value)
+            if np.isfinite(fallback):
+                return float(fallback)
+        return float(scores[0])
+
+    def get_best_completed_trial(self, study: optuna.Study) -> optuna.trial.FrozenTrial | None:
+        completed = study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,))
+        best_trial: optuna.trial.FrozenTrial | None = None
+        best_value = float("-inf")
+        for trial in completed:
+            selection_value = self._selection_value_from_fold_detail(
+                fold_detail=trial.user_attrs.get("fold_detail", {}),
+                eval_mode=str(trial.user_attrs.get("hpo_eval_mode", "")),
+                focus_fold_id=self._focus_fold_id,
+                fallback_value=(None if trial.value is None else float(trial.value)),
+            )
+            if selection_value is None:
+                continue
+            if (
+                best_trial is None
+                or float(selection_value) > float(best_value)
+                or (
+                    float(selection_value) == float(best_value)
+                    and int(trial.number) < int(best_trial.number)
+                )
+            ):
+                best_trial = trial
+                best_value = float(selection_value)
+        return best_trial
+
     def evaluate_trial(self, trial: Trial) -> float:
         log_event("START", "hpo.trial.evaluate", trial=int(trial.number))
         params = search_space(trial)
@@ -1438,20 +1500,34 @@ class MILCrossValidator:
             else:
                 trial_score = float(_fold_score)
             scores.append(float(trial_score))
+            detail["objective_value"] = float(trial_score)
             fold_detail[str(fold_id)] = detail
 
-            trial.report(float(np.mean(scores)), step=step)
+            if str(eval_mode) in {"full_cv_warmup", "full_cv_fallback"}:
+                interim_value = float(np.min(np.asarray(scores, dtype=np.float64)))
+            else:
+                interim_value = float(np.mean(np.asarray(scores, dtype=np.float64)))
+            trial.report(float(interim_value), step=step)
             if trial.should_prune():
                 log_event(
                     "WARN",
                     "hpo.trial.pruned",
                     trial=int(trial.number),
                     cv_step=int(step),
-                    mean_score=f"{float(np.mean(scores)):.6f}",
+                    mean_score=f"{float(interim_value):.6f}",
                 )
                 raise optuna.TrialPruned()
 
         mean_score = float(np.mean(scores))
+        min_fold_score = float(np.min(scores))
+        selection_value = self._selection_value_from_fold_detail(
+            fold_detail=fold_detail,
+            eval_mode=str(eval_mode),
+            focus_fold_id=selected_fold_id,
+            fallback_value=float(mean_score),
+        )
+        if selection_value is None:
+            selection_value = float(mean_score)
         trial_artifact_json = _persist_trial_best_epoch_artifacts(
             outdir=Path(self.run_config.ckpt_root).parent,
             trial=trial,
@@ -1460,6 +1536,17 @@ class MILCrossValidator:
             mean_score=float(mean_score),
         )
         trial.set_user_attr("fold_detail", fold_detail)
+        trial.set_user_attr("hpo_mean_cv_value", float(mean_score))
+        trial.set_user_attr("hpo_min_fold_value", float(min_fold_score))
+        trial.set_user_attr("hpo_selection_value", float(selection_value))
+        trial.set_user_attr(
+            "hpo_selection_basis",
+            (
+                "resolved_focus_fold"
+                if selected_fold_id is not None
+                else "full_cv_min_fold_proxy"
+            ),
+        )
         if trial_artifact_json is not None:
             trial.set_user_attr("best_epoch_params_json", str(trial_artifact_json))
             log_event(
@@ -1473,8 +1560,15 @@ class MILCrossValidator:
             "hpo.trial.evaluate",
             trial=int(trial.number),
             mean_score=f"{mean_score:.6f}",
+            min_fold_score=f"{min_fold_score:.6f}",
+            selection_value=f"{float(selection_value):.6f}",
+            selection_basis=(
+                "resolved_focus_fold"
+                if selected_fold_id is not None
+                else "full_cv_min_fold_proxy"
+            ),
         )
-        return mean_score
+        return float(selection_value)
 
 
 class StudyArtifactsWriter:
@@ -1486,13 +1580,23 @@ class StudyArtifactsWriter:
     to save fold-specific metrics in a consistent manner.
     """
     @staticmethod
-    def save_study_artifacts(*, outdir: Path, study: optuna.Study, prefix: str) -> None:
+    def save_study_artifacts(
+        *,
+        outdir: Path,
+        study: optuna.Study,
+        prefix: str,
+        best_trial: optuna.trial.FrozenTrial | None = None,
+    ) -> None:
         df_trials = study.trials_dataframe(
             attrs=("number", "value", "state", "params", "user_attrs")
         )
         df_trials.to_csv(outdir / f"{prefix}_trials.csv", index=False)
-        best = dict(study.best_params)
-        best["best_value_macro_ap_cv"] = float(study.best_value)
+        selected_trial = study.best_trial if best_trial is None else best_trial
+        best = dict(selected_trial.params)
+        best_value = float(selected_trial.user_attrs.get("hpo_selection_value", selected_trial.value))
+        best["best_value_macro_ap_cv"] = float(best_value)
+        best["best_value_hpo_objective"] = float(best_value)
+        best["best_trial_number"] = int(selected_trial.number)
         (outdir / f"{prefix}_best_params.json").write_text(json.dumps(best, indent=2))
 
     @staticmethod
@@ -1565,18 +1669,37 @@ class MILStudyRunner:
                 gc_after_trial=True,
                 catch=(RuntimeError, ValueError, FloatingPointError),
             )
-            log_event("INFO", "hpo.study.optimize.done", best_value=f"{float(study.best_value):.6f}")
+            selected_best_trial = self.cross_validator.get_best_completed_trial(study)
+            if selected_best_trial is None:
+                selected_best_trial = study.best_trial
+            selected_best_value = float(
+                selected_best_trial.user_attrs.get("hpo_selection_value", selected_best_trial.value)
+            )
+            log_event(
+                "INFO",
+                "hpo.study.optimize.done",
+                best_value=f"{float(study.best_value):.6f}",
+                selected_best_value=f"{selected_best_value:.6f}",
+                selected_best_trial=int(selected_best_trial.number),
+                selected_eval_mode=str(selected_best_trial.user_attrs.get("hpo_eval_mode", "")),
+                selected_eval_fold=selected_best_trial.user_attrs.get("hpo_eval_fold_id"),
+                focus_fold=(None if self.cross_validator._focus_fold_id is None else int(self.cross_validator._focus_fold_id)),
+            )
             StudyArtifactsWriter.save_study_artifacts(
                 outdir=self.config.outdir,
                 study=study,
                 prefix=self.config.study_name,
+                best_trial=selected_best_trial,
             )
             StudyArtifactsWriter.save_best_fold_metrics(
                 outdir=self.config.outdir,
                 prefix=self.config.study_name,
-                fold_metrics=study.best_trial.user_attrs.get("fold_detail", {}),
+                fold_metrics=selected_best_trial.user_attrs.get("fold_detail", {}),
             )
-            print(f"[HPO] best macro AP (CV mean) = {study.best_value:.6f}")
+            print(
+                f"[HPO] selected best HPO objective = {selected_best_value:.6f} "
+                f"(trial={int(selected_best_trial.number)}, internal_optuna_best={float(study.best_value):.6f})"
+            )
             return study
 
 
