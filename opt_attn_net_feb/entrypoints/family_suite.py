@@ -1379,6 +1379,7 @@ def _run_mil_final_train_and_predict(
     write_explainability_outputs: bool = True,
     output_prefix: str = "leaderboard",
     fixed_train_epochs: int | None = None,
+    use_eval_split_for_validation: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     set_all_seeds(int(cfg.seed))
     hpo_cfg = HPOConfig.from_params(
@@ -1449,25 +1450,31 @@ def _run_mil_final_train_and_predict(
         max_instances=0,
         seed=int(cfg.seed) + 7,
     )
-    val_internal_idx = _make_internal_val_indices(len(family_data.ids_train), seed=int(cfg.seed) + 27183)
-    ds_val_internal = MILTrainDataset(
-        [family_data.ids_train[int(i)] for i in val_internal_idx.tolist()],
-        family_data.X2d_train[val_internal_idx],
-        family_data.y_cls_train[val_internal_idx],
-        family_data.w_cls_train[val_internal_idx],
-        y_abs_tr_sc[val_internal_idx],
-        family_data.m_abs_train[val_internal_idx],
-        family_data.w_abs_train[val_internal_idx],
-        y_fluo_tr_sc[val_internal_idx],
-        family_data.m_fluo_train[val_internal_idx],
-        family_data.w_fluo_train[val_internal_idx],
-        family_data.starts,
-        family_data.counts,
-        family_data.id2pos,
-        family_data.Xinst_sorted,
-        max_instances=0,
-        seed=int(cfg.seed) + 11,
-    )
+    val_internal_idx = np.zeros((0,), dtype=np.int64)
+    ds_val_internal: MILTrainDataset | None = None
+    if not bool(use_eval_split_for_validation):
+        val_internal_idx = _make_internal_val_indices(
+            len(family_data.ids_train),
+            seed=int(cfg.seed) + 27183,
+        )
+        ds_val_internal = MILTrainDataset(
+            [family_data.ids_train[int(i)] for i in val_internal_idx.tolist()],
+            family_data.X2d_train[val_internal_idx],
+            family_data.y_cls_train[val_internal_idx],
+            family_data.w_cls_train[val_internal_idx],
+            y_abs_tr_sc[val_internal_idx],
+            family_data.m_abs_train[val_internal_idx],
+            family_data.w_abs_train[val_internal_idx],
+            y_fluo_tr_sc[val_internal_idx],
+            family_data.m_fluo_train[val_internal_idx],
+            family_data.w_fluo_train[val_internal_idx],
+            family_data.starts,
+            family_data.counts,
+            family_data.id2pos,
+            family_data.Xinst_sorted,
+            max_instances=0,
+            seed=int(cfg.seed) + 11,
+        )
     ds_eval = MILTrainDataset(
         family_data.ids_lb,
         family_data.X2d_lb,
@@ -1522,16 +1529,32 @@ def _run_mil_final_train_and_predict(
             sampler=sampler,
             collate_fn=collate_train,
         )
-    dl_val_internal = loader_builder.eval_loader(
-        ds_val_internal,
-        batch_size=min(128, int(hpo_cfg.runtime.batch_size)),
-        collate_fn=collate_train,
-    )
-    dl_eval = loader_builder.eval_loader(
-        ds_eval,
-        batch_size=min(128, int(hpo_cfg.runtime.batch_size)),
-        collate_fn=collate_train,
-    )
+    if bool(use_eval_split_for_validation):
+        dl_val = loader_builder.eval_loader(
+            ds_eval,
+            batch_size=min(128, int(hpo_cfg.runtime.batch_size)),
+            collate_fn=collate_train,
+        )
+        dl_eval = dl_val
+        validation_scope = (
+            "leaderboard" if str(output_prefix).startswith("leaderboard") else "eval_split"
+        )
+        n_validation_rows = int(len(family_data.ids_lb))
+    else:
+        if ds_val_internal is None:
+            raise RuntimeError("Internal validation dataset is missing.")
+        dl_val = loader_builder.eval_loader(
+            ds_val_internal,
+            batch_size=min(128, int(hpo_cfg.runtime.batch_size)),
+            collate_fn=collate_train,
+        )
+        dl_eval = loader_builder.eval_loader(
+            ds_eval,
+            batch_size=min(128, int(hpo_cfg.runtime.batch_size)),
+            collate_fn=collate_train,
+        )
+        validation_scope = "internal_train_subset"
+        n_validation_rows = int(val_internal_idx.size)
 
     bitmask_group_top_ids, bitmask_group_class_weight = build_bitmask_group_definition(
         family_data.y_cls_train,
@@ -1625,6 +1648,9 @@ def _run_mil_final_train_and_predict(
         family=str(family_data.family),
         output_prefix=str(output_prefix),
         use_fixed_epochs=bool(use_fixed_epochs),
+        use_eval_split_for_validation=bool(use_eval_split_for_validation),
+        validation_scope=str(validation_scope),
+        n_validation_rows=int(n_validation_rows),
         max_epochs=int(trainer_cfg.max_epochs),
         patience=int(trainer_cfg.patience),
         accumulate_grad_batches=int(trainer_cfg.accumulate_grad_batches),
@@ -1636,7 +1662,7 @@ def _run_mil_final_train_and_predict(
         ckpt_dir=str(family_dir),
         trial=None,
     )
-    trainer.fit(model, dl_tr, dl_val_internal)
+    trainer.fit(model, dl_tr, dl_val)
     epochs_trained = int(trainer.current_epoch) + 1
     best_epoch: int | None = None
     if ckpt_cb is not None:
@@ -1668,6 +1694,9 @@ def _run_mil_final_train_and_predict(
             lam=lam,
             train_info={
                 "use_fixed_epochs": bool(use_fixed_epochs),
+                "use_eval_split_for_validation": bool(use_eval_split_for_validation),
+                "validation_scope": str(validation_scope),
+                "n_validation_rows": int(n_validation_rows),
                 "target_epochs": int(target_epochs),
                 "target_patience": int(target_patience),
                 "epochs_trained": int(epochs_trained),
@@ -1717,7 +1746,11 @@ def _run_mil_final_train_and_predict(
     if bool(write_outputs):
         metrics.to_csv(outdir / f"{output_prefix}_metrics_{family_data.family}.csv", index=False)
         df_pred.to_csv(outdir / f"{output_prefix}_preds_{family_data.family}.csv", index=False)
-        if bool(write_explainability_outputs) and (int(family_data.inst_geom_dim) > 0 or int(family_data.inst_qm_dim) > 0):
+        has_3d_attention = bool(
+            ("3d_geom" in getattr(model, "active_modalities", ()))
+            or ("3d_qm" in getattr(model, "active_modalities", ()))
+        )
+        if bool(has_3d_attention):
             export_ds = MILExportDataset(
                 ids=[str(x) for x in family_data.ids_lb],
                 X2d=np.asarray(family_data.X2d_lb, dtype=np.float32),
@@ -1757,6 +1790,13 @@ def _run_mil_final_train_and_predict(
                 fusion_gate_summary_path=str(summary_paths["fusion_gate_summary"]),
                 top_conformers_path=str(summary_paths["top_conformers"]),
             )
+        else:
+            log_event(
+                "INFO",
+                "family.final.mil.modality_export.skipped",
+                family=str(family_data.family),
+                reason="no_active_3d_modalities",
+            )
 
     train_info = {
         "family": str(family_data.family),
@@ -1777,7 +1817,7 @@ def _run_mil_final_train_and_predict(
             output_prefix=str(output_prefix),
             path=str(simple_model_path),
         )
-    del trainer, model, dl_tr, dl_val_internal, dl_eval, ds_tr, ds_val_internal, ds_eval
+    del trainer, model, dl_tr, dl_val, dl_eval, ds_tr, ds_val_internal, ds_eval
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
@@ -2844,6 +2884,7 @@ def run_family_suite(args: Any) -> None:
 
     # Strict no-leak calibration/blending fit scope: train OOF only.
     cv_oof_tables: Dict[str, pd.DataFrame] = {}
+    cv_oof_metrics_by_model: Dict[str, pd.DataFrame] = {}
     cv_fold_metrics_by_model: Dict[str, pd.DataFrame] = {}
     mil_selected_epochs: Dict[str, int] = {}
     catboost_selected_iterations: Dict[str, Dict[int, int]] = {}
@@ -2948,9 +2989,9 @@ def run_family_suite(args: Any) -> None:
             ],
             axis=1,
         )
-        _metric_table(y_true=y_oof, p_pred=p_oof, w_cls=w_oof).to_csv(
-            outdir / f"cv_oof_metrics_{model_key}.csv", index=False
-        )
+        cv_metrics_df = _metric_table(y_true=y_oof, p_pred=p_oof, w_cls=w_oof)
+        cv_oof_metrics_by_model[str(model_key)] = cv_metrics_df.copy()
+        cv_metrics_df.to_csv(outdir / f"cv_oof_metrics_{model_key}.csv", index=False)
 
     # Enforce identical OOF ID/fold mapping across families.
     fam_keys = list(cv_oof_tables.keys())
@@ -2992,6 +3033,7 @@ def run_family_suite(args: Any) -> None:
     calibration_fit_method = "identity" if cfg.skip_family_calibration else str(cfg.calibration_method)
 
     calibrated_oof_xfit: Dict[str, pd.DataFrame] = {}
+    calibrated_oof_xfit_metrics_by_model: Dict[str, pd.DataFrame] = {}
     calib_xfit_params_by_family: Dict[str, Dict[str, Any]] = {}
     for family, df_oof in cv_oof_tables.items():
         with log_step(
@@ -3079,6 +3121,7 @@ def run_family_suite(args: Any) -> None:
             )
             cal_xfit_metric_path = outdir / f"cv_oof_metrics_{family}_calibrated_xfit.csv"
             cal_xfit_metrics = _metric_table(y_true=y, p_pred=p_cal, w_cls=w)
+            calibrated_oof_xfit_metrics_by_model[str(family)] = cal_xfit_metrics.copy()
             cal_xfit_metrics.to_csv(cal_xfit_metric_path, index=False)
             cal_xfit_fold_metrics = _metric_table_by_fold(
                 y_true=y,
@@ -3105,6 +3148,7 @@ def run_family_suite(args: Any) -> None:
                 )
 
     calibrated_oof: Dict[str, pd.DataFrame] = {}
+    calibrated_oof_metrics_by_model: Dict[str, pd.DataFrame] = {}
     calib_params_by_family: Dict[str, Dict[str, Any]] = {}
     for family, df_oof in cv_oof_tables.items():
         with log_step(
@@ -3186,6 +3230,7 @@ def run_family_suite(args: Any) -> None:
             )
             cal_metric_path = outdir / f"cv_oof_metrics_{family}_calibrated.csv"
             cal_metrics = _metric_table(y_true=y, p_pred=p_cal, w_cls=w)
+            calibrated_oof_metrics_by_model[str(family)] = cal_metrics.copy()
             cal_metrics.to_csv(cal_metric_path, index=False)
             macro_row = cal_metrics[cal_metrics["task"] == "macro"]
             if len(macro_row) == 1:
@@ -3515,7 +3560,7 @@ def run_family_suite(args: Any) -> None:
     for model_key, family, rep_seed, rep_idx in model_specs:
         cfg_rep = replace(cfg, seed=int(rep_seed))
         if family == "catboost_st":
-            from catboost import CatBoostClassifier
+            from catboost import CatBoostClassifier, Pool
 
             ids_tr = df_train[cfg.id_col].astype(str).tolist()
             ids_lb = df_lb[cfg.id_col].astype(str).tolist()
@@ -3540,25 +3585,32 @@ def run_family_suite(args: Any) -> None:
                 pos = float(y_tr[:, t].sum())
                 neg = float(len(y_tr) - pos)
                 spw = min(neg / max(pos, 1.0), float(p.get("pos_weight_clip", 100.0)))
-                target_iterations = int(selected_iter_map.get(int(t), int(_resolve_catboost_iterations(p))))
+                cv_selected_iterations = int(selected_iter_map.get(int(t), int(_resolve_catboost_iterations(p))))
+                iteration_cap = int(_resolve_catboost_iterations(p))
                 cb_kwargs = _catboost_common_params(
                     params=p,
                     seed=int(cfg_rep.seed) + 97 * int(t),
                     threads=max(1, int(cfg_rep.cpu_workers)),
                     scale_pos_weight=float(spw),
                 )
-                cb_kwargs["iterations"] = int(target_iterations)
+                cb_kwargs["iterations"] = int(iteration_cap)
                 cb = CatBoostClassifier(
                     **cb_kwargs
                 )
                 sw = (w_tr[:, t] if t in (0, 1) else None)
+                sw_lb = (w_lb[:, t] if t in (0, 1) else None)
+                train_pool = Pool(X2d_tr, y_tr[:, t], weight=sw)
+                eval_pool = Pool(X2d_lb, y_lb[:, t], weight=sw_lb)
                 cb.fit(
-                    X2d_tr,
-                    y_tr[:, t],
-                    sample_weight=sw,
-                    use_best_model=False,
+                    train_pool,
+                    eval_set=eval_pool,
+                    use_best_model=True,
+                    early_stopping_rounds=200,
                     verbose=False,
                 )
+                best_iteration = int(cb.get_best_iteration())
+                if best_iteration < 0:
+                    best_iteration = int(cb.tree_count_) - 1
                 cb_model_path = family_model_dir / f"leaderboard_{model_key}_task{int(t)}.cbm"
                 cb.save_model(str(cb_model_path))
                 pred[:, t] = cb.predict_proba(X2d_lb)[:, 1]
@@ -3570,7 +3622,11 @@ def run_family_suite(args: Any) -> None:
                     replica_idx=int(rep_idx),
                     seed=int(rep_seed),
                     task_idx=int(t),
-                    selected_iterations=int(target_iterations),
+                    cv_selected_iterations_reference=int(cv_selected_iterations),
+                    iteration_cap=int(iteration_cap),
+                    best_iteration=int(best_iteration),
+                    use_best_model=True,
+                    validation_scope="leaderboard",
                     scale_pos_weight=f"{float(spw):.6f}",
                     model_path=str(cb_model_path),
                 )
@@ -3597,7 +3653,9 @@ def run_family_suite(args: Any) -> None:
             model=str(model_key),
             replica_idx=int(rep_idx),
             seed=int(rep_seed),
-            selected_epochs=int(selected_epochs),
+            cv_selected_epochs_reference=int(selected_epochs),
+            fit_strategy="max_epochs_with_early_stopping",
+            validation_scope="leaderboard",
         )
         df_pred, metrics_family, train_info = _run_mil_final_train_and_predict(
             cfg=cfg_rep,
@@ -3605,9 +3663,10 @@ def run_family_suite(args: Any) -> None:
             best_params=best_params[family],
             outdir=outdir,
             write_outputs=True,
-            write_explainability_outputs=bool(not cfg.skip_family_explainability),
+            write_explainability_outputs=True,
             output_prefix=f"leaderboard_{model_key}",
-            fixed_train_epochs=int(selected_epochs),
+            fixed_train_epochs=None,
+            use_eval_split_for_validation=True,
         )
         leaderboard_metrics_by_family[str(model_key)] = metrics_family
         metrics_family.to_csv(outdir / f"leaderboard_metrics_{model_key}.csv", index=False)
@@ -3619,15 +3678,18 @@ def run_family_suite(args: Any) -> None:
             model=str(model_key),
             replica_idx=int(rep_idx),
             seed=int(rep_seed),
-            target_epochs=int(train_info.get("target_epochs", selected_epochs)),
+            cv_selected_epochs_reference=int(selected_epochs),
+            target_epochs=int(train_info.get("target_epochs", int(cfg.max_epochs))),
             epochs_trained=int(train_info.get("epochs_trained", 0)),
             best_epoch=int(train_info.get("best_epoch", 0)),
-            use_fixed_epochs=bool(train_info.get("use_fixed_epochs", True)),
+            use_fixed_epochs=bool(train_info.get("use_fixed_epochs", False)),
+            validation_scope=str(train_info.get("validation_scope", "leaderboard")),
         )
         pred_tables[str(model_key)] = df_pred
 
     # Apply train-OOF fitted calibrators on leaderboard predictions.
     calibrated: Dict[str, pd.DataFrame] = {}
+    leaderboard_calibrated_metrics_by_family: Dict[str, pd.DataFrame] = {}
     for family, dfp in pred_tables.items():
         with log_step(
             "family.calibration.apply",
@@ -3670,6 +3732,7 @@ def run_family_suite(args: Any) -> None:
                 p_pred=p_cal,
                 w_cls=w_lb,
             )
+            leaderboard_calibrated_metrics_by_family[str(family)] = cal_lb_metrics.copy()
             cal_lb_metrics.to_csv(cal_lb_metric_path, index=False)
             macro_row = cal_lb_metrics[cal_lb_metrics["task"] == "macro"]
             if len(macro_row) == 1:
@@ -3863,6 +3926,104 @@ def run_family_suite(args: Any) -> None:
             n_models=int(len(leaderboard_metrics_by_family)),
             n_tasks=int(len(TASK_COLS)),
             blend_available=bool(blend_lb_metrics is not None),
+        )
+
+    rows_all_metrics: List[Dict[str, Any]] = []
+
+    def _append_metric_table(
+        *,
+        model: str,
+        stage: str,
+        scope: str,
+        df_metrics: pd.DataFrame | None,
+        artifact_path: Path,
+    ) -> None:
+        if df_metrics is None or len(df_metrics) == 0:
+            return
+        for row in df_metrics.to_dict(orient="records"):
+            rows_all_metrics.append(
+                {
+                    "model": str(model),
+                    "stage": str(stage),
+                    "scope": str(scope),
+                    "task": str(row.get("task", "")),
+                    "pr_auc": float(row.get("pr_auc", float("nan"))),
+                    "roc_auc": float(row.get("roc_auc", float("nan"))),
+                    "nll": float(row.get("nll", float("nan"))),
+                    "brier": float(row.get("brier", float("nan"))),
+                    "artifact_path": str(artifact_path),
+                }
+            )
+
+    for model_name, dfm in sorted(cv_oof_metrics_by_model.items(), key=lambda kv: str(kv[0])):
+        _append_metric_table(
+            model=str(model_name),
+            stage="raw",
+            scope="cv_oof",
+            df_metrics=dfm,
+            artifact_path=(outdir / f"cv_oof_metrics_{model_name}.csv"),
+        )
+    for model_name, dfm in sorted(calibrated_oof_xfit_metrics_by_model.items(), key=lambda kv: str(kv[0])):
+        _append_metric_table(
+            model=str(model_name),
+            stage="calibrated_xfit",
+            scope="cv_oof",
+            df_metrics=dfm,
+            artifact_path=(outdir / f"cv_oof_metrics_{model_name}_calibrated_xfit.csv"),
+        )
+    for model_name, dfm in sorted(calibrated_oof_metrics_by_model.items(), key=lambda kv: str(kv[0])):
+        _append_metric_table(
+            model=str(model_name),
+            stage="calibrated",
+            scope="cv_oof",
+            df_metrics=dfm,
+            artifact_path=(outdir / f"cv_oof_metrics_{model_name}_calibrated.csv"),
+        )
+    for model_name, dfm in sorted(leaderboard_metrics_by_family.items(), key=lambda kv: str(kv[0])):
+        _append_metric_table(
+            model=str(model_name),
+            stage="raw",
+            scope="leaderboard",
+            df_metrics=dfm,
+            artifact_path=(outdir / f"leaderboard_metrics_{model_name}.csv"),
+        )
+    for model_name, dfm in sorted(leaderboard_calibrated_metrics_by_family.items(), key=lambda kv: str(kv[0])):
+        _append_metric_table(
+            model=str(model_name),
+            stage="calibrated",
+            scope="leaderboard",
+            df_metrics=dfm,
+            artifact_path=(outdir / f"leaderboard_metrics_{model_name}_calibrated.csv"),
+        )
+    _append_metric_table(
+        model="blend",
+        stage="blend_xfit",
+        scope="cv_oof",
+        df_metrics=blend_oof_xfit_metrics,
+        artifact_path=(outdir / "cv_oof_metrics_blend_xfit.csv"),
+    )
+    _append_metric_table(
+        model="blend",
+        stage="blend",
+        scope="cv_oof",
+        df_metrics=blend_oof_metrics,
+        artifact_path=(outdir / "cv_oof_metrics_blend.csv"),
+    )
+    _append_metric_table(
+        model="blend",
+        stage="blend",
+        scope="leaderboard",
+        df_metrics=blend_lb_metrics,
+        artifact_path=(outdir / "leaderboard_metrics_blend.csv"),
+    )
+    if len(rows_all_metrics) > 0:
+        all_results_path = outdir / "all_results.csv"
+        pd.DataFrame(rows_all_metrics).to_csv(all_results_path, index=False)
+        log_event(
+            "INFO",
+            "family.results.all_metrics_written",
+            path=str(all_results_path),
+            n_rows=int(len(rows_all_metrics)),
         )
     log_event(
         "DONE",

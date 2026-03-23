@@ -7,11 +7,8 @@
     <list default="true" id="33826e23-5bc2-4bf8-9077-a15c3daefac9" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/entrypoints/family_suite.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/entrypoints/family_suite.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/entrypoints/hpo_pipeline.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/entrypoints/hpo_pipeline.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/jobs/2d3d_mt_opt.slurm" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/jobs/2d3d_mt_opt.slurm" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/jobs/2d_mt_opt.slurm" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/jobs/2d_mt_opt.slurm" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/jobs/3d_mt_opt.slurm" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/jobs/3d_mt_opt.slurm" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/jobs/catboost_st_opt.slurm" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/jobs/catboost_st_opt.slurm" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/jobs/blend_opt_mdls.slurm" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/jobs/blend_opt_mdls.slurm" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/training/search_space.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/training/search_space.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -82,7 +79,7 @@
       <updated>1770573376037</updated>
       <workItem from="1770573377091" duration="1443000" />
       <workItem from="1773516930843" duration="7046000" />
-      <workItem from="1773573422894" duration="37331000" />
+      <workItem from="1773573422894" duration="40094000" />
     </task>
     <servers />
   </component>

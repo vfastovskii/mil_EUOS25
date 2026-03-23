@@ -1727,7 +1727,8 @@ def _parse_args(argv: Any | None = None):
         "--skip_family_explainability",
         action="store_true",
         help=(
-            "In --run_family_suite mode, skip explainability/attention export artifacts for final MIL runs."
+            "In --run_family_suite mode, skip optional extended explainability integrations. "
+            "Attention export for final 3D-bearing MIL models remains enabled by default."
         ),
     )
     ap.add_argument(

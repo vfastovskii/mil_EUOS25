@@ -76,7 +76,7 @@ def search_space(
          # t2 -> Fluorescence_340_450
          # t3 -> Fluorescence_more_than_480
 
-         # POsitive rate per task
+         # Positive rate per task
          # T340   : 0.05637 +/- 0.00010  (min 0.05625, max 0.05649)
          # T450   : 0.01473 +/- 0.00009  (min 0.01462, max 0.01483)
          # F340450: 0.16686 +/- 0.00006  (min 0.16680, max 0.16695)
