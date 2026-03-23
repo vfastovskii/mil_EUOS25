@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=mt_2d3d_opt
+#SBATCH --job-name=2d3d40t
 #SBATCH --export=ALL,MODULESHOME='',MODULEPATH=''
 #SBATCH --partition=qGPUr
 #SBATCH --gres=gpu:1
 #SBATCH --time=23:59:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=15
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
@@ -61,15 +61,15 @@ FEAT3D_QM="${FEAT3D_QM:-${DATA_DIR}/scaled_3d_quantum.csv}"
 # -------------------- mode / knobs --------------------
 RUN_HPO="${RUN_HPO:-1}"
 HPO_ONLY="${HPO_ONLY:-0}"
-TRIALS="${TRIALS:-90}"
+TRIALS="${TRIALS:-40}"
 PRUNER_WARMUP_STEPS="${PRUNER_WARMUP_STEPS:-90}"
 
 MAX_EPOCHS="${MAX_EPOCHS:-150}"
 PATIENCE="${PATIENCE:-15}"
 SEED="${SEED:-0}"
 PRECISION="${PRECISION:-16-mixed}"
-NUM_WORKERS="${NUM_WORKERS:-15}"
-CPU_WORKERS="${CPU_WORKERS:-15}"
+NUM_WORKERS="${NUM_WORKERS:-14}"
+CPU_WORKERS="${CPU_WORKERS:-14}"
 PIN_MEMORY="${PIN_MEMORY:-0}"
 
 LEADERBOARD_SPLIT="${LEADERBOARD_SPLIT:-leaderboard}"

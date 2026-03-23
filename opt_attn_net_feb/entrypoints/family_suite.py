@@ -269,6 +269,28 @@ def _metric_table(
     return pd.DataFrame(rows)
 
 
+def _metric_table_by_fold(
+    *,
+    y_true: np.ndarray,
+    p_pred: np.ndarray,
+    w_cls: np.ndarray,
+    fold_ids: np.ndarray,
+    family: str,
+) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    folds_arr = np.asarray(fold_ids, dtype=np.int64).reshape(-1)
+    for fold_id in sorted([int(x) for x in np.unique(folds_arr).tolist() if int(x) >= 0]):
+        m = np.asarray(folds_arr == int(fold_id))
+        if int(np.sum(m)) <= 0:
+            continue
+        mt = _metric_table(y_true=y_true[m], p_pred=p_pred[m], w_cls=w_cls[m])
+        for row in mt.to_dict(orient="records"):
+            row["fold"] = int(fold_id)
+            row["family"] = str(family)
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def _save_family_best_params(*, outdir: Path, family: str, best_params: Mapping[str, Any], best_value: float) -> Path:
     outdir.mkdir(parents=True, exist_ok=True)
     path = outdir / f"{family}.json"
@@ -1196,7 +1218,8 @@ def _fit_blend_task(
 
     # Constrained convex blending:
     #   p = sum_i w_i * p_i, with w_i >= 0 and sum_i w_i = 1.
-    # Objective here is direct weighted ROC-AUC maximization on train OOF.
+    # Objective here is direct weighted PR-AUC maximization on train OOF.
+    # ROC-AUC is kept only as a deterministic tiebreaker.
     # We use deterministic randomized search + local refinement on the simplex.
     n_models = int(x_arr.shape[1])
     sw_local = np.ones((x_arr.shape[0],), dtype=np.float64) if sw is None else sw
@@ -1217,14 +1240,14 @@ def _fit_blend_task(
         wv = _normalize_simplex(w_vec)
         p_vec = _clip_prob(np.dot(x_arr, wv.reshape(-1, 1)).reshape(-1))
         try:
-            auc = float(roc_auc_score(y_arr, p_vec, sample_weight=sw_local))
-        except Exception:
-            auc = float("nan")
-        try:
             ap = float(average_precision_score(y_arr, p_vec, sample_weight=sw_local))
         except Exception:
             ap = float("nan")
-        return auc, ap, p_vec
+        try:
+            auc = float(roc_auc_score(y_arr, p_vec, sample_weight=sw_local))
+        except Exception:
+            auc = float("nan")
+        return ap, auc, p_vec
 
     seed_basis = int(
         (int(x_arr.shape[0]) * 17 + int(x_arr.shape[1]) * 97 + int(np.sum(y_arr)) * 131) % (2**31 - 1)
@@ -1253,18 +1276,18 @@ def _fit_blend_task(
         candidates.append(rng.dirichlet(np.ones((n_models,), dtype=np.float64)))
 
     best_w = candidates[0]
-    best_auc = float("-inf")
     best_ap = float("-inf")
+    best_auc = float("-inf")
     best_p = _clip_prob(np.dot(x_arr, _normalize_simplex(best_w).reshape(-1, 1)).reshape(-1))
     n_eval = 0
     for cand in candidates:
-        auc, ap, p_vec = _eval_weights(cand)
+        ap, auc, p_vec = _eval_weights(cand)
         n_eval += 1
-        if (np.isfinite(auc) and (auc > best_auc + 1e-12)) or (
-            np.isfinite(auc) and abs(auc - best_auc) <= 1e-12 and np.isfinite(ap) and ap > best_ap
+        if (np.isfinite(ap) and (ap > best_ap + 1e-12)) or (
+            np.isfinite(ap) and abs(ap - best_ap) <= 1e-12 and np.isfinite(auc) and auc > best_auc
         ):
-            best_auc = float(auc)
             best_ap = float(ap) if np.isfinite(ap) else float(best_ap)
+            best_auc = float(auc) if np.isfinite(auc) else float(best_auc)
             best_w = _normalize_simplex(cand)
             best_p = p_vec
 
@@ -1272,13 +1295,13 @@ def _fit_blend_task(
     for sigma, n_steps in ((0.10, 320), (0.05, 320), (0.02, 240), (0.01, 160)):
         for _ in range(int(n_steps)):
             cand = _normalize_simplex(best_w + rng.normal(loc=0.0, scale=float(sigma), size=n_models))
-            auc, ap, p_vec = _eval_weights(cand)
+            ap, auc, p_vec = _eval_weights(cand)
             n_eval += 1
-            if (np.isfinite(auc) and (auc > best_auc + 1e-12)) or (
-                np.isfinite(auc) and abs(auc - best_auc) <= 1e-12 and np.isfinite(ap) and ap > best_ap
+            if (np.isfinite(ap) and (ap > best_ap + 1e-12)) or (
+                np.isfinite(ap) and abs(ap - best_ap) <= 1e-12 and np.isfinite(auc) and auc > best_auc
             ):
-                best_auc = float(auc)
                 best_ap = float(ap) if np.isfinite(ap) else float(best_ap)
+                best_auc = float(auc) if np.isfinite(auc) else float(best_auc)
                 best_w = cand
                 best_p = p_vec
 
@@ -1288,10 +1311,10 @@ def _fit_blend_task(
         "weights": {f: float(best_w[i]) for i, f in enumerate(fams)},
         "constraint": "simplex_non_negative_sum1",
         "optimizer": "simplex_random_local_search",
-        "objective": "roc_auc",
+        "objective": "pr_auc",
         "n_eval": int(max(1, n_eval)),
-        "train_roc_auc": float(best_auc) if np.isfinite(best_auc) else float("nan"),
-        "train_pr_auc_tiebreak": float(best_ap) if np.isfinite(best_ap) else float("nan"),
+        "train_pr_auc": float(best_ap) if np.isfinite(best_ap) else float("nan"),
+        "train_roc_auc_tiebreak": float(best_auc) if np.isfinite(best_auc) else float("nan"),
     }
     return cfg, p_task
 
@@ -2967,6 +2990,120 @@ def run_family_suite(args: Any) -> None:
                 )
 
     calibration_fit_method = "identity" if cfg.skip_family_calibration else str(cfg.calibration_method)
+
+    calibrated_oof_xfit: Dict[str, pd.DataFrame] = {}
+    calib_xfit_params_by_family: Dict[str, Dict[str, Any]] = {}
+    for family, df_oof in cv_oof_tables.items():
+        with log_step(
+            "family.calibration.xfit",
+            family=str(family),
+            scope="train_oof",
+            method=str(calibration_fit_method),
+            skipped=bool(cfg.skip_family_calibration),
+            n_rows=int(len(df_oof)),
+        ):
+            arr = df_oof.copy()
+            if "fold_id" not in arr.columns:
+                raise RuntimeError(f"Cross-fitted calibration requires fold_id column for family={family}")
+            fold_ids = arr["fold_id"].to_numpy(dtype=np.int64)
+            valid_folds = sorted([int(x) for x in np.unique(fold_ids).tolist() if int(x) >= 0])
+            if len(valid_folds) == 0 or int(np.sum(fold_ids < 0)) > 0:
+                raise RuntimeError(f"Invalid OOF fold_id values for cross-fitted calibration family={family}")
+            y = np.stack([arr[f"y_t{t}"].to_numpy(dtype=np.int64) for t in range(4)], axis=1)
+            p = np.stack([arr[f"p_t{t}"].to_numpy(dtype=np.float64) for t in range(4)], axis=1)
+            p_cal = np.zeros_like(p, dtype=np.float32)
+            params_by_task: Dict[str, Any] = {}
+            for t in range(4):
+                raw_sw_t = arr[f"w_t{t}"].to_numpy(dtype=np.float64) if f"w_t{t}" in arr.columns else None
+                sw_t_full = _metric_sample_weight_for_task(raw_sw_t, t)
+                params_by_fold: Dict[str, Any] = {}
+                for fold_id in valid_folds:
+                    m_val = np.asarray(fold_ids == int(fold_id))
+                    m_fit = np.asarray(fold_ids != int(fold_id))
+                    if int(np.sum(m_val)) <= 0:
+                        continue
+                    if cfg.skip_family_calibration:
+                        t_params = {"kind": "identity", "skip_reason": "skip_family_calibration", "fit_scope": "cross_fit"}
+                        p_cal[m_val, t] = np.asarray(p[m_val, t], dtype=np.float32)
+                    else:
+                        fit_sw = None if sw_t_full is None else np.asarray(sw_t_full[m_fit], dtype=np.float64)
+                        _, t_params = _calibrate_task(
+                            y[m_fit, t],
+                            p[m_fit, t],
+                            cfg.calibration_method,
+                            sample_weight=fit_sw,
+                        )
+                        p_cal[m_val, t] = _apply_calibration_task(p[m_val, t], t_params)
+                    params_by_fold[str(int(fold_id))] = dict(t_params)
+                params_by_task[str(t)] = params_by_fold
+                arr[f"p_cal_t{t}"] = p_cal[:, t]
+                n_identity_folds = int(
+                    sum(1 for payload in params_by_fold.values() if str(payload.get("kind", "")).startswith("identity"))
+                )
+                log_event(
+                    "INFO",
+                    "family.calibration.xfit.task",
+                    family=str(family),
+                    scope="train_oof",
+                    task_idx=int(t),
+                    skipped=bool(cfg.skip_family_calibration),
+                    n_rows=int(y.shape[0]),
+                    n_folds=int(len(valid_folds)),
+                    n_identity_folds=int(n_identity_folds),
+                )
+            cal_xfit_pred_path = outdir / f"train_oof_preds_{family}_calibrated_xfit.csv"
+            arr.to_csv(cal_xfit_pred_path, index=False)
+            calibrated_oof_xfit[family] = arr
+            calib_xfit_params_by_family[family] = params_by_task
+            cal_xfit_json_path = cal_dir / f"{family}_calib_xfit.json"
+            cal_xfit_json_path.write_text(
+                json.dumps(
+                    {
+                        "family": str(family),
+                        "fit_scope": "train_oof_cross_fit",
+                        "method": str(calibration_fit_method),
+                        "skipped": bool(cfg.skip_family_calibration),
+                        "task_fold_params": params_by_task,
+                    },
+                    indent=2,
+                )
+            )
+            w = np.stack(
+                [
+                    arr[f"w_t{t}"].to_numpy(dtype=np.float32)
+                    if f"w_t{t}" in arr.columns
+                    else np.ones(len(arr), dtype=np.float32)
+                    for t in range(4)
+                ],
+                axis=1,
+            )
+            cal_xfit_metric_path = outdir / f"cv_oof_metrics_{family}_calibrated_xfit.csv"
+            cal_xfit_metrics = _metric_table(y_true=y, p_pred=p_cal, w_cls=w)
+            cal_xfit_metrics.to_csv(cal_xfit_metric_path, index=False)
+            cal_xfit_fold_metrics = _metric_table_by_fold(
+                y_true=y,
+                p_pred=p_cal,
+                w_cls=w,
+                fold_ids=fold_ids,
+                family=str(family),
+            )
+            if len(cal_xfit_fold_metrics) > 0:
+                cal_xfit_fold_metrics.to_csv(outdir / f"cv_fold_metrics_{family}_calibrated_xfit.csv", index=False)
+            macro_row = cal_xfit_metrics[cal_xfit_metrics["task"] == "macro"]
+            if len(macro_row) == 1:
+                log_event(
+                    "INFO",
+                    "family.calibration.xfit.summary",
+                    family=str(family),
+                    scope="train_oof",
+                    skipped=bool(cfg.skip_family_calibration),
+                    macro_pr_auc=f"{float(macro_row.iloc[0]['pr_auc']):.6f}",
+                    macro_roc_auc=f"{float(macro_row.iloc[0]['roc_auc']):.6f}",
+                    preds_path=str(cal_xfit_pred_path),
+                    metrics_path=str(cal_xfit_metric_path),
+                    calib_json_path=str(cal_xfit_json_path),
+                )
+
     calibrated_oof: Dict[str, pd.DataFrame] = {}
     calib_params_by_family: Dict[str, Dict[str, Any]] = {}
     for family, df_oof in cv_oof_tables.items():
@@ -3065,14 +3202,167 @@ def run_family_suite(args: Any) -> None:
                     calib_json_path=str(cal_json_path),
                 )
 
-    blend_weights: Dict[str, Any] | None = None
-    blend_oof_metrics: pd.DataFrame | None = None
+    blend_weights_xfit: Dict[str, Any] | None = None
+    blend_oof_xfit_metrics: pd.DataFrame | None = None
     skip_blend_reason = ""
     if cfg.skip_family_blending:
         skip_blend_reason = "skip_family_blending_flag"
     elif int(len(calibrated_oof)) <= 1:
         skip_blend_reason = "single_model"
 
+    if skip_blend_reason:
+        log_event(
+            "INFO",
+            "family.blend.xfit.skipped",
+            scope="train_oof",
+            reason=str(skip_blend_reason),
+            n_families=int(len(calibrated_oof_xfit)),
+        )
+    else:
+        with log_step("family.blend.xfit", scope="train_oof"):
+            fams = list(calibrated_oof_xfit.keys())
+            if len(fams) == 0:
+                raise RuntimeError("No family predictions available for cross-fitted blending.")
+            common_ids = set(calibrated_oof_xfit[fams[0]]["ID"].astype(str).tolist())
+            for f in fams[1:]:
+                common_ids &= set(calibrated_oof_xfit[f]["ID"].astype(str).tolist())
+            common_ids = sorted(common_ids)
+            if len(common_ids) == 0:
+                raise RuntimeError("No common train OOF IDs across selected families for cross-fitted blending.")
+            log_event(
+                "INFO",
+                "family.blend.xfit.scope",
+                scope="train_oof",
+                n_families=int(len(fams)),
+                families=",".join([str(x) for x in fams]),
+                n_common_ids=int(len(common_ids)),
+            )
+
+            y_bl: Optional[np.ndarray] = None
+            w_bl: Optional[np.ndarray] = None
+            fold_bl: Optional[np.ndarray] = None
+            x_by_family_oof: Dict[str, np.ndarray] = {}
+            for f in fams:
+                d = calibrated_oof_xfit[f].copy()
+                d["ID"] = d["ID"].astype(str)
+                d = d.set_index("ID").loc[common_ids].reset_index(drop=False)
+                _require_calibrated_prob_columns(df=d, family=str(f), scope="train_oof_xfit")
+                x_by_family_oof[f] = np.stack([d[f"p_cal_t{t}"].to_numpy(dtype=np.float64) for t in range(4)], axis=1)
+                log_event(
+                    "INFO",
+                    "family.blend.xfit.family_input",
+                    scope="train_oof",
+                    family=str(f),
+                    input_source="cross_fitted_calibrated_probabilities",
+                    n_rows=int(len(d)),
+                )
+                if y_bl is None:
+                    y_bl = np.stack([d[f"y_t{t}"].to_numpy(dtype=np.int64) for t in range(4)], axis=1)
+                    w_bl = np.stack(
+                        [
+                            d[f"w_t{t}"].to_numpy(dtype=np.float32)
+                            if f"w_t{t}" in d.columns
+                            else np.ones(len(d), dtype=np.float32)
+                            for t in range(4)
+                        ],
+                        axis=1,
+                    )
+                    if "fold_id" in d.columns:
+                        fold_bl = d["fold_id"].to_numpy(dtype=np.int64)
+            assert y_bl is not None
+            assert w_bl is not None
+            if fold_bl is None:
+                raise RuntimeError("Cross-fitted blending requires fold_id in calibrated OOF tables.")
+            valid_folds = sorted([int(x) for x in np.unique(fold_bl).tolist() if int(x) >= 0])
+            if len(valid_folds) == 0 or int(np.sum(fold_bl < 0)) > 0:
+                raise RuntimeError("Invalid OOF fold_id values for cross-fitted blending.")
+
+            blend_pred_oof = np.zeros_like(y_bl, dtype=np.float64)
+            blend_weights_xfit = {
+                "fit_scope": "train_oof_cross_fit",
+                "families": fams,
+                "input_source": "cross_fitted_calibrated_probabilities",
+                "calibration_method": str(calibration_fit_method),
+                "blend_method": "convex_blending_simplex_cross_fit",
+                "weighting_policy": "metrics_aligned",
+                "tasks": {},
+            }
+            for t in range(4):
+                x_task = np.column_stack([x_by_family_oof[f][:, t] for f in fams]).astype(np.float64)
+                y_task = y_bl[:, t].astype(int)
+                blend_sw_full = _metric_sample_weight_for_task(w_bl[:, t], t)
+                task_fold_params: Dict[str, Any] = {}
+                for fold_id in valid_folds:
+                    m_val = np.asarray(fold_bl == int(fold_id))
+                    m_fit = np.asarray(fold_bl != int(fold_id))
+                    fit_sw = None if blend_sw_full is None else np.asarray(blend_sw_full[m_fit], dtype=np.float64)
+                    task_cfg_fold, _ = _fit_blend_task(
+                        x=x_task[m_fit],
+                        y=y_task[m_fit],
+                        fams=fams,
+                        sample_weight=fit_sw,
+                    )
+                    blend_pred_oof[m_val, t] = _apply_blend_task(
+                        x=x_task[m_val],
+                        task_cfg=task_cfg_fold,
+                        fams=fams,
+                    )
+                    task_fold_params[str(int(fold_id))] = dict(task_cfg_fold)
+                blend_weights_xfit["tasks"][str(t)] = {
+                    "kind": "cross_fitted_convex_blending",
+                    "objective": "pr_auc",
+                    "tiebreak": "roc_auc",
+                    "fold_params": task_fold_params,
+                }
+                log_event(
+                    "INFO",
+                    "family.blend.xfit.task",
+                    scope="train_oof",
+                    task_idx=int(t),
+                    n_rows=int(y_task.shape[0]),
+                    n_folds=int(len(valid_folds)),
+                    weighting_policy="metrics_aligned" if blend_sw_full is not None else "unweighted",
+                    sample_weight_sum=(
+                        f"{float(np.sum(blend_sw_full)):.3f}" if blend_sw_full is not None else f"{float(y_task.shape[0]):.3f}"
+                    ),
+                )
+            blend_xfit_weights_path = outdir / "blend_weights_xfit.json"
+            blend_xfit_weights_path.write_text(json.dumps(blend_weights_xfit, indent=2))
+
+            blend_oof_df = pd.DataFrame({"ID": common_ids, "fold_id": np.asarray(fold_bl, dtype=np.int64)})
+            for t in range(4):
+                blend_oof_df[f"p_blend_t{t}"] = blend_pred_oof[:, t]
+                blend_oof_df[f"y_t{t}"] = y_bl[:, t]
+                blend_oof_df[f"pred_t{t}"] = (blend_pred_oof[:, t] >= 0.5).astype(int)
+            blend_oof_pred_path = outdir / "train_oof_preds_blend_xfit.csv"
+            blend_oof_df.to_csv(blend_oof_pred_path, index=False)
+            blend_oof_metric_path = outdir / "cv_oof_metrics_blend_xfit.csv"
+            blend_oof_xfit_metrics = _metric_table(y_true=y_bl, p_pred=blend_pred_oof, w_cls=w_bl)
+            blend_oof_xfit_metrics.to_csv(blend_oof_metric_path, index=False)
+            blend_fold_metrics_xfit = _metric_table_by_fold(
+                y_true=y_bl,
+                p_pred=blend_pred_oof,
+                w_cls=w_bl,
+                fold_ids=fold_bl,
+                family="blend_xfit",
+            )
+            if len(blend_fold_metrics_xfit) > 0:
+                blend_fold_metrics_xfit.to_csv(outdir / "cv_fold_metrics_blend_xfit.csv", index=False)
+            macro_row = blend_oof_xfit_metrics[blend_oof_xfit_metrics["task"] == "macro"]
+            if len(macro_row) == 1:
+                log_event(
+                    "INFO",
+                    "family.blend.xfit.summary",
+                    scope="train_oof",
+                    macro_pr_auc=f"{float(macro_row.iloc[0]['pr_auc']):.6f}",
+                    macro_roc_auc=f"{float(macro_row.iloc[0]['roc_auc']):.6f}",
+                    preds_path=str(blend_oof_pred_path),
+                    metrics_path=str(blend_oof_metric_path),
+                    weights_path=str(blend_xfit_weights_path),
+                )
+
+    blend_weights: Dict[str, Any] | None = None
+    blend_oof_metrics: pd.DataFrame | None = None
     if skip_blend_reason:
         log_event(
             "INFO",
@@ -3172,10 +3462,10 @@ def run_family_suite(args: Any) -> None:
                     pos_rate=f"{float(np.mean(y_task)):.6f}",
                     constraint=str(task_cfg.get("constraint", "")),
                     optimizer=str(task_cfg.get("optimizer", "")),
-                    objective=str(task_cfg.get("objective", "roc_auc")),
+                    objective=str(task_cfg.get("objective", "pr_auc")),
                     n_eval=int(task_cfg.get("n_eval", 0)),
-                    train_roc_auc=f"{float(task_cfg.get('train_roc_auc', np.nan)):.6f}",
-                    train_pr_auc_tiebreak=f"{float(task_cfg.get('train_pr_auc_tiebreak', np.nan)):.6f}",
+                    train_pr_auc=f"{float(task_cfg.get('train_pr_auc', np.nan)):.6f}",
+                    train_roc_auc_tiebreak=f"{float(task_cfg.get('train_roc_auc_tiebreak', np.nan)):.6f}",
                     weight_max=f"{float(np.max(w_norm)):.6f}",
                     weight_entropy=f"{float(w_entropy):.6f}",
                     weight_l1=f"{float(np.sum(np.abs(np.asarray(list(task_cfg.get('weights', {}).values()), dtype=np.float64)))):.6f}",
@@ -3198,18 +3488,15 @@ def run_family_suite(args: Any) -> None:
             blend_oof_metrics = _metric_table(y_true=y_bl, p_pred=blend_pred_oof, w_cls=w_bl)
             blend_oof_metrics.to_csv(blend_oof_metric_path, index=False)
             if fold_bl is not None:
-                fold_metric_rows_blend: List[Dict[str, Any]] = []
-                for fold_id in sorted([int(x) for x in np.unique(fold_bl).tolist() if int(x) >= 0]):
-                    m = np.asarray(fold_bl == int(fold_id))
-                    if int(np.sum(m)) <= 0:
-                        continue
-                    mt = _metric_table(y_true=y_bl[m], p_pred=blend_pred_oof[m], w_cls=w_bl[m])
-                    for row in mt.to_dict(orient="records"):
-                        row["fold"] = int(fold_id)
-                        row["family"] = "blend"
-                        fold_metric_rows_blend.append(row)
-                if len(fold_metric_rows_blend) > 0:
-                    pd.DataFrame(fold_metric_rows_blend).to_csv(outdir / "cv_fold_metrics_blend.csv", index=False)
+                blend_fold_metrics = _metric_table_by_fold(
+                    y_true=y_bl,
+                    p_pred=blend_pred_oof,
+                    w_cls=w_bl,
+                    fold_ids=fold_bl,
+                    family="blend",
+                )
+                if len(blend_fold_metrics) > 0:
+                    blend_fold_metrics.to_csv(outdir / "cv_fold_metrics_blend.csv", index=False)
             macro_row = blend_oof_metrics[blend_oof_metrics["task"] == "macro"]
             if len(macro_row) == 1:
                 log_event(

@@ -1713,7 +1713,7 @@ def _parse_args(argv: Any | None = None):
         "--calibration_method",
         choices=["platt", "isotonic", "temperature"],
         default="platt",
-        help="Post-hoc calibration method for family probabilities on leaderboard.",
+        help="Post-hoc calibration method for family probabilities on leaderboard. Default: platt.",
     )
     ap.add_argument(
         "--skip_family_calibration",
