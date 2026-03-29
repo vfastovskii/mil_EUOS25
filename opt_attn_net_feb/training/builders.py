@@ -89,6 +89,16 @@ class MILModelBuilder:
                 mixer_hidden=int(b.mixer_hidden),
                 mixer_layers=int(b.mixer_layers),
                 mixer_dropout=float(b.mixer_dropout),
+                mixer_type=str(b.mixer_type),
+                moe_num_experts=int(b.moe_num_experts),
+                moe_top_k=int(b.moe_top_k),
+                moe_use_shared_expert=bool(b.moe_use_shared_expert),
+                moe_router_hidden=(
+                    None if b.moe_router_hidden is None else int(b.moe_router_hidden)
+                ),
+                moe_load_balance_weight=float(b.moe_load_balance_weight),
+                moe_z_loss_weight=float(b.moe_z_loss_weight),
+                moe_router_entropy_weight=float(b.moe_router_entropy_weight),
                 activation=str(b.activation),
                 mol_embedder_name=str(b.mol_embedder_name),
                 inst_embedder_name=str(b.inst_embedder_name),
@@ -121,6 +131,8 @@ class MILModelBuilder:
                 weight_decay_scale_heads=float(opt.weight_decay_scale_heads),
                 stage_2d_only_epochs=int(opt.stage_2d_only_epochs),
                 stage_3d_only_epochs=int(opt.stage_3d_only_epochs),
+                multitask_gradient_mode=str(opt.multitask_gradient_mode),
+                log_task_gradient_diagnostics=bool(opt.log_task_gradient_diagnostics),
             ),
             loss=MILLossConfig(
                 lambda_aux_abs=float(loss.lambda_aux_abs),
@@ -133,6 +145,9 @@ class MILModelBuilder:
                 contrastive_temperature=float(loss.contrastive_temperature),
                 consistency_view_keep_rate=float(loss.consistency_view_keep_rate),
                 cross_modal_include_geom_qm=bool(loss.cross_modal_include_geom_qm),
+                learnable_task_uncertainty=bool(loss.learnable_task_uncertainty),
+                task_uncertainty_init_log_var=float(loss.task_uncertainty_init_log_var),
+                task_uncertainty_reg=float(loss.task_uncertainty_reg),
                 reg_loss_type=str(loss.reg_loss_type),
                 bitmask_group_top_ids=(
                     [int(x) for x in bitmask_group_top_ids]

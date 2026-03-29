@@ -22,6 +22,14 @@ class MILBackboneConfig:
     mixer_hidden: int
     mixer_layers: int
     mixer_dropout: float
+    mixer_type: str = "moe"
+    moe_num_experts: int = 4
+    moe_top_k: int = 2
+    moe_use_shared_expert: bool = True
+    moe_router_hidden: Optional[int] = None
+    moe_load_balance_weight: float = 1e-2
+    moe_z_loss_weight: float = 1e-3
+    moe_router_entropy_weight: float = 1e-4
     activation: str = "GELU"
     mol_embedder_name: str = "mlp_v3_2d"
     inst_embedder_name: str = "mlp_v3_3d"
@@ -57,6 +65,8 @@ class MILOptimizationConfig:
     weight_decay_scale_heads: float = 1.0
     stage_2d_only_epochs: int = 0
     stage_3d_only_epochs: int = 0
+    multitask_gradient_mode: str = "pcgrad_shared"
+    log_task_gradient_diagnostics: bool = True
 
 
 @dataclass(frozen=True)
@@ -71,6 +81,9 @@ class MILLossConfig:
     contrastive_temperature: float = 0.10
     consistency_view_keep_rate: float = 0.70
     cross_modal_include_geom_qm: bool = True
+    learnable_task_uncertainty: bool = True
+    task_uncertainty_init_log_var: float = 0.0
+    task_uncertainty_reg: float = 0.5
     reg_loss_type: str = "mse"
     bitmask_group_top_ids: Optional[List[int]] = None
     bitmask_group_class_weight: Optional[List[float]] = None

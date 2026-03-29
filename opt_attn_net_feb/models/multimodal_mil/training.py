@@ -17,7 +17,9 @@ class TrainingLossBreakdown:
     fluo: torch.Tensor
     bitmask: torch.Tensor
     per_task: torch.Tensor
+    base_weighted_per_task: torch.Tensor
     weighted_per_task: torch.Tensor
+    task_uncertainty_reg: torch.Tensor
 
 
 def compute_training_losses(
@@ -42,9 +44,19 @@ def compute_training_losses(
     lambda_aux_abs: float,
     lambda_aux_fluo: float,
     lambda_aux_bitmask: float,
+    task_loss_log_vars: torch.Tensor | None = None,
+    task_uncertainty_reg: float = 0.5,
 ) -> TrainingLossBreakdown:
     per_task = cls_loss_fn(logits.float(), y_cls.float(), w_cls.float())
-    weighted_per_task = per_task * lam.float()
+    base_weighted_per_task = per_task * lam.float()
+    if task_loss_log_vars is not None:
+        log_vars = task_loss_log_vars.float().view(-1)
+        precision = torch.exp(-log_vars)
+        uncertainty_reg = float(task_uncertainty_reg) * log_vars
+        weighted_per_task = precision * base_weighted_per_task + uncertainty_reg
+    else:
+        weighted_per_task = base_weighted_per_task
+        uncertainty_reg = torch.zeros_like(base_weighted_per_task)
     loss_cls = weighted_per_task.mean()
 
     loss_abs = reg_loss_weighted(abs_out.float(), y_abs.float(), m_abs, w_abs.float(), reg_loss_type)
@@ -79,5 +91,7 @@ def compute_training_losses(
         fluo=loss_fluo,
         bitmask=loss_bitmask,
         per_task=per_task,
+        base_weighted_per_task=base_weighted_per_task,
         weighted_per_task=weighted_per_task,
+        task_uncertainty_reg=uncertainty_reg,
     )

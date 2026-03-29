@@ -71,8 +71,9 @@ FEAT3D_SCALED="${FEAT3D_SCALED:-${DATA_DIR}/scaled_3d.csv}"
 FEAT3D_QM="${FEAT3D_QM:-${DATA_DIR}/scaled_3d_quantum.csv}"
 
 # -------------------- mode / knobs --------------------
-# Default: run HPO + final leaderboard evaluation.
-RUN_HPO="${RUN_HPO:-1}"
+# Default: use provided optimized params / best_params_dir and run
+# final calibration + blending + attention export.
+RUN_HPO="${RUN_HPO:-0}"
 # Optional: HPO only, no final leaderboard stage.
 HPO_ONLY="${HPO_ONLY:-0}"
 TRIALS="${TRIALS:-50}"
@@ -96,6 +97,9 @@ BLEND_SEED_ENSEMBLE_SIZE="${BLEND_SEED_ENSEMBLE_SIZE:-1}"
 BLEND_SEED_STEP="${BLEND_SEED_STEP:-1000}"
 BEST_PARAMS_DIR="${BEST_PARAMS_DIR:-}"
 FAMILY_BEST_PARAMS_JSON="${FAMILY_BEST_PARAMS_JSON:-}"
+SKIP_FAMILY_EXPLAINABILITY="${SKIP_FAMILY_EXPLAINABILITY:-0}"
+SKIP_FAMILY_CALIBRATION="${SKIP_FAMILY_CALIBRATION:-0}"
+SKIP_FAMILY_BLENDING="${SKIP_FAMILY_BLENDING:-0}"
 CATBOOST_TASK_PARAMS_JSONS="${CATBOOST_TASK_PARAMS_JSONS:-"${DATA_DIR}/t0.json ${DATA_DIR}/t1.json ${DATA_DIR}/t2.json ${DATA_DIR}/t3.json"}"
 #CATBOOST_FINAL_ITERATIONS_JSONS="${CATBOOST_FINAL_ITERATIONS_JSONS:-"${DATA_DIR}/final_iterations_catboost_t0.json ${DATA_DIR}/final_iterations_catboost_t1.json ${DATA_DIR}/final_iterations_catboost_t2.json ${DATA_DIR}/final_iterations_catboost_t3.json"}"
 MT_2D_PARAMS_JSON="${MT_2D_PARAMS_JSON:-"${DATA_DIR}/mt_2d.json"}"
@@ -131,6 +135,7 @@ echo "[INFO] CPUs=${SLURM_CPUS_PER_TASK} | CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_D
 echo "[INFO] RUN_HPO=$RUN_HPO | HPO_ONLY=$HPO_ONLY | PRUNER_WARMUP_STEPS=$PRUNER_WARMUP_STEPS"
 echo "[INFO] MODEL_FAMILIES=$MODEL_FAMILIES | CALIBRATION_METHOD=$CALIBRATION_METHOD | CATBOOST_HPO_PARALLEL_TASKS=$CATBOOST_HPO_PARALLEL_TASKS"
 echo "[INFO] BLEND_SEED_ENSEMBLE_SIZE=$BLEND_SEED_ENSEMBLE_SIZE | BLEND_SEED_STEP=$BLEND_SEED_STEP"
+echo "[INFO] SKIP_FAMILY_EXPLAINABILITY=$SKIP_FAMILY_EXPLAINABILITY | SKIP_FAMILY_CALIBRATION=$SKIP_FAMILY_CALIBRATION | SKIP_FAMILY_BLENDING=$SKIP_FAMILY_BLENDING"
 echo "[INFO] 2D sources: scaled=$FEAT2D_SCALED | catboost_raw=$FEAT2D_RAW"
 echo "[INFO] FAMILY_BEST_PARAMS_JSON=${FAMILY_BEST_PARAMS_JSON:-<none>}"
 echo "[INFO] CATBOOST_TASK_PARAMS_JSONS=${CATBOOST_TASK_PARAMS_JSONS:-<none>}"
@@ -151,10 +156,6 @@ command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || true
 [[ -f "$FEAT2D_RAW" ]] || { echo "[ERROR] Missing raw 2D features for CatBoost: $FEAT2D_RAW"; exit 2; }
 [[ -f "$FEAT3D_SCALED" ]] || { echo "[ERROR] Missing 3D features: $FEAT3D_SCALED"; exit 2; }
 [[ -f "$FEAT3D_QM" ]] || { echo "[ERROR] Missing 3D QM features: $FEAT3D_QM"; exit 2; }
-if [[ "$RUN_HPO" != "1" ]]; then
-  [[ -n "$BEST_PARAMS_DIR" ]] || { echo "[ERROR] RUN_HPO=0 requires BEST_PARAMS_DIR"; exit 2; }
-fi
-
 if [[ -n "$FAMILY_BEST_PARAMS_JSON" ]]; then
   [[ -f "$FAMILY_BEST_PARAMS_JSON" ]] || { echo "[ERROR] Missing FAMILY_BEST_PARAMS_JSON: $FAMILY_BEST_PARAMS_JSON"; exit 2; }
 fi
@@ -240,11 +241,44 @@ if [[ -n "$MT_3D_FINAL_EPOCHS_JSON" ]]; then
 fi
 
 export PYTHONPATH="$WORKDIR:${PYTHONPATH:-}"
-python3 -c "import opt_attn_net_feb; print('[INFO] opt_attn_net_feb import OK from', opt_attn_net_feb.__file__)"
+python3 - <<'PY'
+import importlib.util
+import sys
+
+mods = [
+    "opt_attn_net_feb",
+    "opt_attn_net_feb.entrypoints",
+    "opt_attn_net_feb.entrypoints.hpo_pipeline",
+]
+
+for m in mods:
+    spec = importlib.util.find_spec(m)
+    print(f"[INFO] find_spec({m}) = {spec}")
+    if spec is None:
+        print(f"[ERROR] Missing import target: {m}")
+        sys.exit(4)
+
+import opt_attn_net_feb
+print("[INFO] opt_attn_net_feb import OK from", opt_attn_net_feb.__file__)
+PY
 
 read -r -a MODEL_FAMILIES_ARR <<< "$MODEL_FAMILIES"
 
-echo "[INFO] Running family-suite pipeline WITHOUT explainability..."
+if [[ "$RUN_HPO" != "1" ]]; then
+  have_override_source=0
+  [[ -n "$BEST_PARAMS_DIR" ]] && have_override_source=1
+  [[ -n "$FAMILY_BEST_PARAMS_JSON" ]] && have_override_source=1
+  [[ -n "$CATBOOST_TASK_PARAMS_JSONS" ]] && have_override_source=1
+  [[ -n "$MT_2D_PARAMS_JSON" ]] && have_override_source=1
+  [[ -n "$MT_2D3D_PARAMS_JSON" ]] && have_override_source=1
+  [[ -n "$MT_3D_PARAMS_JSON" ]] && have_override_source=1
+  if [[ "$have_override_source" != "1" ]]; then
+    echo "[ERROR] RUN_HPO=0 requires BEST_PARAMS_DIR or family/task params JSON overrides."
+    exit 2
+  fi
+fi
+
+echo "[INFO] Running family-suite pipeline with final calibration + blending + attention export..."
 CMD=(
   python3 "$WORKDIR/opt_net_fast.py"
   --labels "$WORKDIR/$(basename "$LABELS")"

@@ -19,6 +19,7 @@ from .embedder_mlp_v3_base import build_mlp_v3_embedder
 from .embedders import build_2d_embedder, build_3d_embedder
 from .head_mlp_v3 import MLPPredictorV3Like
 from .head_utils import apply_shared_heads, apply_task_heads, make_projection
+from .moe import TaskAwareMoEMixer
 from .predictors import build_predictor_heads
 from .training import compute_training_losses
 
@@ -99,6 +100,16 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             mixer_hidden=int(b.mixer_hidden),
             mixer_layers=int(b.mixer_layers),
             mixer_dropout=float(b.mixer_dropout),
+            mixer_type=str(b.mixer_type),
+            moe_num_experts=int(b.moe_num_experts),
+            moe_top_k=int(b.moe_top_k),
+            moe_use_shared_expert=bool(b.moe_use_shared_expert),
+            moe_router_hidden=(
+                None if b.moe_router_hidden is None else int(b.moe_router_hidden)
+            ),
+            moe_load_balance_weight=float(b.moe_load_balance_weight),
+            moe_z_loss_weight=float(b.moe_z_loss_weight),
+            moe_router_entropy_weight=float(b.moe_router_entropy_weight),
             lr=float(opt.lr),
             weight_decay=float(opt.weight_decay),
             lr_scale_2d=float(opt.lr_scale_2d),
@@ -111,6 +122,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             weight_decay_scale_heads=float(opt.weight_decay_scale_heads),
             stage_2d_only_epochs=int(opt.stage_2d_only_epochs),
             stage_3d_only_epochs=int(opt.stage_3d_only_epochs),
+            multitask_gradient_mode=str(opt.multitask_gradient_mode),
+            log_task_gradient_diagnostics=bool(opt.log_task_gradient_diagnostics),
             pos_weight=pos_weight,
             gamma=gamma,
             lam=lam,
@@ -124,6 +137,9 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             contrastive_temperature=float(loss.contrastive_temperature),
             consistency_view_keep_rate=float(loss.consistency_view_keep_rate),
             cross_modal_include_geom_qm=bool(loss.cross_modal_include_geom_qm),
+            learnable_task_uncertainty=bool(loss.learnable_task_uncertainty),
+            task_uncertainty_init_log_var=float(loss.task_uncertainty_init_log_var),
+            task_uncertainty_reg=float(loss.task_uncertainty_reg),
             reg_loss_type=str(loss.reg_loss_type),
             bitmask_group_top_ids=(
                 [int(x) for x in (loss.bitmask_group_top_ids or [])]
@@ -182,6 +198,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         weight_decay_scale_heads: float,
         stage_2d_only_epochs: int,
         stage_3d_only_epochs: int,
+        multitask_gradient_mode: str,
+        log_task_gradient_diagnostics: bool,
         pos_weight: torch.Tensor,
         gamma: torch.Tensor,
         lam: np.ndarray,
@@ -196,6 +214,9 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         contrastive_temperature: float = 0.10,
         consistency_view_keep_rate: float = 0.70,
         cross_modal_include_geom_qm: bool = True,
+        learnable_task_uncertainty: bool = True,
+        task_uncertainty_init_log_var: float = 0.0,
+        task_uncertainty_reg: float = 0.5,
         bitmask_group_top_ids: Optional[List[int]] = None,
         bitmask_group_class_weight: Optional[List[float]] = None,
         activation: str = "GELU",
@@ -208,6 +229,14 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         fusion_use_modality_interaction: bool = True,
         fusion_gate_hidden: Optional[int] = None,
         fusion_interaction_heads: int = 4,
+        mixer_type: str = "moe",
+        moe_num_experts: int = 4,
+        moe_top_k: int = 2,
+        moe_use_shared_expert: bool = True,
+        moe_router_hidden: Optional[int] = None,
+        moe_load_balance_weight: float = 1e-2,
+        moe_z_loss_weight: float = 1e-3,
+        moe_router_entropy_weight: float = 1e-4,
         predictor_name: str = "mlp_v3",
         head_num_layers: int = 2,
         head_dropout: float = 0.1,
@@ -225,8 +254,38 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self.inst_qm_dim = int(inst_qm_dim)
         self.inst_hidden = int(inst_hidden)
         self.proj_dim = int(proj_dim)
+        self.mixer_type = str(mixer_type).strip().lower()
+        if self.mixer_type not in {"mlp_v3", "moe"}:
+            raise ValueError(
+                f"Unsupported mixer_type={mixer_type!r}. Expected one of {{'mlp_v3', 'moe'}}."
+            )
+        self.moe_num_experts = int(max(1, moe_num_experts))
+        self.moe_top_k = int(max(1, min(int(moe_top_k), self.moe_num_experts)))
+        self.moe_use_shared_expert = bool(moe_use_shared_expert)
+        self.moe_router_hidden = (
+            None if moe_router_hidden is None else int(max(8, moe_router_hidden))
+        )
+        self.moe_load_balance_weight = float(max(0.0, moe_load_balance_weight))
+        self.moe_z_loss_weight = float(max(0.0, moe_z_loss_weight))
+        self.moe_router_entropy_weight = float(max(0.0, moe_router_entropy_weight))
         self.objective_mode = str(objective_mode)
         self.objective_min_w = float(objective_min_w)
+        self.multitask_gradient_mode = str(multitask_gradient_mode).strip().lower()
+        if self.multitask_gradient_mode not in {"none", "pcgrad_shared"}:
+            raise ValueError(
+                f"Unsupported multitask_gradient_mode={multitask_gradient_mode!r}. "
+                "Expected one of {'none', 'pcgrad_shared'}."
+            )
+        self.log_task_gradient_diagnostics = bool(log_task_gradient_diagnostics)
+        self.learnable_task_uncertainty = bool(learnable_task_uncertainty)
+        self.task_uncertainty_reg = float(max(0.0, task_uncertainty_reg))
+        if self.learnable_task_uncertainty:
+            self.task_loss_log_vars = nn.Parameter(
+                torch.full((NUM_TASKS,), float(task_uncertainty_init_log_var), dtype=torch.float32)
+            )
+        else:
+            self.register_parameter("task_loss_log_vars", None)
+        self.automatic_optimization = bool(self.multitask_gradient_mode == "none")
         self.lr_group_scales = {
             "2d": float(max(1e-4, lr_scale_2d)),
             "3d": float(max(1e-4, lr_scale_3d)),
@@ -475,13 +534,31 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         )
         mixer_in_dim = int(max(1, len(self.active_modalities)) * int(proj_dim))
 
-        self.mixer = build_mlp_v3_embedder(
-            input_dim=mixer_in_dim,
-            hidden_dim=int(mixer_hidden),
-            layers=int(mixer_layers),
-            dropout=float(mixer_dropout),
-            activation=str(activation),
-        )
+        if self.mixer_type == "moe":
+            self.mixer = TaskAwareMoEMixer(
+                input_dim=mixer_in_dim,
+                hidden_dim=int(mixer_hidden),
+                layers=int(mixer_layers),
+                dropout=float(mixer_dropout),
+                activation=str(activation),
+                num_tasks=NUM_TASKS,
+                gate_dim=int(len(self.active_modalities)),
+                num_experts=int(self.moe_num_experts),
+                top_k=int(self.moe_top_k),
+                use_shared_expert=bool(self.moe_use_shared_expert),
+                router_hidden=self.moe_router_hidden,
+                load_balance_weight=float(self.moe_load_balance_weight),
+                z_loss_weight=float(self.moe_z_loss_weight),
+                router_entropy_weight=float(self.moe_router_entropy_weight),
+            )
+        else:
+            self.mixer = build_mlp_v3_embedder(
+                input_dim=mixer_in_dim,
+                hidden_dim=int(mixer_hidden),
+                layers=int(mixer_layers),
+                dropout=float(mixer_dropout),
+                activation=str(activation),
+            )
         self.mixer_post_norm = nn.LayerNorm(int(mixer_hidden))
 
         self.cls_heads = self._build_head_group(
@@ -590,6 +667,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self._train_real_3d_without: int = 0
         self._val_real_3d_with: int = 0
         self._val_real_3d_without: int = 0
+        self._val_moe_weight_sum: Optional[torch.Tensor] = None
+        self._val_moe_count: int = 0
 
         # Optional concept-guidance RL controls (configured externally for final runs).
         self.rl_enabled: bool = False
@@ -601,6 +680,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self.rl_target_mols_by_task: list[set[str]] = [set() for _ in range(NUM_TASKS)]
 
     def _parameter_group_name(self, param_name: str) -> str:
+        if param_name == "task_loss_log_vars":
+            return "heads"
         if param_name == "task_2d_tokens":
             return "2d"
         if param_name.startswith(self._group_2d_prefixes):
@@ -677,6 +758,20 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             "fusion_modality_interaction": bool(self.fusion_use_modality_interaction),
             "objective_mode": str(self.objective_mode),
             "objective_min_w": float(self.objective_min_w),
+            "mixer_type": str(self.mixer_type),
+            "moe_num_experts": int(self.moe_num_experts),
+            "moe_top_k": int(self.moe_top_k),
+            "moe_use_shared_expert": bool(self.moe_use_shared_expert),
+            "moe_router_hidden": (
+                None if self.moe_router_hidden is None else int(self.moe_router_hidden)
+            ),
+            "moe_load_balance_weight": float(self.moe_load_balance_weight),
+            "moe_z_loss_weight": float(self.moe_z_loss_weight),
+            "moe_router_entropy_weight": float(self.moe_router_entropy_weight),
+            "multitask_gradient_mode": str(self.multitask_gradient_mode),
+            "log_task_gradient_diagnostics": bool(self.log_task_gradient_diagnostics),
+            "learnable_task_uncertainty": bool(self.learnable_task_uncertainty),
+            "task_uncertainty_reg": float(self.task_uncertainty_reg),
             "lambda_aux_abs": float(self.lambda_aux_abs),
             "lambda_aux_fluo": float(self.lambda_aux_fluo),
             "lambda_aux_bitmask": float(self.lambda_aux_bitmask),
@@ -772,6 +867,169 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 fields[f"group_{group_name}_lr"] = float(opt_values[group_name]["lr"])
                 fields[f"group_{group_name}_weight_decay"] = float(opt_values[group_name]["weight_decay"])
         return fields
+
+    def _shared_training_parameters(self) -> List[torch.nn.Parameter]:
+        shared_groups = {"2d", "3d", "fusion"}
+        params: List[torch.nn.Parameter] = []
+        for name, param in self.named_parameters():
+            if not bool(param.requires_grad):
+                continue
+            if self._parameter_group_name(str(name)) in shared_groups:
+                params.append(param)
+        return params
+
+    @staticmethod
+    def _clone_grad_list(
+        grads: Sequence[Optional[torch.Tensor]],
+    ) -> List[Optional[torch.Tensor]]:
+        return [None if g is None else g.detach().clone() for g in grads]
+
+    @staticmethod
+    def _grad_dot(
+        grads_a: Sequence[Optional[torch.Tensor]],
+        grads_b: Sequence[Optional[torch.Tensor]],
+    ) -> torch.Tensor:
+        terms: List[torch.Tensor] = []
+        for ga, gb in zip(grads_a, grads_b):
+            if ga is None or gb is None:
+                continue
+            terms.append((ga.float() * gb.float()).sum())
+        if len(terms) <= 0:
+            return torch.zeros((), dtype=torch.float32)
+        return torch.stack(terms).sum()
+
+    @classmethod
+    def _grad_norm(
+        cls,
+        grads: Sequence[Optional[torch.Tensor]],
+    ) -> torch.Tensor:
+        return torch.sqrt(cls._grad_dot(grads, grads).clamp_min(0.0))
+
+    @classmethod
+    def _grad_cosine(
+        cls,
+        grads_a: Sequence[Optional[torch.Tensor]],
+        grads_b: Sequence[Optional[torch.Tensor]],
+        eps: float = 1e-12,
+    ) -> torch.Tensor:
+        den = cls._grad_norm(grads_a) * cls._grad_norm(grads_b)
+        if float(den.detach().item()) <= float(eps):
+            return torch.zeros((), dtype=torch.float32)
+        return cls._grad_dot(grads_a, grads_b) / den.clamp_min(float(eps))
+
+    @classmethod
+    def _sum_grad_lists(
+        cls,
+        grad_lists: Sequence[Sequence[Optional[torch.Tensor]]],
+    ) -> List[Optional[torch.Tensor]]:
+        if len(grad_lists) <= 0:
+            return []
+        summed = cls._clone_grad_list(grad_lists[0])
+        for extra in grad_lists[1:]:
+            for idx, g in enumerate(extra):
+                if g is None:
+                    continue
+                if summed[idx] is None:
+                    summed[idx] = g.detach().clone()
+                else:
+                    summed[idx] = summed[idx] + g.detach()
+        return summed
+
+    @classmethod
+    def _subtract_grad_lists(
+        cls,
+        grads_a: Sequence[Optional[torch.Tensor]],
+        grads_b: Sequence[Optional[torch.Tensor]],
+    ) -> List[Optional[torch.Tensor]]:
+        out = cls._clone_grad_list(grads_a)
+        for idx, gb in enumerate(grads_b):
+            if gb is None:
+                continue
+            if out[idx] is None:
+                out[idx] = -gb.detach().clone()
+            else:
+                out[idx] = out[idx] - gb.detach()
+        return out
+
+    def _pcgrad_merge(
+        self,
+        task_grads: Sequence[Sequence[Optional[torch.Tensor]]],
+    ) -> List[Optional[torch.Tensor]]:
+        if len(task_grads) <= 0:
+            return []
+        projected = [self._clone_grad_list(grads) for grads in task_grads]
+        n_tasks = int(len(task_grads))
+        if n_tasks <= 1:
+            return projected[0]
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(getattr(self, "global_step", 0)) + 17)
+        for task_idx in range(n_tasks):
+            order = torch.randperm(n_tasks, generator=generator).tolist()
+            for other_idx in order:
+                if int(other_idx) == int(task_idx):
+                    continue
+                dot = self._grad_dot(projected[task_idx], task_grads[int(other_idx)])
+                if float(dot.detach().item()) >= 0.0:
+                    continue
+                denom = self._grad_dot(task_grads[int(other_idx)], task_grads[int(other_idx)]).clamp_min(1e-12)
+                scale = (dot / denom).detach()
+                for grad_pos, g_other in enumerate(task_grads[int(other_idx)]):
+                    if projected[task_idx][grad_pos] is None or g_other is None:
+                        continue
+                    projected[task_idx][grad_pos] = projected[task_idx][grad_pos] - scale * g_other.detach()
+        return self._sum_grad_lists(projected)
+
+    def _log_task_gradient_diagnostics(
+        self,
+        *,
+        task_grads: Sequence[Sequence[Optional[torch.Tensor]]],
+        batch_size: int,
+    ) -> None:
+        if (not bool(self.log_task_gradient_diagnostics)) or len(task_grads) < 2:
+            return
+        cos_vals: List[torch.Tensor] = []
+        for i in range(len(task_grads)):
+            for j in range(i + 1, len(task_grads)):
+                cos_ij = self._grad_cosine(task_grads[i], task_grads[j])
+                cos_vals.append(cos_ij)
+                self.log(
+                    f"train_task_grad_cos_t{i}_t{j}",
+                    cos_ij,
+                    on_step=False,
+                    on_epoch=True,
+                    batch_size=int(batch_size),
+                )
+        if len(cos_vals) <= 0:
+            return
+        cos_stack = torch.stack([c.float() for c in cos_vals])
+        self.log("train_task_grad_cos_mean", cos_stack.mean(), on_step=False, on_epoch=True, batch_size=int(batch_size))
+        self.log("train_task_grad_cos_min", cos_stack.min(), on_step=False, on_epoch=True, batch_size=int(batch_size))
+        self.log(
+            "train_task_grad_conflict_rate",
+            (cos_stack < 0.0).float().mean(),
+            on_step=False,
+            on_epoch=True,
+            batch_size=int(batch_size),
+        )
+
+    def _gradient_accumulation_steps(self) -> int:
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return 1
+        return int(max(1, getattr(trainer, "accumulate_grad_batches", 1)))
+
+    def _should_step_optimizer(self, batch_idx: int) -> bool:
+        accum = int(self._gradient_accumulation_steps())
+        if ((int(batch_idx) + 1) % accum) == 0:
+            return True
+        trainer = getattr(self, "trainer", None)
+        num_batches = None if trainer is None else getattr(trainer, "num_training_batches", None)
+        if num_batches is None:
+            return True
+        try:
+            return int(batch_idx) + 1 >= int(num_batches)
+        except Exception:
+            return True
 
     def _accumulate_real_3d_counts(
         self,
@@ -1029,6 +1287,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 "modality_scores": fusion_info.get("modality_scores"),
                 "modality_order": fusion_info.get("modality_order"),
                 "modality_attn": fusion_info.get("modality_attn"),
+                "mixer_info": fusion_info.get("mixer_info"),
             }
 
         if need_attn and return_bitmask:
@@ -1287,7 +1546,19 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             modality_attn = modality_attn_full.reshape(batch_size, NUM_TASKS, n_modalities, n_modalities)
 
         mix_in = fused_tokens.reshape(batch_size * NUM_TASKS, n_modalities * self.proj_dim)
-        z_tasks = self.mixer(mix_in).reshape(batch_size, NUM_TASKS, -1)  # [B,4,mixer_hidden]
+        mixer_info: Dict[str, Any] = {}
+        if self.mixer_type == "moe" and isinstance(self.mixer, TaskAwareMoEMixer):
+            task_index = torch.arange(NUM_TASKS, device=x2d.device, dtype=torch.long).view(1, NUM_TASKS)
+            task_index = task_index.expand(batch_size, NUM_TASKS).reshape(batch_size * NUM_TASKS)
+            router_context = modality_gates.reshape(batch_size * NUM_TASKS, n_modalities)
+            mix_out, mixer_info = self.mixer(
+                mix_in,
+                task_index=task_index,
+                router_context=router_context,
+            )
+        else:
+            mix_out = self.mixer(mix_in)
+        z_tasks = mix_out.reshape(batch_size, NUM_TASKS, -1)  # [B,4,mixer_hidden]
         z_tasks = self.mixer_post_norm(z_tasks)
         fusion_info = {
             "modality_order": tuple(str(x) for x in self.active_modalities),
@@ -1295,6 +1566,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             "modality_gates": modality_gates,
             "modality_attn": modality_attn,
             "modality_parts": modality_parts,
+            "mixer_info": mixer_info,
             "sample_has_real_3d": sample_has_real_3d,
             "modality_presence": {str(k): v for k, v in modality_presence.items()},
         }
@@ -1751,7 +2023,37 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 lambda_aux_abs=self.lambda_aux_abs,
                 lambda_aux_fluo=self.lambda_aux_fluo,
                 lambda_aux_bitmask=self.lambda_aux_bitmask,
+                task_loss_log_vars=(self.task_loss_log_vars if self.learnable_task_uncertainty else None),
+                task_uncertainty_reg=float(self.task_uncertainty_reg),
             )
+            mixer_info = forward_out["fusion_info"].get("mixer_info", {})
+            moe_router_aux_loss = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
+            moe_load_balance_loss = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
+            moe_z_loss = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
+            moe_router_entropy = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
+            moe_router_entropy_bonus = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
+            moe_shared_weight_mean = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
+            moe_private_weight_max_mean = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
+            moe_expert_importance = None
+            moe_expert_load = None
+            moe_private_dispatch_rate = None
+            if len(mixer_info) > 0:
+                moe_router_aux_loss = mixer_info.get("router_aux_loss", moe_router_aux_loss).to(dtype=losses.total.dtype)
+                moe_load_balance_loss = mixer_info.get("load_balance_loss", moe_load_balance_loss).to(dtype=losses.total.dtype)
+                moe_z_loss = mixer_info.get("z_loss", moe_z_loss).to(dtype=losses.total.dtype)
+                moe_router_entropy = mixer_info.get("router_entropy", moe_router_entropy).to(dtype=losses.total.dtype)
+                moe_router_entropy_bonus = mixer_info.get("router_entropy_bonus", moe_router_entropy_bonus).to(dtype=losses.total.dtype)
+                shared_weight_tensor = mixer_info.get("shared_weight")
+                if shared_weight_tensor is not None:
+                    moe_shared_weight_mean = shared_weight_tensor.float().mean().to(dtype=losses.total.dtype)
+                expert_weight_sparse = mixer_info.get("expert_weight_sparse")
+                if expert_weight_sparse is not None:
+                    moe_private_weight_max_mean = (
+                        expert_weight_sparse.float().amax(dim=-1).mean().to(dtype=losses.total.dtype)
+                    )
+                moe_expert_importance = mixer_info.get("expert_importance")
+                moe_expert_load = mixer_info.get("expert_load")
+                moe_private_dispatch_rate = mixer_info.get("private_dispatch_rate")
             contrastive_cross_modal = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
             contrastive_3d_consistency = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
             contrastive_supervised = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
@@ -1794,6 +2096,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 concept_bonus = float(self.rl_guidance_scale) * concept_alignment
             total_loss = (
                 losses.total
+                + moe_router_aux_loss
                 + weighted_contrastive_cross_modal
                 + weighted_contrastive_3d_consistency
                 + weighted_contrastive_supervised
@@ -1812,9 +2115,142 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             on_epoch=True,
             batch_size=bs,
         )
+        self.log(
+            "train_base_weighted_per_task_loss_mean",
+            losses.base_weighted_per_task.mean(),
+            on_step=False,
+            on_epoch=True,
+            batch_size=bs,
+        )
+        self.log(
+            "train_task_uncertainty_reg_mean",
+            losses.task_uncertainty_reg.mean(),
+            on_step=False,
+            on_epoch=True,
+            batch_size=bs,
+        )
+        for task_idx in range(NUM_TASKS):
+            self.log(
+                f"train_task_loss_t{int(task_idx)}",
+                losses.per_task[int(task_idx)],
+                on_step=False,
+                on_epoch=True,
+                batch_size=bs,
+            )
+            self.log(
+                f"train_task_weighted_loss_t{int(task_idx)}",
+                losses.weighted_per_task[int(task_idx)],
+                on_step=False,
+                on_epoch=True,
+                batch_size=bs,
+            )
+            self.log(
+                f"train_task_base_weighted_loss_t{int(task_idx)}",
+                losses.base_weighted_per_task[int(task_idx)],
+                on_step=False,
+                on_epoch=True,
+                batch_size=bs,
+            )
+        if self.learnable_task_uncertainty and self.task_loss_log_vars is not None:
+            task_precision = torch.exp(-self.task_loss_log_vars.detach())
+            for task_idx in range(NUM_TASKS):
+                self.log(
+                    f"train_task_log_var_t{int(task_idx)}",
+                    self.task_loss_log_vars[int(task_idx)].detach(),
+                    on_step=False,
+                    on_epoch=True,
+                    batch_size=bs,
+                )
+                self.log(
+                    f"train_task_precision_t{int(task_idx)}",
+                    task_precision[int(task_idx)],
+                    on_step=False,
+                    on_epoch=True,
+                    batch_size=bs,
+                )
         self.log("train_concept_alignment", concept_alignment, on_step=False, on_epoch=True, batch_size=bs)
         self.log("train_concept_bonus", concept_bonus, on_step=False, on_epoch=True, batch_size=bs)
         self.log("train_rl_guidance_scale", float(self.rl_guidance_scale), on_step=False, on_epoch=True, batch_size=bs)
+        self.log("train_moe_router_aux_loss", moe_router_aux_loss, on_step=False, on_epoch=True, batch_size=bs)
+        self.log("train_moe_load_balance_loss", moe_load_balance_loss, on_step=False, on_epoch=True, batch_size=bs)
+        self.log("train_moe_z_loss", moe_z_loss, on_step=False, on_epoch=True, batch_size=bs)
+        self.log("train_moe_router_entropy", moe_router_entropy, on_step=False, on_epoch=True, batch_size=bs)
+        self.log(
+            "train_moe_router_entropy_bonus",
+            moe_router_entropy_bonus,
+            on_step=False,
+            on_epoch=True,
+            batch_size=bs,
+        )
+        self.log(
+            "train_moe_shared_weight_mean",
+            moe_shared_weight_mean,
+            on_step=False,
+            on_epoch=True,
+            batch_size=bs,
+        )
+        self.log(
+            "train_moe_private_weight_max_mean",
+            moe_private_weight_max_mean,
+            on_step=False,
+            on_epoch=True,
+            batch_size=bs,
+        )
+        if moe_expert_importance is not None:
+            if bool(self.moe_use_shared_expert) and int(moe_expert_importance.shape[0]) > 0:
+                self.log(
+                    "train_moe_shared_importance",
+                    moe_expert_importance[0],
+                    on_step=False,
+                    on_epoch=True,
+                    batch_size=bs,
+                )
+                private_offset = 1
+            else:
+                private_offset = 0
+            for expert_idx in range(int(self.moe_num_experts)):
+                unit_idx = int(private_offset + expert_idx)
+                if unit_idx >= int(moe_expert_importance.shape[0]):
+                    break
+                self.log(
+                    f"train_moe_private_importance_e{int(expert_idx)}",
+                    moe_expert_importance[unit_idx],
+                    on_step=False,
+                    on_epoch=True,
+                    batch_size=bs,
+                )
+        if moe_expert_load is not None:
+            if bool(self.moe_use_shared_expert) and int(moe_expert_load.shape[0]) > 0:
+                self.log(
+                    "train_moe_shared_load",
+                    moe_expert_load[0],
+                    on_step=False,
+                    on_epoch=True,
+                    batch_size=bs,
+                )
+                private_offset = 1
+            else:
+                private_offset = 0
+            for expert_idx in range(int(self.moe_num_experts)):
+                unit_idx = int(private_offset + expert_idx)
+                if unit_idx >= int(moe_expert_load.shape[0]):
+                    break
+                self.log(
+                    f"train_moe_private_load_e{int(expert_idx)}",
+                    moe_expert_load[unit_idx],
+                    on_step=False,
+                    on_epoch=True,
+                    batch_size=bs,
+                )
+        if moe_private_dispatch_rate is not None:
+            for expert_idx in range(min(int(self.moe_num_experts), int(moe_private_dispatch_rate.shape[0]))):
+                self.log(
+                    f"train_moe_private_dispatch_rate_e{int(expert_idx)}",
+                    moe_private_dispatch_rate[int(expert_idx)],
+                    on_step=False,
+                    on_epoch=True,
+                    batch_size=bs,
+                )
         self.log("train_contrastive_cross_modal", contrastive_cross_modal, on_step=False, on_epoch=True, batch_size=bs)
         self.log(
             "train_contrastive_cross_modal_weighted",
@@ -1851,17 +2287,123 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             on_epoch=True,
             batch_size=bs,
         )
-        return total_loss
+        if bool(self.automatic_optimization):
+            return total_loss
+
+        opt = self.optimizers()
+        accum_steps = int(self._gradient_accumulation_steps())
+        if (int(batch_idx) % accum_steps) == 0:
+            opt.zero_grad()
+
+        shared_params = self._shared_training_parameters()
+        task_grad_lists: List[Sequence[Optional[torch.Tensor]]] = []
+        if len(shared_params) > 0 and str(self.multitask_gradient_mode) == "pcgrad_shared":
+            for task_idx in range(NUM_TASKS):
+                task_component = losses.weighted_per_task[int(task_idx)] / float(NUM_TASKS * accum_steps)
+                task_grads = torch.autograd.grad(
+                    task_component,
+                    shared_params,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                task_grad_lists.append(task_grads)
+            self._log_task_gradient_diagnostics(task_grads=task_grad_lists, batch_size=int(bs))
+
+        scaled_total_loss = total_loss / float(accum_steps)
+        self.manual_backward(scaled_total_loss)
+
+        if len(shared_params) > 0 and len(task_grad_lists) > 0 and str(self.multitask_gradient_mode) == "pcgrad_shared":
+            full_shared_grads = [
+                (None if param.grad is None else param.grad.detach().clone())
+                for param in shared_params
+            ]
+            classification_shared_grads = self._sum_grad_lists(task_grad_lists)
+            extra_shared_grads = self._subtract_grad_lists(full_shared_grads, classification_shared_grads)
+            merged_task_grads = self._pcgrad_merge(task_grad_lists)
+            merged_shared_grads = self._sum_grad_lists([merged_task_grads, extra_shared_grads])
+            for param, merged_grad in zip(shared_params, merged_shared_grads):
+                if merged_grad is None:
+                    param.grad = None
+                else:
+                    param.grad = merged_grad.to(device=param.device, dtype=param.dtype)
+
+        if self._should_step_optimizer(int(batch_idx)):
+            opt.step()
+            opt.zero_grad()
+        return total_loss.detach()
+
+    def _accumulate_val_moe_usage(self, *, mixer_info: Dict[str, Any], batch_size: int) -> None:
+        if len(mixer_info) <= 0:
+            return
+        all_expert_weights = mixer_info.get("all_expert_weights")
+        if all_expert_weights is None:
+            return
+        weights_bt = all_expert_weights.detach().reshape(int(batch_size), NUM_TASKS, -1).sum(dim=0).cpu()
+        if self._val_moe_weight_sum is None:
+            self._val_moe_weight_sum = torch.zeros_like(weights_bt)
+        self._val_moe_weight_sum = self._val_moe_weight_sum + weights_bt
+        self._val_moe_count += int(batch_size)
+
+    def _log_val_moe_usage_summary(self) -> None:
+        if self._val_moe_weight_sum is None or int(self._val_moe_count) <= 0:
+            return
+        mean_usage = self._val_moe_weight_sum / float(self._val_moe_count)
+        n_units = int(mean_usage.shape[1])
+        n_private = int(self.moe_num_experts)
+        for task_idx in range(NUM_TASKS):
+            usage_t = mean_usage[int(task_idx)]
+            usage_entropy = -torch.sum(usage_t.clamp_min(1e-8) * usage_t.clamp_min(1e-8).log())
+            self.log(
+                f"val_moe_usage_entropy_t{int(task_idx)}",
+                usage_entropy,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+            )
+            if bool(self.moe_use_shared_expert) and n_units > 0:
+                self.log(
+                    f"val_moe_shared_usage_t{int(task_idx)}",
+                    usage_t[0],
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                )
+                private_offset = 1
+            else:
+                private_offset = 0
+            for expert_idx in range(n_private):
+                unit_idx = int(private_offset + expert_idx)
+                if unit_idx >= n_units:
+                    break
+                self.log(
+                    f"val_moe_private_usage_t{int(task_idx)}_e{int(expert_idx)}",
+                    usage_t[unit_idx],
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                )
 
     def on_validation_epoch_start(self):
         self._val_p, self._val_y, self._val_w = [], [], []
         self._val_real_3d_with = 0
         self._val_real_3d_without = 0
+        self._val_moe_weight_sum = None
+        self._val_moe_count = 0
 
     def validation_step(self, batch, batch_idx):
         x2d, x3d, kpm, y_cls, w_cls, *_ = batch
         self._accumulate_real_3d_counts(split="val", x3d_pad=x3d, key_padding_mask=kpm)
-        logits, _, _ = self(x2d, x3d, kpm, return_attn=False)
+        forward_out = self._compute_outputs(
+            x2d=x2d,
+            x3d_pad=x3d,
+            key_padding_mask=kpm,
+            need_attn=False,
+        )
+        logits = forward_out["logits"]
+        self._accumulate_val_moe_usage(
+            mixer_info=forward_out["fusion_info"].get("mixer_info", {}),
+            batch_size=int(x2d.shape[0]),
+        )
 
         logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
         p = torch.sigmoid(logits).detach().cpu().numpy()
@@ -1874,6 +2416,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
 
     def on_validation_epoch_end(self):
         self._log_real_3d_epoch_summary(split="val")
+        self._log_val_moe_usage_summary()
         if not self._val_p:
             return
         p_all = np.concatenate(self._val_p, axis=0)

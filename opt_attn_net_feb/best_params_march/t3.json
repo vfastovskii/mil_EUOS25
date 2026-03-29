@@ -1,0 +1,17 @@
+{
+  "family": "catboost_st",
+  "task_idx": 3,
+  "task_name": "Fluorescence_more_than_480",
+  "best_params": {
+    "depth": 6,
+    "learning_rate": 0.010023656466639755,
+    "l2_leaf_reg": 9.067024380980882,
+    "min_data_in_leaf": 34,
+    "random_strength": 0.2473847783837974,
+    "rsm": 0.8160278013934359,
+    "bootstrap_type": "Bayesian",
+    "pos_weight_clip": 112.61846484745361,
+    "bagging_temperature": 0.13926237586625057
+  },
+  "best_value_pr_auc_cv": 0.040792978760835465
+}

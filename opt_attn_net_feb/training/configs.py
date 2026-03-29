@@ -54,6 +54,14 @@ class BackboneConfig:
     mixer_hidden: int = 512
     mixer_layers: int = 3
     mixer_dropout: float = 0.05
+    mixer_type: str = "moe"
+    moe_num_experts: int = 4
+    moe_top_k: int = 2
+    moe_use_shared_expert: bool = True
+    moe_router_hidden: int | None = None
+    moe_load_balance_weight: float = 1e-2
+    moe_z_loss_weight: float = 1e-3
+    moe_router_entropy_weight: float = 1e-4
     activation: str = "GELU"
     mol_embedder_name: str = "mlp_v3_2d"
     inst_embedder_name: str = "mlp_v3_3d"
@@ -110,6 +118,8 @@ class OptimizationConfig:
     weight_decay_scale_heads: float = 1.0
     stage_2d_only_epochs: int = 0
     stage_3d_only_epochs: int = 0
+    multitask_gradient_mode: str = "pcgrad_shared"
+    log_task_gradient_diagnostics: bool = True
 
 
 @dataclass(frozen=True)
@@ -225,6 +235,9 @@ class LossWeightingConfig:
     contrastive_temperature: float = 0.10
     consistency_view_keep_rate: float = 0.70
     cross_modal_include_geom_qm: bool = True
+    learnable_task_uncertainty: bool = True
+    task_uncertainty_init_log_var: float = 0.0
+    task_uncertainty_reg: float = 0.5
     bitmask_group_top_k: int = 6
     bitmask_group_weight_alpha: float = 0.5
     bitmask_group_weight_cap: float = 5.0
@@ -279,6 +292,9 @@ class LossWeightingConfig:
             contrastive_temperature=float(params.get("contrastive_temperature", 0.10)),
             consistency_view_keep_rate=float(params.get("consistency_view_keep_rate", 0.70)),
             cross_modal_include_geom_qm=bool(params.get("cross_modal_include_geom_qm", True)),
+            learnable_task_uncertainty=bool(params.get("learnable_task_uncertainty", True)),
+            task_uncertainty_init_log_var=float(params.get("task_uncertainty_init_log_var", 0.0)),
+            task_uncertainty_reg=float(params.get("task_uncertainty_reg", 0.5)),
             bitmask_group_top_k=int(params.get("bitmask_group_top_k", 6)),
             bitmask_group_weight_alpha=float(params.get("bitmask_group_weight_alpha", 0.5)),
             bitmask_group_weight_cap=float(params.get("bitmask_group_weight_cap", 5.0)),
@@ -374,6 +390,18 @@ class HPOConfig:
             mixer_hidden=int(params.get("mixer_hidden", 512)),
             mixer_layers=int(params.get("mixer_layers", 3)),
             mixer_dropout=float(params.get("mixer_dropout", 0.05)),
+            mixer_type=str(params.get("mixer_type", "moe")),
+            moe_num_experts=int(params.get("moe_num_experts", 4)),
+            moe_top_k=int(params.get("moe_top_k", 2)),
+            moe_use_shared_expert=bool(params.get("moe_use_shared_expert", True)),
+            moe_router_hidden=(
+                None
+                if params.get("moe_router_hidden", None) in (None, "")
+                else int(params.get("moe_router_hidden"))
+            ),
+            moe_load_balance_weight=float(params.get("moe_load_balance_weight", 1e-2)),
+            moe_z_loss_weight=float(params.get("moe_z_loss_weight", 1e-3)),
+            moe_router_entropy_weight=float(params.get("moe_router_entropy_weight", 1e-4)),
             activation=str(params.get("activation", "GELU")),
             mol_embedder_name=str(params.get("mol_embedder_name", "mlp_v3_2d")),
             inst_embedder_name=str(params.get("inst_embedder_name", "mlp_v3_3d")),
@@ -410,6 +438,8 @@ class HPOConfig:
             weight_decay_scale_heads=float(params.get("weight_decay_scale_heads", 1.0)),
             stage_2d_only_epochs=int(params.get("stage_2d_only_epochs", 0)),
             stage_3d_only_epochs=int(params.get("stage_3d_only_epochs", 0)),
+            multitask_gradient_mode=str(params.get("multitask_gradient_mode", "pcgrad_shared")),
+            log_task_gradient_diagnostics=bool(params.get("log_task_gradient_diagnostics", True)),
         )
 
         runtime = RuntimeConfig(
