@@ -78,6 +78,7 @@ class LightningTrainerFactory:
         ckpt_dir: str,
         trial: Optional["optuna.trial.Trial"] = None,
         extra_callbacks: Optional[List[Callback]] = None,
+        manual_optimization: bool = False,
     ) -> Tuple[pl.Trainer, Optional[pl.callbacks.ModelCheckpoint]]:
         monitor_metric = "val_objective_ap"
         es = pl.callbacks.EarlyStopping(
@@ -116,7 +117,7 @@ class LightningTrainerFactory:
             precision=str(self.config.precision),
             deterministic=True,
             gradient_clip_val=0.0,
-            accumulate_grad_batches=int(self.config.accumulate_grad_batches),
+            accumulate_grad_batches=(1 if bool(manual_optimization) else int(self.config.accumulate_grad_batches)),
         )
         return trainer, ckpt
 
@@ -179,6 +180,7 @@ def make_trainer_gpu(
     save_checkpoint: bool = True,
     save_weights_only: bool = True,
     extra_callbacks: Optional[List[Callback]] = None,
+    manual_optimization: bool = False,
 ) -> Tuple[pl.Trainer, Optional[pl.callbacks.ModelCheckpoint]]:
     """
     Creates and returns a PyTorch Lightning Trainer instance configured for GPU
@@ -232,6 +234,7 @@ def make_trainer_gpu(
         ckpt_dir=ckpt_dir,
         trial=trial,
         extra_callbacks=extra_callbacks,
+        manual_optimization=bool(manual_optimization),
     )
 
 

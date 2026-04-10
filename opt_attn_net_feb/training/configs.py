@@ -54,14 +54,6 @@ class BackboneConfig:
     mixer_hidden: int = 512
     mixer_layers: int = 3
     mixer_dropout: float = 0.05
-    mixer_type: str = "moe"
-    moe_num_experts: int = 4
-    moe_top_k: int = 2
-    moe_use_shared_expert: bool = True
-    moe_router_hidden: int | None = None
-    moe_load_balance_weight: float = 1e-2
-    moe_z_loss_weight: float = 1e-3
-    moe_router_entropy_weight: float = 1e-4
     activation: str = "GELU"
     mol_embedder_name: str = "mlp_v3_2d"
     inst_embedder_name: str = "mlp_v3_3d"
@@ -390,18 +382,6 @@ class HPOConfig:
             mixer_hidden=int(params.get("mixer_hidden", 512)),
             mixer_layers=int(params.get("mixer_layers", 3)),
             mixer_dropout=float(params.get("mixer_dropout", 0.05)),
-            mixer_type=str(params.get("mixer_type", "moe")),
-            moe_num_experts=int(params.get("moe_num_experts", 4)),
-            moe_top_k=int(params.get("moe_top_k", 2)),
-            moe_use_shared_expert=bool(params.get("moe_use_shared_expert", True)),
-            moe_router_hidden=(
-                None
-                if params.get("moe_router_hidden", None) in (None, "")
-                else int(params.get("moe_router_hidden"))
-            ),
-            moe_load_balance_weight=float(params.get("moe_load_balance_weight", 1e-2)),
-            moe_z_loss_weight=float(params.get("moe_z_loss_weight", 1e-3)),
-            moe_router_entropy_weight=float(params.get("moe_router_entropy_weight", 1e-4)),
             activation=str(params.get("activation", "GELU")),
             mol_embedder_name=str(params.get("mol_embedder_name", "mlp_v3_2d")),
             inst_embedder_name=str(params.get("inst_embedder_name", "mlp_v3_3d")),

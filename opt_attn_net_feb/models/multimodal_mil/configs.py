@@ -22,14 +22,6 @@ class MILBackboneConfig:
     mixer_hidden: int
     mixer_layers: int
     mixer_dropout: float
-    mixer_type: str = "moe"
-    moe_num_experts: int = 4
-    moe_top_k: int = 2
-    moe_use_shared_expert: bool = True
-    moe_router_hidden: Optional[int] = None
-    moe_load_balance_weight: float = 1e-2
-    moe_z_loss_weight: float = 1e-3
-    moe_router_entropy_weight: float = 1e-4
     activation: str = "GELU"
     mol_embedder_name: str = "mlp_v3_2d"
     inst_embedder_name: str = "mlp_v3_3d"

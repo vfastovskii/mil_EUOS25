@@ -39,7 +39,7 @@ def search_space(
         A dictionary containing the suggested values for each parameter within the
         specified hyperparameter search space.
     """
-    batch_values = [512, 1024, 2048] if batch_choices is None else [int(x) for x in batch_choices]
+    batch_values = [64, 128, 256] if batch_choices is None else [int(x) for x in batch_choices]
     if len(batch_values) == 0:
         raise ValueError("batch_choices must contain at least one value.")
     p = {"mol_hidden": trial.suggest_categorical("mol_hidden", [128, 256, 512]),
@@ -54,14 +54,6 @@ def search_space(
          "mixer_hidden": trial.suggest_categorical("mixer_hidden", [128, 256, 512]),
          "mixer_layers": trial.suggest_int("mixer_layers", 2, 5),
          "mixer_dropout": trial.suggest_float("mixer_dropout", 0.01, 0.2),
-         "mixer_type": "moe",
-         "moe_num_experts": trial.suggest_categorical("moe_num_experts", [4, 6, 8]),
-         "moe_top_k": 2,
-         "moe_use_shared_expert": True,
-         "moe_router_hidden": trial.suggest_categorical("moe_router_hidden", [64, 128, 256]),
-         "moe_load_balance_weight": trial.suggest_float("moe_load_balance_weight", 1e-3, 5e-2, log=True),
-         "moe_z_loss_weight": trial.suggest_float("moe_z_loss_weight", 1e-4, 1e-2, log=True),
-         "moe_router_entropy_weight": trial.suggest_float("moe_router_entropy_weight", 1e-5, 5e-3, log=True),
          "mol_embedder_name": trial.suggest_categorical("mol_embedder_name", ["mlp_v3_2d"]),
          "inst_embedder_name": trial.suggest_categorical("inst_embedder_name", ["mlp_v3_3d"]),
          "aggregator_name": trial.suggest_categorical("aggregator_name", ["task_attention_pool"]),

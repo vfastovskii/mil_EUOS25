@@ -62,6 +62,21 @@ from ..utils.ops import (
 from ..utils.progress import log_event, log_step
 
 FAMILY_CHOICES: tuple[str, ...] = ("catboost_st", "mt_2d", "mt_2d3d", "mt_3d")
+_TORCH_OOM_TYPES: tuple[type[BaseException], ...] = tuple(
+    cls
+    for cls in (
+        getattr(torch, "OutOfMemoryError", None),
+        getattr(torch.cuda, "OutOfMemoryError", None),
+    )
+    if isinstance(cls, type)
+)
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    if len(_TORCH_OOM_TYPES) > 0 and isinstance(exc, _TORCH_OOM_TYPES):
+        return True
+    msg = str(exc).lower()
+    return ("out of memory" in msg) and ("cuda" in msg)
 
 
 def _sampler_diag_lookup(df: pd.DataFrame) -> Dict[Tuple[Any, ...], float]:
@@ -698,7 +713,7 @@ def _search_space_mt_3d(trial: optuna.Trial) -> Dict[str, Any]:
         "lr_scale_3d": trial.suggest_float("lr_scale_3d", 0.5, 2.0, log=True),
         "lr_scale_fusion": trial.suggest_float("lr_scale_fusion", 0.5, 1.5, log=True),
         "lr_scale_heads": trial.suggest_float("lr_scale_heads", 0.5, 2.0, log=True),
-        "batch_size": trial.suggest_categorical("batch_size", [128, 256, 512]),
+        "batch_size": trial.suggest_categorical("batch_size", [64, 128]),
         "posw_clip_t0": trial.suggest_float("posw_clip_t0", 12.0, 28.0, log=True),
         "posw_clip_t1": trial.suggest_float("posw_clip_t1", 35.0, 90.0, log=True),
         "posw_clip_t2": trial.suggest_float("posw_clip_t2", 3.0, 10.0, log=True),
@@ -739,8 +754,8 @@ def _mil_search_space_for_family(*, trial: optuna.Trial, family: str) -> Dict[st
     if str(family) == "mt_3d":
         return _search_space_mt_3d(trial)
     if str(family) in {"mt_2d3d", "mt_3d"}:
-        # 3D-bearing families are the most memory intensive; keep per-step batch conservative.
-        return search_space(trial, batch_choices=(128, 256, 512))
+        # 3D-bearing families are the most memory intensive, especially with MoE + PCGrad.
+        return search_space(trial, batch_choices=(64, 128))
     return search_space(trial, batch_choices=(256, 512, 1024))
 
 
@@ -914,24 +929,8 @@ class _MILMacroCrossValidator:
                     val_idx=np.asarray(va, dtype=np.int64),
                     fold_id=int(fold_id),
                 )
-            except torch.cuda.OutOfMemoryError as exc:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
-                log_event(
-                    "WARN",
-                    "family.hpo.trial.pruned_oom",
-                    trial=int(trial.number),
-                    family=str(self.family),
-                    fold=int(fold_id),
-                    error=repr(exc),
-                )
-                raise optuna.TrialPruned(
-                    f"OOM in family={self.family} trial={int(trial.number)} fold={int(fold_id)}"
-                ) from exc
-            except RuntimeError as exc:
-                msg = str(exc).lower()
-                if ("out of memory" in msg) and ("cuda" in msg):
+            except Exception as exc:
+                if _is_cuda_oom(exc):
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     gc.collect()
@@ -1574,6 +1573,7 @@ def _run_mil_final_train_and_predict(
         bitmask_group_top_ids=bitmask_group_top_ids,
         bitmask_group_class_weight=bitmask_group_class_weight,
     )
+    model.manual_accumulate_grad_batches = int(max(1, hpo_cfg.runtime.accumulate_grad_batches))
     log_event(
         "INFO",
         "family.final.mil.model_training_setup",
@@ -1661,6 +1661,7 @@ def _run_mil_final_train_and_predict(
     trainer, ckpt_cb = LightningTrainerFactory(trainer_cfg).build(
         ckpt_dir=str(family_dir),
         trial=None,
+        manual_optimization=(not bool(model.automatic_optimization)),
     )
     trainer.fit(model, dl_tr, dl_val)
     epochs_trained = int(trainer.current_epoch) + 1

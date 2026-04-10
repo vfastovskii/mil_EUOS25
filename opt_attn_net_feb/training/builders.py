@@ -89,16 +89,6 @@ class MILModelBuilder:
                 mixer_hidden=int(b.mixer_hidden),
                 mixer_layers=int(b.mixer_layers),
                 mixer_dropout=float(b.mixer_dropout),
-                mixer_type=str(b.mixer_type),
-                moe_num_experts=int(b.moe_num_experts),
-                moe_top_k=int(b.moe_top_k),
-                moe_use_shared_expert=bool(b.moe_use_shared_expert),
-                moe_router_hidden=(
-                    None if b.moe_router_hidden is None else int(b.moe_router_hidden)
-                ),
-                moe_load_balance_weight=float(b.moe_load_balance_weight),
-                moe_z_loss_weight=float(b.moe_z_loss_weight),
-                moe_router_entropy_weight=float(b.moe_router_entropy_weight),
                 activation=str(b.activation),
                 mol_embedder_name=str(b.mol_embedder_name),
                 inst_embedder_name=str(b.inst_embedder_name),

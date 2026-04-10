@@ -48,6 +48,22 @@ from .loss_config import compute_gamma, compute_lam, compute_posw_clips
 from .search_space import search_space
 from .trainer import LightningTrainerConfig, LightningTrainerFactory, ModelEvaluator
 
+_TORCH_OOM_TYPES: tuple[type[BaseException], ...] = tuple(
+    cls
+    for cls in (
+        getattr(torch, "OutOfMemoryError", None),
+        getattr(torch.cuda, "OutOfMemoryError", None),
+    )
+    if isinstance(cls, type)
+)
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    if len(_TORCH_OOM_TYPES) > 0 and isinstance(exc, _TORCH_OOM_TYPES):
+        return True
+    msg = str(exc).lower()
+    return ("out of memory" in msg) and ("cuda" in msg)
+
 
 def _normalize_conf_id(value: Any) -> str:
     s = str(value).strip()
@@ -1069,6 +1085,7 @@ class MILFoldTrainer:
             bitmask_group_top_ids=bitmask_group_top_ids,
             bitmask_group_class_weight=bitmask_group_class_weight,
         )
+        model.manual_accumulate_grad_batches = int(max(1, cfg.runtime.accumulate_grad_batches))
         log_event(
             "INFO",
             "hpo.fold.model_training_setup",
@@ -1108,6 +1125,7 @@ class MILFoldTrainer:
         trainer, ckpt_cb = LightningTrainerFactory(trainer_cfg).build(
             ckpt_dir=str(fold_ckpt_dir),
             trial=self.trial,
+            manual_optimization=(not bool(model.automatic_optimization)),
         )
         with log_step("hpo.fold.fit", trial=int(self.trial.number), fold=int(fold_id), run_tag=str(run_tag)):
             trainer.fit(model, dl_tr, dl_va)
@@ -1489,11 +1507,28 @@ class MILCrossValidator:
                 cv_step=int(step),
                 fold=int(fold_id),
             )
-            _fold_score, detail = fold_runner.run_fold(
-                train_idx=np.asarray(tr, dtype=np.int64),
-                val_idx=np.asarray(va, dtype=np.int64),
-                fold_id=int(fold_id),
-            )
+            try:
+                _fold_score, detail = fold_runner.run_fold(
+                    train_idx=np.asarray(tr, dtype=np.int64),
+                    val_idx=np.asarray(va, dtype=np.int64),
+                    fold_id=int(fold_id),
+                )
+            except Exception as exc:
+                if _is_cuda_oom(exc):
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                    log_event(
+                        "WARN",
+                        "hpo.trial.pruned_oom",
+                        trial=int(trial.number),
+                        fold=int(fold_id),
+                        error=repr(exc),
+                    )
+                    raise optuna.TrialPruned(
+                        f"OOM in trial={int(trial.number)} fold={int(fold_id)}"
+                    ) from exc
+                raise
             objective_mode = str(cfg.objective.mode)
             if objective_mode in {"macro_pr_auc", "macro_ap"}:
                 trial_score = float(detail.get("macro_pr_auc_best_epoch", detail.get("macro_ap_best_epoch", 0.0)))
@@ -2110,6 +2145,7 @@ class MILFinalTrainer:
             bitmask_group_top_ids=bitmask_group_top_ids,
             bitmask_group_class_weight=bitmask_group_class_weight,
         )
+        model.manual_accumulate_grad_batches = int(max(1, cfg.runtime.accumulate_grad_batches))
         log_event("INFO", "final.model_training_setup", **model.get_training_debug_summary())
 
         if rl_active and explain_cfg is not None and chem_bundle is not None:
@@ -2226,6 +2262,7 @@ class MILFinalTrainer:
             ckpt_dir=str(final_dir),
             trial=None,
             extra_callbacks=(extra_callbacks if extra_callbacks else None),
+            manual_optimization=(not bool(model.automatic_optimization)),
         )
         with log_step("final.trainer.fit"):
             trainer.fit(model, dl_tr, dl_val)
