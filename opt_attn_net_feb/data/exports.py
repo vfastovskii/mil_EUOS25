@@ -227,7 +227,11 @@ def export_leaderboard_attention(
         attn_geom_t = attn.get("attn_geom")
         attn_qm_t = attn.get("attn_qm")
         modality_gates_t = attn.get("modality_gates")
+        modality_channel_gate_mean_t = attn.get("modality_channel_gate_mean")
+        modality_attn_t = attn.get("modality_attn")
         modality_order = tuple(str(x) for x in (attn.get("modality_order") or ()))
+        pairwise_weights_t = attn.get("pairwise_weights")
+        pairwise_order = tuple(str(x) for x in (attn.get("pairwise_order") or ()))
         if (attn_geom_t is None) and (attn_qm_t is None):
             raise RuntimeError("No modality attention returned; expected attn_geom and/or attn_qm")
 
@@ -242,6 +246,17 @@ def export_leaderboard_attention(
         modality_gates_np = (
             None if modality_gates_t is None else modality_gates_t.detach().cpu().numpy()
         )  # [B,4,M]
+        modality_channel_gate_mean_np = (
+            None
+            if modality_channel_gate_mean_t is None
+            else modality_channel_gate_mean_t.detach().cpu().numpy()
+        )  # [B,4,M]
+        modality_attn_np = (
+            None if modality_attn_t is None else modality_attn_t.detach().cpu().numpy()
+        )  # [B,4,M,M]
+        pairwise_weights_np = (
+            None if pairwise_weights_t is None else pairwise_weights_t.detach().cpu().numpy()
+        )  # [B,4,P]
         ref = attn_geom_np if attn_geom_np is not None else attn_qm_np
         if ref is None:
             raise RuntimeError("Internal error: missing reference attention tensor")
@@ -329,6 +344,36 @@ def export_leaderboard_attention(
                         for mi, modality_name in enumerate(modality_order):
                             row[f"fusion_gate_{str(modality_name)}_{TASK_COLS[t]}"] = float(
                                 modality_gates_np[b, t, mi]
+                            )
+                if (
+                    modality_channel_gate_mean_np is not None
+                    and len(modality_order) == int(modality_channel_gate_mean_np.shape[2])
+                ):
+                    for t in range(T):
+                        for mi, modality_name in enumerate(modality_order):
+                            row[f"fusion_channel_mean_{str(modality_name)}_{TASK_COLS[t]}"] = float(
+                                modality_channel_gate_mean_np[b, t, mi]
+                            )
+                if (
+                    modality_attn_np is not None
+                    and len(modality_order) == int(modality_attn_np.shape[2])
+                    and len(modality_order) == int(modality_attn_np.shape[3])
+                ):
+                    for t in range(T):
+                        for qi, query_name in enumerate(modality_order):
+                            for ki, key_name in enumerate(modality_order):
+                                row[
+                                    f"modality_attn_query_{str(query_name)}_key_{str(key_name)}_{TASK_COLS[t]}"
+                                ] = float(modality_attn_np[b, t, qi, ki])
+                if (
+                    pairwise_weights_np is not None
+                    and len(pairwise_order) == int(pairwise_weights_np.shape[2])
+                ):
+                    for t in range(T):
+                        for pi, pair_name in enumerate(pairwise_order):
+                            safe_pair_name = str(pair_name).replace("|", "_x_")
+                            row[f"fusion_pair_{safe_pair_name}_{TASK_COLS[t]}"] = float(
+                                pairwise_weights_np[b, t, pi]
                             )
                 if conf_signature_map is not None:
                     key = _normalize_conf_id(confs[i])

@@ -39,9 +39,10 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
     - 3D quantum embedder -> tokens -> quantum aggregator
     - project 2D/3D-geom/3D-qm to same dim
     - make 2D task-aware before fusion
-    - apply explicit per-task modality gates
     - run a tiny modality interaction block
-    - flatten modality summaries and pass through mixer -> z_task
+    - apply contextual per-task modality gates plus channel modulation
+    - add explicit pairwise modality interaction terms
+    - pool modality summaries with a DeepSets-style residual mixer -> z_task
     - cls logits from task-specific z_task
     - aux heads from mean(z_task)
     """
@@ -407,7 +408,6 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             str(name): int(i) for i, name in enumerate(self.active_modalities)
         }
         n_modalities = int(len(self.active_modalities))
-        act_mod = _make_activation_module(str(activation))
         self.fusion_use_task_2d_adapter = bool(fusion_use_task_2d_adapter and self.proj2d is not None)
         self.fusion_use_modality_gates = bool(fusion_use_modality_gates)
         self.fusion_use_modality_interaction = bool(fusion_use_modality_interaction and n_modalities > 1)
@@ -437,11 +437,18 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self.modality_type_embeddings = nn.Parameter(
             torch.randn(max(1, n_modalities), self.proj_dim) * 0.02
         )
+        gate_input_dim = int(4 * self.proj_dim)
         self.modality_gate_net = nn.Sequential(
-            nn.Linear(self.proj_dim, gate_hidden),
-            act_mod,
+            nn.Linear(gate_input_dim, gate_hidden),
+            _make_activation_module(str(activation)),
             nn.Dropout(float(mixer_dropout)),
             nn.Linear(gate_hidden, 1),
+        )
+        self.modality_channel_gate_net = nn.Sequential(
+            nn.Linear(gate_input_dim, gate_hidden),
+            _make_activation_module(str(activation)),
+            nn.Dropout(float(mixer_dropout)),
+            nn.Linear(gate_hidden, self.proj_dim),
         )
         interaction_heads = int(max(1, fusion_interaction_heads))
         if self.proj_dim % interaction_heads != 0:
@@ -503,10 +510,39 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             nn.Dropout(float(mixer_dropout)),
             nn.Linear(int(mixer_hidden), self.contrastive_proj_dim),
         )
-        mixer_in_dim = int(max(1, len(self.active_modalities)) * int(proj_dim))
+        self.pairwise_interaction_net = nn.Sequential(
+            nn.Linear(int(3 * self.proj_dim), self.proj_dim),
+            _make_activation_module(str(activation)),
+            nn.Dropout(float(mixer_dropout)),
+            nn.Linear(self.proj_dim, self.proj_dim),
+        )
+        self.pairwise_score_net = nn.Sequential(
+            nn.Linear(int(3 * self.proj_dim), gate_hidden),
+            _make_activation_module(str(activation)),
+            nn.Dropout(float(mixer_dropout)),
+            nn.Linear(gate_hidden, 1),
+        )
+        self.modality_deepset_proj = nn.Sequential(
+            nn.Linear(self.proj_dim, int(mixer_hidden)),
+            _make_activation_module(str(activation)),
+            nn.Dropout(float(mixer_dropout)),
+            nn.Linear(int(mixer_hidden), int(mixer_hidden)),
+        )
+        self.modality_deepset_skip = (
+            nn.Identity()
+            if self.proj_dim == int(mixer_hidden)
+            else nn.Linear(self.proj_dim, int(mixer_hidden))
+        )
+        self.pairwise_summary_proj = nn.Sequential(
+            nn.Linear(self.proj_dim, int(mixer_hidden)),
+            _make_activation_module(str(activation)),
+            nn.Dropout(float(mixer_dropout)),
+            nn.Linear(int(mixer_hidden), int(mixer_hidden)),
+        )
+        self.fusion_summary_norm = nn.LayerNorm(int(mixer_hidden))
 
         self.mixer = build_mlp_v3_embedder(
-            input_dim=mixer_in_dim,
+            input_dim=int(mixer_hidden),
             hidden_dim=int(mixer_hidden),
             layers=int(mixer_layers),
             dropout=float(mixer_dropout),
@@ -1248,8 +1284,12 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 "attn_qm": attn_qm,
                 "modality_gates": fusion_info.get("modality_gates"),
                 "modality_scores": fusion_info.get("modality_scores"),
+                "modality_channel_gate_mean": fusion_info.get("modality_channel_gate_mean"),
                 "modality_order": fusion_info.get("modality_order"),
                 "modality_attn": fusion_info.get("modality_attn"),
+                "pairwise_order": fusion_info.get("pairwise_order"),
+                "pairwise_scores": fusion_info.get("pairwise_scores"),
+                "pairwise_weights": fusion_info.get("pairwise_weights"),
                 "mixer_info": fusion_info.get("mixer_info"),
             }
 
@@ -1429,7 +1469,6 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         )  # [B,T,M,proj]
         n_modalities = int(tokens.shape[2])
         type_embed = self.modality_type_embeddings[:n_modalities].view(1, 1, n_modalities, self.proj_dim)
-        tokens_with_type = tokens + type_embed
         active_mask = torch.stack(
             [
                 modality_presence[str(name)].to(dtype=tokens.dtype, device=tokens.device)
@@ -1439,32 +1478,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         ).view(batch_size, 1, n_modalities)
         active_mask_bt = active_mask.expand(batch_size, NUM_TASKS, n_modalities)
 
-        if n_modalities == 1:
-            modality_scores = torch.ones(
-                (batch_size, NUM_TASKS, 1),
-                dtype=tokens.dtype,
-                device=tokens.device,
-            )
-            modality_gates = active_mask_bt
-        else:
-            flat_tokens = tokens_with_type.reshape(batch_size * NUM_TASKS * n_modalities, self.proj_dim)
-            modality_scores = self.modality_gate_net(flat_tokens).reshape(batch_size, NUM_TASKS, n_modalities)
-            if bool(torch.any(active_mask_bt < 0.5)):
-                # Use a dtype-safe floor so mixed-precision runs do not overflow on fp16.
-                modality_scores = modality_scores.masked_fill(
-                    active_mask_bt < 0.5,
-                    float(torch.finfo(modality_scores.dtype).min),
-                )
-            if self.fusion_use_modality_gates:
-                modality_gates = torch.softmax(modality_scores, dim=-1)
-                modality_gates = modality_gates * active_mask_bt
-                modality_gates = modality_gates / modality_gates.sum(dim=-1, keepdim=True).clamp_min(1.0)
-            else:
-                modality_gates = active_mask_bt / active_mask_bt.sum(dim=-1, keepdim=True).clamp_min(1.0)
-
-        gated_tokens = tokens * modality_gates.unsqueeze(-1)
         modality_attn = None
-        fused_tokens = gated_tokens
+        contextual_tokens = tokens
         if (
             self.fusion_use_modality_interaction
             and self.modality_interaction_attn is not None
@@ -1473,7 +1488,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             and self.modality_interaction_ln2 is not None
             and n_modalities > 1
         ):
-            seq = gated_tokens.reshape(batch_size * NUM_TASKS, n_modalities, self.proj_dim)
+            seq = tokens.reshape(batch_size * NUM_TASKS, n_modalities, self.proj_dim)
             seq_active_mask = active_mask_bt.reshape(batch_size * NUM_TASKS, n_modalities).bool()
             seq_type = type_embed.expand(batch_size, NUM_TASKS, -1, -1).reshape(
                 batch_size * NUM_TASKS, n_modalities, self.proj_dim
@@ -1502,22 +1517,131 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 seq_sel = self.modality_interaction_ln1(seq_sel + self.modality_interaction_dropout(attn_out))
                 seq_sel = self.modality_interaction_ln2(seq_sel + self.modality_interaction_ffn(seq_sel))
                 seq_sel = seq_sel * seq_mask_sel.to(dtype=seq_sel.dtype).unsqueeze(-1)
+                attn_mean = attn_w.mean(dim=1)
+                attn_mask = seq_mask_sel.to(dtype=attn_mean.dtype)
+                attn_mean = attn_mean * attn_mask.unsqueeze(-1) * attn_mask.unsqueeze(-2)
+                attn_mean = attn_mean / attn_mean.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                attn_mean = attn_mean * attn_mask.unsqueeze(-1)
                 fused_seq = fused_seq.clone()
                 fused_seq.index_copy_(0, active_rows, seq_sel)
-                modality_attn_full.index_copy_(0, active_rows, attn_w.mean(dim=1))
-            fused_tokens = fused_seq.reshape(batch_size, NUM_TASKS, n_modalities, self.proj_dim)
+                modality_attn_full.index_copy_(0, active_rows, attn_mean)
+            contextual_tokens = fused_seq.reshape(batch_size, NUM_TASKS, n_modalities, self.proj_dim)
             modality_attn = modality_attn_full.reshape(batch_size, NUM_TASKS, n_modalities, n_modalities)
 
-        mix_in = fused_tokens.reshape(batch_size * NUM_TASKS, n_modalities * self.proj_dim)
-        mixer_info: Dict[str, Any] = {}
-        mix_out = self.mixer(mix_in)
+        gate_tokens = contextual_tokens + type_embed
+        gate_mask = active_mask_bt.unsqueeze(-1)
+        gate_tokens_masked = gate_tokens * gate_mask
+        context_mean = gate_tokens_masked.sum(dim=2, keepdim=True) / gate_mask.sum(dim=2, keepdim=True).clamp_min(1.0)
+        gate_floor = float(torch.finfo(gate_tokens.dtype).min)
+        context_max = gate_tokens.masked_fill(gate_mask < 0.5, gate_floor).max(dim=2, keepdim=True).values
+        has_any_modality = active_mask_bt.any(dim=2, keepdim=True).unsqueeze(-1)
+        context_max = torch.where(has_any_modality, context_max, torch.zeros_like(context_max))
+        gate_features = torch.cat(
+            [
+                gate_tokens,
+                context_mean.expand(-1, -1, n_modalities, -1),
+                context_max.expand(-1, -1, n_modalities, -1),
+                gate_tokens * context_mean.expand(-1, -1, n_modalities, -1),
+            ],
+            dim=-1,
+        )
+        flat_gate_features = gate_features.reshape(batch_size * NUM_TASKS * n_modalities, int(4 * self.proj_dim))
+
+        if n_modalities == 1:
+            modality_scores = torch.ones(
+                (batch_size, NUM_TASKS, 1),
+                dtype=tokens.dtype,
+                device=tokens.device,
+            )
+            modality_gates = active_mask_bt
+            modality_channel_gates = torch.ones_like(contextual_tokens) * gate_mask
+        else:
+            modality_scores = self.modality_gate_net(flat_gate_features).reshape(batch_size, NUM_TASKS, n_modalities)
+            if bool(torch.any(active_mask_bt < 0.5)):
+                # Use a dtype-safe floor so mixed-precision runs do not overflow on fp16.
+                modality_scores = modality_scores.masked_fill(
+                    active_mask_bt < 0.5,
+                    float(torch.finfo(modality_scores.dtype).min),
+                )
+            if self.fusion_use_modality_gates:
+                modality_gates = torch.softmax(modality_scores, dim=-1)
+                modality_gates = modality_gates * active_mask_bt
+                modality_gates = modality_gates / modality_gates.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                channel_logits = self.modality_channel_gate_net(flat_gate_features).reshape(
+                    batch_size, NUM_TASKS, n_modalities, self.proj_dim
+                )
+                modality_channel_gates = (1.0 + 0.5 * torch.tanh(channel_logits)) * gate_mask
+            else:
+                modality_gates = active_mask_bt / active_mask_bt.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                modality_channel_gates = torch.ones_like(contextual_tokens) * gate_mask
+        modality_channel_gate_mean = modality_channel_gates.mean(dim=-1) * active_mask_bt
+
+        gated_tokens = contextual_tokens * modality_gates.unsqueeze(-1) * modality_channel_gates
+
+        pairwise_order: tuple[str, ...] = tuple()
+        pairwise_scores = tokens.new_zeros((batch_size, NUM_TASKS, 0))
+        pairwise_weights = tokens.new_zeros((batch_size, NUM_TASKS, 0))
+        pairwise_summary = tokens.new_zeros((batch_size, NUM_TASKS, self.proj_dim))
+        pairwise_has_valid = tokens.new_zeros((batch_size, NUM_TASKS, 1))
+        if n_modalities > 1:
+            pair_inputs: list[torch.Tensor] = []
+            pair_valid: list[torch.Tensor] = []
+            pair_names: list[str] = []
+            for i in range(n_modalities):
+                for j in range(i + 1, n_modalities):
+                    left = contextual_tokens[:, :, i, :]
+                    right = contextual_tokens[:, :, j, :]
+                    pair_inputs.append(torch.cat([left, right, left * right], dim=-1))
+                    pair_valid.append(active_mask_bt[:, :, i] * active_mask_bt[:, :, j])
+                    pair_names.append(f"{self.active_modalities[i]}|{self.active_modalities[j]}")
+            if len(pair_inputs) > 0:
+                pairwise_order = tuple(pair_names)
+                pair_features = torch.stack(pair_inputs, dim=2)
+                pair_valid_t = torch.stack(pair_valid, dim=2)
+                n_pairs = int(pair_features.shape[2])
+                flat_pair_features = pair_features.reshape(batch_size * NUM_TASKS * n_pairs, int(3 * self.proj_dim))
+                pair_tokens = self.pairwise_interaction_net(flat_pair_features).reshape(
+                    batch_size, NUM_TASKS, n_pairs, self.proj_dim
+                )
+                pairwise_scores = self.pairwise_score_net(flat_pair_features).reshape(batch_size, NUM_TASKS, n_pairs)
+                if bool(torch.any(pair_valid_t < 0.5)):
+                    pairwise_scores = pairwise_scores.masked_fill(
+                        pair_valid_t < 0.5,
+                        float(torch.finfo(pairwise_scores.dtype).min),
+                    )
+                pairwise_weights = torch.softmax(pairwise_scores, dim=-1)
+                pairwise_weights = pairwise_weights * pair_valid_t
+                pairwise_weights = pairwise_weights / pairwise_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                pairwise_summary = (pair_tokens * pairwise_weights.unsqueeze(-1)).sum(dim=2)
+                pairwise_has_valid = (pair_valid_t.sum(dim=-1, keepdim=True) > 0).to(dtype=tokens.dtype)
+
+        token_latents = self.modality_deepset_proj(
+            gated_tokens.reshape(batch_size * NUM_TASKS * n_modalities, self.proj_dim)
+        ).reshape(batch_size, NUM_TASKS, n_modalities, -1)
+        token_skip = self.modality_deepset_skip(gated_tokens)
+        token_latents = (token_latents + token_skip) * active_mask_bt.unsqueeze(-1)
+        modality_summary = token_latents.sum(dim=2)
+        pair_latent = self.pairwise_summary_proj(
+            pairwise_summary.reshape(batch_size * NUM_TASKS, self.proj_dim)
+        ).reshape(batch_size, NUM_TASKS, -1)
+        pair_latent = pair_latent * pairwise_has_valid
+        mix_in = self.fusion_summary_norm(modality_summary + pair_latent)
+        mixer_info: Dict[str, Any] = {
+            "type": "deepsets_residual_pairwise",
+            "pairwise_order": pairwise_order,
+        }
+        mix_out = self.mixer(mix_in.reshape(batch_size * NUM_TASKS, -1))
         z_tasks = mix_out.reshape(batch_size, NUM_TASKS, -1)  # [B,4,mixer_hidden]
         z_tasks = self.mixer_post_norm(z_tasks)
         fusion_info = {
             "modality_order": tuple(str(x) for x in self.active_modalities),
             "modality_scores": modality_scores,
             "modality_gates": modality_gates,
+            "modality_channel_gate_mean": modality_channel_gate_mean,
             "modality_attn": modality_attn,
+            "pairwise_order": pairwise_order,
+            "pairwise_scores": pairwise_scores,
+            "pairwise_weights": pairwise_weights,
             "modality_parts": modality_parts,
             "mixer_info": mixer_info,
             "sample_has_real_3d": sample_has_real_3d,
@@ -1555,20 +1679,29 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         return torch.tensor(mask, dtype=torch.bool, device=device)
 
     @staticmethod
-    def _mask_positive_pairs_by_sample_eligibility(
+    def _filter_pair_by_sample_eligibility(
+        *,
+        za: torch.Tensor,
+        zb: torch.Tensor,
         positive_mask: torch.Tensor,
         sample_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if sample_mask is None:
-            return positive_mask
+            return za, zb, positive_mask
         sample_mask = sample_mask.to(device=positive_mask.device, dtype=torch.bool).reshape(-1)
         if int(sample_mask.numel()) != int(positive_mask.shape[0]):
             raise ValueError(
                 f"Expected sample eligibility to have length {int(positive_mask.shape[0])}, "
                 f"got {int(sample_mask.numel())}"
             )
-        pair_mask = sample_mask.unsqueeze(1) & sample_mask.unsqueeze(0)
-        return positive_mask & pair_mask
+        idx = torch.nonzero(sample_mask, as_tuple=False).squeeze(1)
+        if int(idx.numel()) == int(positive_mask.shape[0]):
+            return za, zb, positive_mask
+        za_f = za.index_select(0, idx.to(device=za.device))
+        zb_f = zb.index_select(0, idx.to(device=zb.device))
+        idx_mask = idx.to(device=positive_mask.device)
+        positive_mask_f = positive_mask.index_select(0, idx_mask).index_select(1, idx_mask)
+        return za_f, zb_f, positive_mask_f
 
     @staticmethod
     def _non_dummy_valid_instance_mask(
@@ -1714,20 +1847,30 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         pair_losses: List[torch.Tensor] = []
         for name_a, name_b in (("2d", "3d_geom"), ("2d", "3d_qm")):
             if name_a in proj and name_b in proj:
-                pair_positive_mask = self._mask_positive_pairs_by_sample_eligibility(positive_mask, has_real_3d)
+                za_pair, zb_pair, pair_positive_mask = self._filter_pair_by_sample_eligibility(
+                    za=proj[name_a],
+                    zb=proj[name_b],
+                    positive_mask=positive_mask,
+                    sample_mask=has_real_3d,
+                )
                 pair_losses.append(
                     self._contrastive_pair_loss(
-                        za=proj[name_a],
-                        zb=proj[name_b],
+                        za=za_pair,
+                        zb=zb_pair,
                         positive_mask=pair_positive_mask,
                     )
                 )
         if self.cross_modal_include_geom_qm and ("3d_geom" in proj) and ("3d_qm" in proj):
-            pair_positive_mask = self._mask_positive_pairs_by_sample_eligibility(positive_mask, has_real_3d)
+            za_pair, zb_pair, pair_positive_mask = self._filter_pair_by_sample_eligibility(
+                za=proj["3d_geom"],
+                zb=proj["3d_qm"],
+                positive_mask=positive_mask,
+                sample_mask=has_real_3d,
+            )
             pair_losses.append(
                 self._contrastive_pair_loss(
-                    za=proj["3d_geom"],
-                    zb=proj["3d_qm"],
+                    za=za_pair,
+                    zb=zb_pair,
                     positive_mask=pair_positive_mask,
                 )
             )
@@ -1835,15 +1978,20 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             device=ref.device,
             mol_ids=mol_ids,
         )
-        positive_mask = self._mask_positive_pairs_by_sample_eligibility(positive_mask, eligible_samples)
         losses: List[torch.Tensor] = []
         for name in ("3d_geom", "3d_qm"):
             if name in proj_a and name in proj_b:
+                za_pair, zb_pair, pair_positive_mask = self._filter_pair_by_sample_eligibility(
+                    za=proj_a[name],
+                    zb=proj_b[name],
+                    positive_mask=positive_mask,
+                    sample_mask=eligible_samples,
+                )
                 losses.append(
                     self._contrastive_pair_loss(
-                        za=proj_a[name],
-                        zb=proj_b[name],
-                        positive_mask=positive_mask,
+                        za=za_pair,
+                        zb=zb_pair,
+                        positive_mask=pair_positive_mask,
                     )
                 )
         if len(losses) == 0:
@@ -1945,8 +2093,12 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 "attn_qm": forward_out.get("attn_qm"),
                 "modality_gates": forward_out["fusion_info"].get("modality_gates"),
                 "modality_scores": forward_out["fusion_info"].get("modality_scores"),
+                "modality_channel_gate_mean": forward_out["fusion_info"].get("modality_channel_gate_mean"),
                 "modality_order": forward_out["fusion_info"].get("modality_order"),
                 "modality_attn": forward_out["fusion_info"].get("modality_attn"),
+                "pairwise_order": forward_out["fusion_info"].get("pairwise_order"),
+                "pairwise_scores": forward_out["fusion_info"].get("pairwise_scores"),
+                "pairwise_weights": forward_out["fusion_info"].get("pairwise_weights"),
             }
         bitmask_targets = self._bitmask_group_targets(y_cls)
 

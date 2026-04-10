@@ -713,7 +713,7 @@ def _search_space_mt_3d(trial: optuna.Trial) -> Dict[str, Any]:
         "lr_scale_3d": trial.suggest_float("lr_scale_3d", 0.5, 2.0, log=True),
         "lr_scale_fusion": trial.suggest_float("lr_scale_fusion", 0.5, 1.5, log=True),
         "lr_scale_heads": trial.suggest_float("lr_scale_heads", 0.5, 2.0, log=True),
-        "batch_size": trial.suggest_categorical("batch_size", [64, 128]),
+        "batch_size": trial.suggest_categorical("batch_size", [128, 256, 512]),
         "posw_clip_t0": trial.suggest_float("posw_clip_t0", 12.0, 28.0, log=True),
         "posw_clip_t1": trial.suggest_float("posw_clip_t1", 35.0, 90.0, log=True),
         "posw_clip_t2": trial.suggest_float("posw_clip_t2", 3.0, 10.0, log=True),
@@ -754,8 +754,8 @@ def _mil_search_space_for_family(*, trial: optuna.Trial, family: str) -> Dict[st
     if str(family) == "mt_3d":
         return _search_space_mt_3d(trial)
     if str(family) in {"mt_2d3d", "mt_3d"}:
-        # 3D-bearing families are the most memory intensive, especially with MoE + PCGrad.
-        return search_space(trial, batch_choices=(64, 128))
+        # 3D-bearing families are still heavier than 2D-only, but no longer need the MoE-era clamp.
+        return search_space(trial, batch_choices=(128, 256, 512))
     return search_space(trial, batch_choices=(256, 512, 1024))
 
 

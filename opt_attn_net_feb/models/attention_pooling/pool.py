@@ -66,11 +66,14 @@ class TaskAttentionPool(nn.Module):
         self.topk_strategy = topk_strategy
         self.use_temperature = bool(use_temperature)
         self.prune_below = float(prune_below)
+        self.attn_dropout_p = float(attn_dropout if attn_dropout is not None else dropout)
 
         self.mha = nn.MultiheadAttention(
             embed_dim=dim,
             num_heads=n_heads,
-            dropout=float(attn_dropout if attn_dropout is not None else dropout),
+            # Apply attention dropout explicitly after padding/prune normalization so
+            # stochastic masking can never erase every conformer in a molecule.
+            dropout=0.0,
             batch_first=True,
             bias=True,
         )
@@ -135,6 +138,43 @@ class TaskAttentionPool(nn.Module):
                 a = a.masked_fill(key_padding_mask.unsqueeze(1), 0.0)
 
         return a / a.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+
+    def _apply_safe_instance_dropout(
+        self,
+        alpha: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if (not self.training) or self.attn_dropout_p <= 0.0:
+            return alpha
+
+        p = float(min(max(self.attn_dropout_p, 0.0), 0.95))
+        if p <= 0.0:
+            return alpha
+
+        if key_padding_mask is None:
+            valid = torch.ones_like(alpha, dtype=torch.bool)
+        else:
+            valid = (~key_padding_mask.bool()).unsqueeze(1).expand_as(alpha)
+        if not bool(torch.any(valid)):
+            return alpha
+
+        keep = (torch.rand_like(alpha) >= p) & valid
+        has_keep = keep.any(dim=-1, keepdim=True)
+        if bool(torch.any(~has_keep)):
+            fallback_scores = alpha.masked_fill(~valid, -1.0)
+            fallback_idx = fallback_scores.argmax(dim=-1, keepdim=True)
+            fallback_keep = torch.zeros_like(keep).scatter_(-1, fallback_idx, True)
+            fallback_keep = fallback_keep & valid
+            keep = torch.where(has_keep, keep, fallback_keep)
+
+        dropped = alpha * keep.to(dtype=alpha.dtype)
+        dropped = dropped.masked_fill(~valid, 0.0)
+        denom = dropped.sum(dim=-1, keepdim=True)
+        needs_original = denom <= self.eps
+        if bool(torch.any(needs_original)):
+            dropped = torch.where(needs_original, alpha.masked_fill(~valid, 0.0), dropped)
+            denom = dropped.sum(dim=-1, keepdim=True)
+        return dropped / denom.clamp_min(self.eps)
 
     def _topk_pool(self, alpha: torch.Tensor, pool_source: torch.Tensor) -> torch.Tensor:
         """
@@ -201,6 +241,7 @@ class TaskAttentionPool(nn.Module):
         else:
             alpha = alpha / alpha.sum(dim=-1, keepdim=True).clamp_min(self.eps)
         alpha = self._apply_prune_and_renorm(alpha, key_padding_mask=key_padding_mask)
+        alpha = self._apply_safe_instance_dropout(alpha, key_padding_mask=key_padding_mask)
 
         if self.pool_from == "attn_out":
             attn_pool = cls_out

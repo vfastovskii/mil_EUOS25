@@ -12,10 +12,40 @@ if str(PKG_ROOT) not in sys.path:
 
 torch = pytest.importorskip("torch")
 
+from opt_attn_net_feb.models.attention_pooling.pool import TaskAttentionPool
 from opt_attn_net_feb.models.multimodal_mil.model import MILTaskAttnMixerWithAux
 
 
 class MultimodalFusionModelTest(unittest.TestCase):
+    def test_attention_dropout_keeps_at_least_one_valid_conformer(self) -> None:
+        pool = TaskAttentionPool(
+            dim=8,
+            n_heads=2,
+            dropout=0.95,
+            n_tasks=4,
+            pool_from="normed_inputs",
+        )
+        pool.train()
+
+        tokens = torch.randn(3, 4, 8)
+        key_padding_mask = torch.tensor(
+            [
+                [False, True, True, True],
+                [False, False, True, True],
+                [False, False, False, True],
+            ],
+            dtype=torch.bool,
+        )
+
+        for _ in range(8):
+            pooled, attn = pool(tokens, key_padding_mask=key_padding_mask, return_attn=True)
+            self.assertTrue(torch.isfinite(pooled).all())
+            self.assertIsNotNone(attn)
+            attn_t = attn if attn is not None else torch.zeros(3, 4, 4)
+            self.assertTrue(torch.allclose(attn_t.sum(dim=-1), torch.ones(3, 4), atol=1e-6))
+            self.assertTrue(torch.allclose(attn_t[0, :, 0], torch.ones(4), atol=1e-6))
+            self.assertTrue(bool(torch.all(attn_t.masked_select(key_padding_mask.unsqueeze(1)) == 0.0).item()))
+
     def test_alignment_attention_uses_3d_modality_gates(self) -> None:
         model = MILTaskAttnMixerWithAux(
             mol_dim=6,
@@ -127,6 +157,13 @@ class MultimodalFusionModelTest(unittest.TestCase):
         self.assertEqual(tuple(attn["modality_gates"].shape), (3, 4, 3))
         sums = attn["modality_gates"].sum(dim=-1)
         self.assertTrue(torch.allclose(sums, torch.ones_like(sums), atol=1e-5))
+        self.assertIn("modality_channel_gate_mean", attn)
+        self.assertEqual(tuple(attn["modality_channel_gate_mean"].shape), (3, 4, 3))
+        self.assertIn("modality_attn", attn)
+        self.assertEqual(tuple(attn["modality_attn"].shape), (3, 4, 3, 3))
+        self.assertIn("pairwise_weights", attn)
+        self.assertEqual(tuple(attn["pairwise_weights"].shape), (3, 4, 3))
+        self.assertEqual(tuple(attn["pairwise_order"]), ("2d|3d_geom", "2d|3d_qm", "3d_geom|3d_qm"))
         self.assertEqual(tuple(attn["attn_geom"].shape), (3, 4, 5))
         self.assertEqual(tuple(attn["attn_qm"].shape), (3, 4, 5))
 
@@ -172,6 +209,8 @@ class MultimodalFusionModelTest(unittest.TestCase):
         self.assertEqual(tuple(logits.shape), (2, 4))
         self.assertEqual(tuple(attn["modality_gates"].shape), (2, 4, 1))
         self.assertTrue(torch.allclose(attn["modality_gates"], torch.ones_like(attn["modality_gates"])))
+        self.assertEqual(tuple(attn["modality_channel_gate_mean"].shape), (2, 4, 1))
+        self.assertEqual(tuple(attn["pairwise_weights"].shape), (2, 4, 0))
 
 
 if __name__ == "__main__":

@@ -5,12 +5,11 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="33826e23-5bc2-4bf8-9077-a15c3daefac9" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/data/exports.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/data/exports.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/entrypoints/family_suite.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/entrypoints/family_suite.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/models/multimodal_mil/model.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/models/multimodal_mil/model.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/training/execution.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/training/execution.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/tests/test_multimodal_fusion_model.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/tests/test_multimodal_fusion_model.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/training/search_space.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/training/search_space.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/opt_attn_net_feb/training/trainer.py" beforeDir="false" afterPath="$PROJECT_DIR$/opt_attn_net_feb/training/trainer.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -39,26 +38,26 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "ModuleVcsDetector.initialDetectionPerformed": "true",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.git.unshallow": "true",
-    "SHELLCHECK.PATH": "/Users/vfastovskii/Library/Application Support/JetBrains/PyCharm2025.1/plugins/Shell Script/shellcheck",
-    "com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultAutoModeForALLUsers.v1": "true",
-    "com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultModelSelectionForGA.v1": "true",
-    "git-widget-placeholder": "tcav__integration",
-    "junie.onboarding.icon.badge.shown": "true",
-    "last_opened_file_path": "/Users/vfastovskii/Desktop/mil_explainability_2026",
-    "node.js.detected.package.eslint": "true",
-    "node.js.detected.package.tslint": "true",
-    "node.js.selected.package.eslint": "(autodetect)",
-    "node.js.selected.package.tslint": "(autodetect)",
-    "nodejs_package_manager_path": "npm",
-    "to.speed.mode.migration.done": "true",
-    "vue.rearranger.settings.migration": "true"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;SHELLCHECK.PATH&quot;: &quot;/Users/vfastovskii/Library/Application Support/JetBrains/PyCharm2025.1/plugins/Shell Script/shellcheck&quot;,
+    &quot;com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultAutoModeForALLUsers.v1&quot;: &quot;true&quot;,
+    &quot;com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultModelSelectionForGA.v1&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;tcav__integration&quot;,
+    &quot;junie.onboarding.icon.badge.shown&quot;: &quot;true&quot;,
+    &quot;last_opened_file_path&quot;: &quot;/Users/vfastovskii/Desktop/mil_explainability_2026&quot;,
+    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
+    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
+    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
+    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
+    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
+    &quot;to.speed.mode.migration.done&quot;: &quot;true&quot;,
+    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
   }
-}]]></component>
+}</component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
       <recent name="$PROJECT_DIR$" />
@@ -82,6 +81,7 @@
       <workItem from="1770573377091" duration="1443000" />
       <workItem from="1773516930843" duration="7046000" />
       <workItem from="1773573422894" duration="60842000" />
+      <workItem from="1775747507206" duration="659000" />
     </task>
     <servers />
   </component>

@@ -39,7 +39,7 @@ def search_space(
         A dictionary containing the suggested values for each parameter within the
         specified hyperparameter search space.
     """
-    batch_values = [64, 128, 256] if batch_choices is None else [int(x) for x in batch_choices]
+    batch_values = [128, 256, 512] if batch_choices is None else [int(x) for x in batch_choices]
     if len(batch_values) == 0:
         raise ValueError("batch_choices must contain at least one value.")
     p = {"mol_hidden": trial.suggest_categorical("mol_hidden", [128, 256, 512]),
