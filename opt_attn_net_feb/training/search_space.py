@@ -121,4 +121,86 @@ def search_space(
     return p
 
 
-__all__ = ["search_space"]
+def search_space_mt_2d3d_local(
+    trial: Trial,
+    *,
+    batch_choices: Iterable[int] | None = None,
+) -> Dict[str, Any]:
+    """
+    Local refinement space for mt_2d3d after a useful incumbent has been found.
+
+    The expensive categorical architecture choices are fixed to the incumbent
+    neighborhood so a short follow-up run can spend trials on optimization,
+    regularization, task weighting, and contrastive-loss balance.
+    """
+    batch_values = [256] if batch_choices is None else [int(x) for x in batch_choices]
+    if len(batch_values) == 0:
+        raise ValueError("batch_choices must contain at least one value.")
+
+    p: Dict[str, Any] = {
+        "mol_hidden": 512,
+        "mol_layers": trial.suggest_int("mol_layers", 3, 5),
+        "mol_dropout": trial.suggest_float("mol_dropout", 0.035, 0.095),
+        "inst_hidden": 128,
+        "inst_layers": trial.suggest_int("inst_layers", 2, 3),
+        "inst_dropout": trial.suggest_float("inst_dropout", 0.05, 0.10),
+        "proj_dim": 512,
+        "attn_heads": 8,
+        "attn_dropout": trial.suggest_float("attn_dropout", 0.12, 0.20),
+        "mixer_hidden": 512,
+        "mixer_layers": trial.suggest_int("mixer_layers", 3, 5),
+        "mixer_dropout": trial.suggest_float("mixer_dropout", 0.08, 0.17),
+        "mol_embedder_name": "mlp_v3_2d",
+        "inst_embedder_name": "mlp_v3_3d",
+        "aggregator_name": "task_attention_pool",
+        "predictor_name": "mlp_v3",
+        "head_num_layers": trial.suggest_int("head_num_layers", 2, 3),
+        "head_dropout": trial.suggest_float("head_dropout", 0.045, 0.12),
+        "head_fc2_gain_non_last": trial.suggest_float("head_fc2_gain_non_last", 0.0015, 0.006),
+        "activation": "LeakyReLU",
+        "lr": trial.suggest_float("lr", 3e-4, 1.5e-3, log=True),
+        "weight_decay": trial.suggest_float("weight_decay", 2e-5, 1e-4, log=True),
+        "lr_scale_2d": trial.suggest_float("lr_scale_2d", 0.9, 1.5, log=True),
+        "lr_scale_3d": trial.suggest_float("lr_scale_3d", 1.0, 1.8, log=True),
+        "lr_scale_fusion": trial.suggest_float("lr_scale_fusion", 0.65, 1.15, log=True),
+        "lr_scale_heads": trial.suggest_float("lr_scale_heads", 1.4, 2.3, log=True),
+        "batch_size": batch_values[0],
+        "posw_clip_t0": trial.suggest_float("posw_clip_t0", 10.0, 18.0, log=True),
+        "posw_clip_t1": trial.suggest_float("posw_clip_t1", 45.0, 80.0, log=True),
+        "posw_clip_t2": trial.suggest_float("posw_clip_t2", 4.0, 8.0, log=True),
+        "posw_clip_t3": trial.suggest_float("posw_clip_t3", 140.0, 220.0, log=True),
+        "gamma_t0": trial.suggest_float("gamma_t0", 1.2, 2.0),
+        "gamma_t1": trial.suggest_float("gamma_t1", 1.2, 2.1),
+        "gamma_t2": trial.suggest_float("gamma_t2", 0.4, 1.2),
+        "gamma_t3": trial.suggest_float("gamma_t3", 2.8, 4.0),
+        "rare_oversample_mult": trial.suggest_float("rare_oversample_mult", 6.5, 10.0),
+        "rare_target_prev": trial.suggest_float("rare_target_prev", 0.085, 0.12),
+        "sample_weight_cap": trial.suggest_float("sample_weight_cap", 7.0, 9.0),
+        "lam_t0": trial.suggest_float("lam_t0", 0.9, 1.6, log=True),
+        "lam_t1": trial.suggest_float("lam_t1", 0.8, 1.35, log=True),
+        "lam_t2": trial.suggest_float("lam_t2", 0.35, 0.7, log=True),
+        "lam_t3": trial.suggest_float("lam_t3", 1.8, 2.8, log=True),
+        "lam_floor": trial.suggest_float("lam_floor", 0.60, 0.85),
+        "lam_ceil": trial.suggest_float("lam_ceil", 1.25, 1.70),
+        "lambda_aux_abs": trial.suggest_float("lambda_aux_abs", 0.16, 0.30),
+        "lambda_aux_fluo": trial.suggest_float("lambda_aux_fluo", 0.035, 0.09),
+        "lambda_aux_bitmask": trial.suggest_float("lambda_aux_bitmask", 0.045, 0.10),
+        "lambda_contrastive_cross_modal": trial.suggest_float("lambda_contrastive_cross_modal", 0.001, 0.03, log=True),
+        "lambda_contrastive_3d_consistency": trial.suggest_float("lambda_contrastive_3d_consistency", 0.035, 0.15, log=True),
+        "lambda_contrastive_supervised": trial.suggest_float("lambda_contrastive_supervised", 0.001, 0.03, log=True),
+        "reg_loss_type": "mse",
+        "min_w": 0.40,
+        "stage_2d_only_epochs": 1,
+        "stage_3d_only_epochs": 1,
+        "multitask_gradient_mode": "pcgrad_shared",
+        "learnable_task_uncertainty": True,
+        "accumulate_grad_batches": 8,
+        "head_stochastic_depth": trial.suggest_float("head_stochastic_depth", 0.04, 0.10),
+    }
+
+    if int(p["inst_hidden"]) % int(p["attn_heads"]) != 0:
+        raise optuna.TrialPruned("inst_hidden must be divisible by attn_heads")
+    return p
+
+
+__all__ = ["search_space", "search_space_mt_2d3d_local"]

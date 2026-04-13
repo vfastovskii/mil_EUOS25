@@ -1458,6 +1458,7 @@ class MILCrossValidator:
     def evaluate_trial(self, trial: Trial) -> float:
         log_event("START", "hpo.trial.evaluate", trial=int(trial.number))
         params = search_space(trial)
+        trial.set_user_attr("full_params", dict(params))
         cfg = HPOConfig.from_params(params)
         log_event(
             "INFO",
@@ -1627,7 +1628,8 @@ class StudyArtifactsWriter:
         )
         df_trials.to_csv(outdir / f"{prefix}_trials.csv", index=False)
         selected_trial = study.best_trial if best_trial is None else best_trial
-        best = dict(selected_trial.params)
+        full_params = selected_trial.user_attrs.get("full_params")
+        best = dict(full_params) if isinstance(full_params, dict) else dict(selected_trial.params)
         best_value = float(selected_trial.user_attrs.get("hpo_selection_value", selected_trial.value))
         best["best_value_macro_ap_cv"] = float(best_value)
         best["best_value_hpo_objective"] = float(best_value)
