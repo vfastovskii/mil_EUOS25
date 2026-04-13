@@ -357,6 +357,10 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         overlap = {"dim", "n_heads", "dropout", "n_tasks"}.intersection(agg_kwargs.keys())
         if overlap:
             raise ValueError(f"aggregator_kwargs cannot override reserved keys: {sorted(overlap)}")
+        # 3D conformer tokens are already normalized by inst_*_post_embed_norm
+        # before they enter the task-attention pool. Keep query normalization in
+        # TaskAttentionPool, but avoid an immediate second token LayerNorm there.
+        agg_kwargs.setdefault("pre_layer_norm", False)
         self.attn_pool_geom = (
             None
             if self.inst_geom_enc is None
@@ -605,7 +609,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 use_layernorm=True,
                 pre_layer_norm=True,
                 output_dim=int(self.bitmask_num_groups),
-                input_layernorm=True,
+                input_layernorm=False,
                 final_layernorm=False,
                 res_scale_init=0.1,
                 inner_multiple=64,

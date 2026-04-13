@@ -236,7 +236,7 @@ def make_predictor_heads(
                 use_layernorm=True,
                 pre_layer_norm=True,
                 output_dim=1,
-                input_layernorm=True,
+                input_layernorm=False,
                 final_layernorm=False,
                 res_scale_init=0.1,
                 inner_multiple=64,
