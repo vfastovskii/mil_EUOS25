@@ -229,6 +229,23 @@ def _metric_sample_weight_for_task(w: np.ndarray | None, task_idx: int) -> np.nd
     return sw
 
 
+def _weighted_positive_rate(y: np.ndarray, sample_weight: np.ndarray | None = None) -> float:
+    yt = np.asarray(y, dtype=np.float64).reshape(-1)
+    if yt.size == 0:
+        return float("nan")
+    if sample_weight is None:
+        return float(np.mean(yt))
+    sw = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+    if sw.shape[0] != yt.shape[0]:
+        return float("nan")
+    sw = np.nan_to_num(sw, nan=0.0, posinf=0.0, neginf=0.0)
+    sw = np.clip(sw, 0.0, np.inf)
+    total = float(np.sum(sw))
+    if total <= 0.0:
+        return float("nan")
+    return float(np.sum(sw * yt) / total)
+
+
 def _df_by_ids(df: pd.DataFrame, *, id_col: str, ids: Sequence[str]) -> pd.DataFrame:
     # Keep first row for duplicate IDs to preserve one-label-per-ID contract.
     d = df.drop_duplicates(subset=[id_col], keep="first").copy()
@@ -249,10 +266,12 @@ def _metric_table(
     rows: List[Dict[str, Any]] = []
     nlls: List[float] = []
     briers: List[float] = []
+    baselines: List[float] = []
     for t, task in enumerate(TASK_COLS):
         yt = y_true[:, t].astype(int)
         pt = _clip_prob(p_pred[:, t])
         sw = _metric_sample_weight_for_task(w_cls[:, t] if w_cls is not None else None, t)
+        baseline = _weighted_positive_rate(yt, sw)
         try:
             nll = float(log_loss(yt, pt, sample_weight=sw, labels=[0, 1]))
         except Exception:
@@ -263,10 +282,12 @@ def _metric_table(
             brier = float("nan")
         nlls.append(nll)
         briers.append(brier)
+        baselines.append(float(baseline))
         rows.append(
             {
                 "task": str(task),
                 "pr_auc": float(aps[t]),
+                "pr_auc_baseline": float(baseline),
                 "roc_auc": float(aucs[t]),
                 "nll": nll,
                 "brier": brier,
@@ -276,6 +297,7 @@ def _metric_table(
         {
             "task": "macro",
             "pr_auc": float(np.mean(aps)),
+            "pr_auc_baseline": float(np.nanmean(baselines)),
             "roc_auc": float(np.mean(aucs)),
             "nll": float(np.nanmean(nlls)),
             "brier": float(np.nanmean(briers)),
@@ -404,10 +426,8 @@ def _load_family_best_params(*, outdir: Path, family: str) -> Dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Best params file not found for family '{family}': {path}")
     payload = json.loads(path.read_text())
-    if isinstance(payload, dict) and isinstance(payload.get("best_params"), dict):
-        return dict(payload["best_params"])
     if isinstance(payload, dict):
-        return dict(payload)
+        return _normalize_family_params(family=family, value=payload)
     raise ValueError(f"Invalid best params JSON for '{family}': expected object, got {type(payload).__name__}")
 
 
@@ -509,9 +529,14 @@ def _normalize_family_params(*, family: str, value: Any) -> Any:
     if family == "catboost_st":
         return _normalize_catboost_params(value)
     if isinstance(value, dict) and isinstance(value.get("best_params"), dict):
-        return dict(value["best_params"])
+        return _complete_mil_family_params(family=family, params=value["best_params"])
     if isinstance(value, dict):
-        return dict(value)
+        params = {
+            k: v
+            for k, v in value.items()
+            if k not in {"family", "best_value_macro_ap_cv", "best_value_hpo_objective"}
+        }
+        return _complete_mil_family_params(family=family, params=params)
     raise ValueError(f"Params for family '{family}' must be a dict.")
 
 
@@ -688,6 +713,59 @@ def _mt_3d_fixed_inactive_params() -> Dict[str, Any]:
         "stage_2d_only_epochs": 0,
         "stage_3d_only_epochs": 0,
     }
+
+
+def _complete_mil_family_params(*, family: str, params: Mapping[str, Any]) -> Dict[str, Any]:
+    """Fill fixed/non-Optuna MIL knobs so final refits match the HPO trial config."""
+    fam = str(family)
+    out: Dict[str, Any] = dict(params)
+    out.setdefault("min_w", 0.40)
+
+    if fam == "mt_2d":
+        out.update(_mt_2d_fixed_inactive_params())
+        out.setdefault("lr_scale_3d", 1.0)
+        out.setdefault("lambda_contrastive_cross_modal", 0.0)
+        out.setdefault("lambda_contrastive_3d_consistency", 0.0)
+        out.setdefault("stage_2d_only_epochs", 0)
+        out.setdefault("stage_3d_only_epochs", 0)
+        return out
+
+    if fam == "mt_3d":
+        out.setdefault("inst_hidden", 512)
+        out.setdefault("proj_dim", 512)
+        out.setdefault("attn_heads", 8)
+        out.setdefault("mixer_hidden", 256)
+        out.setdefault("inst_embedder_name", "mlp_v3_3d")
+        out.setdefault("aggregator_name", "task_attention_pool")
+        out.setdefault("predictor_name", "mlp_v3")
+        out.setdefault("activation", "LeakyReLU")
+        out.setdefault("batch_size", 512)
+        out.setdefault("reg_loss_type", "mse")
+        out.setdefault("accumulate_grad_batches", 16)
+        out.update(_mt_3d_fixed_inactive_params())
+        return out
+
+    if fam == "mt_2d3d":
+        out.setdefault("mol_hidden", 512)
+        out.setdefault("inst_hidden", 128)
+        out.setdefault("proj_dim", 512)
+        out.setdefault("attn_heads", 8)
+        out.setdefault("mixer_hidden", 512)
+        out.setdefault("mol_embedder_name", "mlp_v3_2d")
+        out.setdefault("inst_embedder_name", "mlp_v3_3d")
+        out.setdefault("aggregator_name", "task_attention_pool")
+        out.setdefault("predictor_name", "mlp_v3")
+        out.setdefault("activation", "LeakyReLU")
+        out.setdefault("batch_size", 256)
+        out.setdefault("reg_loss_type", "mse")
+        out.setdefault("accumulate_grad_batches", 8)
+        out.setdefault("stage_2d_only_epochs", 1)
+        out.setdefault("stage_3d_only_epochs", 1)
+        out.setdefault("multitask_gradient_mode", "pcgrad_shared")
+        out.setdefault("learnable_task_uncertainty", True)
+        return out
+
+    return out
 
 
 def _search_space_mt_3d(trial: optuna.Trial) -> Dict[str, Any]:
@@ -1388,6 +1466,65 @@ def _run_mil_final_train_and_predict(
         fallback_lam_ceil=6.0,
         fallback_pos_weight_clip=50.0,
     )
+    audit_keys = (
+        "mol_hidden",
+        "mol_layers",
+        "inst_hidden",
+        "inst_layers",
+        "proj_dim",
+        "attn_heads",
+        "mixer_hidden",
+        "mixer_layers",
+        "head_num_layers",
+        "lr",
+        "weight_decay",
+        "lr_scale_2d",
+        "lr_scale_3d",
+        "lr_scale_fusion",
+        "lr_scale_heads",
+        "batch_size",
+        "accumulate_grad_batches",
+        "stage_2d_only_epochs",
+        "stage_3d_only_epochs",
+        "multitask_gradient_mode",
+        "learnable_task_uncertainty",
+        "lambda_contrastive_cross_modal",
+        "lambda_contrastive_3d_consistency",
+        "lambda_contrastive_supervised",
+    )
+    missing_audit_keys = [str(k) for k in audit_keys if k not in best_params]
+    log_event(
+        "INFO",
+        "family.final.mil.best_params_audit",
+        family=str(family_data.family),
+        output_prefix=str(output_prefix),
+        n_best_params=int(len(best_params)),
+        missing_audit_keys=",".join(missing_audit_keys),
+        mol_hidden=int(hpo_cfg.backbone.mol_hidden),
+        mol_layers=int(hpo_cfg.backbone.mol_layers),
+        inst_hidden=int(hpo_cfg.backbone.inst_hidden),
+        inst_layers=int(hpo_cfg.backbone.inst_layers),
+        proj_dim=int(hpo_cfg.backbone.proj_dim),
+        attn_heads=int(hpo_cfg.backbone.attn_heads),
+        mixer_hidden=int(hpo_cfg.backbone.mixer_hidden),
+        mixer_layers=int(hpo_cfg.backbone.mixer_layers),
+        head_num_layers=int(hpo_cfg.heads.num_layers),
+        lr=float(hpo_cfg.optimization.lr),
+        weight_decay=float(hpo_cfg.optimization.weight_decay),
+        lr_scale_2d=float(hpo_cfg.optimization.lr_scale_2d),
+        lr_scale_3d=float(hpo_cfg.optimization.lr_scale_3d),
+        lr_scale_fusion=float(hpo_cfg.optimization.lr_scale_fusion),
+        lr_scale_heads=float(hpo_cfg.optimization.lr_scale_heads),
+        batch_size=int(hpo_cfg.runtime.batch_size),
+        accumulate_grad_batches=int(hpo_cfg.runtime.accumulate_grad_batches),
+        stage_2d_only_epochs=int(hpo_cfg.optimization.stage_2d_only_epochs),
+        stage_3d_only_epochs=int(hpo_cfg.optimization.stage_3d_only_epochs),
+        multitask_gradient_mode=str(hpo_cfg.optimization.multitask_gradient_mode),
+        learnable_task_uncertainty=bool(hpo_cfg.loss.learnable_task_uncertainty),
+        lambda_contrastive_cross_modal=float(hpo_cfg.loss.lambda_contrastive_cross_modal),
+        lambda_contrastive_3d_consistency=float(hpo_cfg.loss.lambda_contrastive_3d_consistency),
+        lambda_contrastive_supervised=float(hpo_cfg.loss.lambda_contrastive_supervised),
+    )
     lam = compute_lam(hpo_cfg.loss, y_train=family_data.y_cls_train)
     posw = pos_weight_per_task(
         family_data.y_cls_train,
@@ -1736,6 +1873,27 @@ def _run_mil_final_train_and_predict(
     P = np.concatenate(preds, axis=0)
     Y = np.asarray(family_data.y_cls_lb, dtype=np.int64)
     W = np.asarray(family_data.w_cls_lb, dtype=np.float32)
+    y_train_for_balance = np.asarray(family_data.y_cls_train, dtype=np.int64)
+    w_train_for_balance = np.asarray(family_data.w_cls_train, dtype=np.float32)
+    for t, task in enumerate(TASK_COLS):
+        train_sw = _metric_sample_weight_for_task(w_train_for_balance[:, t], t)
+        eval_sw = _metric_sample_weight_for_task(W[:, t], t)
+        log_event(
+            "INFO",
+            "family.final.mil.eval_class_balance",
+            family=str(family_data.family),
+            output_prefix=str(output_prefix),
+            task_idx=int(t),
+            task=str(task),
+            n_train=int(y_train_for_balance.shape[0]),
+            n_eval=int(Y.shape[0]),
+            n_train_pos=int(np.sum(y_train_for_balance[:, t] == 1)),
+            n_eval_pos=int(np.sum(Y[:, t] == 1)),
+            train_pos_rate=f"{float(np.mean(y_train_for_balance[:, t])):.8f}",
+            eval_pos_rate=f"{float(np.mean(Y[:, t])):.8f}",
+            train_metric_pr_baseline=f"{_weighted_positive_rate(y_train_for_balance[:, t], train_sw):.8f}",
+            eval_metric_pr_baseline=f"{_weighted_positive_rate(Y[:, t], eval_sw):.8f}",
+        )
 
     df_pred = pd.DataFrame({"ID": [str(x) for x in family_data.ids_lb]})
     for t in range(4):
@@ -2815,16 +2973,7 @@ def run_family_suite(args: Any) -> None:
                 best_trial = study.best_trial
             full_params = best_trial.user_attrs.get("full_params")
             bp = dict(full_params) if isinstance(full_params, Mapping) else dict(best_trial.params)
-            bp["min_w"] = 0.4
-            if str(family) == "mt_2d":
-                bp.update(_mt_2d_fixed_inactive_params())
-            if str(family) == "mt_3d":
-                bp.update(_mt_3d_fixed_inactive_params())
-            if str(family) == "mt_2d3d":
-                bp.setdefault("stage_2d_only_epochs", 1)
-                bp.setdefault("stage_3d_only_epochs", 1)
-                bp.setdefault("multitask_gradient_mode", "pcgrad_shared")
-                bp.setdefault("learnable_task_uncertainty", True)
+            bp = _complete_mil_family_params(family=str(family), params=bp)
             best_params[family] = bp
             best_value = float(best_trial.user_attrs.get("hpo_selection_value", best_trial.value))
             log_event(
