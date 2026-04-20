@@ -149,6 +149,13 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 None if b.fusion_gate_hidden is None else int(b.fusion_gate_hidden)
             ),
             fusion_interaction_heads=int(b.fusion_interaction_heads),
+            fusion_gate_temperature=float(b.fusion_gate_temperature),
+            fusion_gate_prior_strength=float(b.fusion_gate_prior_strength),
+            fusion_gate_prior_2d=float(b.fusion_gate_prior_2d),
+            fusion_gate_prior_3d_geom=float(b.fusion_gate_prior_3d_geom),
+            fusion_gate_prior_3d_qm=float(b.fusion_gate_prior_3d_qm),
+            fusion_gate_2d_max=float(b.fusion_gate_2d_max),
+            fusion_gate_3d_min_total=float(b.fusion_gate_3d_min_total),
             predictor_name=str(h.predictor_name),
             head_num_layers=int(h.num_layers),
             head_dropout=float(h.dropout),
@@ -200,13 +207,13 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         lambda_contrastive_cross_modal: float = 0.05,
         lambda_contrastive_3d_consistency: float = 0.05,
         lambda_contrastive_supervised: float = 0.05,
-        contrastive_proj_dim: int = 64,
+        contrastive_proj_dim: int = 256,
         contrastive_temperature: float = 0.10,
         consistency_view_keep_rate: float = 0.70,
         cross_modal_include_geom_qm: bool = True,
-        learnable_task_uncertainty: bool = True,
+        learnable_task_uncertainty: bool = False,
         task_uncertainty_init_log_var: float = 0.0,
-        task_uncertainty_reg: float = 0.5,
+        task_uncertainty_reg: float = 0.0,
         bitmask_group_top_ids: Optional[List[int]] = None,
         bitmask_group_class_weight: Optional[List[float]] = None,
         activation: str = "GELU",
@@ -219,6 +226,13 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         fusion_use_modality_interaction: bool = True,
         fusion_gate_hidden: Optional[int] = None,
         fusion_interaction_heads: int = 4,
+        fusion_gate_temperature: float = 1.0,
+        fusion_gate_prior_strength: float = 0.0,
+        fusion_gate_prior_2d: float = 1.0,
+        fusion_gate_prior_3d_geom: float = 1.0,
+        fusion_gate_prior_3d_qm: float = 1.0,
+        fusion_gate_2d_max: float = 1.0,
+        fusion_gate_3d_min_total: float = 0.0,
         predictor_name: str = "mlp_v3",
         head_num_layers: int = 2,
         head_dropout: float = 0.1,
@@ -248,14 +262,10 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 "Expected one of {'none', 'pcgrad_shared'}."
             )
         self.log_task_gradient_diagnostics = bool(log_task_gradient_diagnostics)
-        self.learnable_task_uncertainty = bool(learnable_task_uncertainty)
-        self.task_uncertainty_reg = float(max(0.0, task_uncertainty_reg))
-        if self.learnable_task_uncertainty:
-            self.task_loss_log_vars = nn.Parameter(
-                torch.full((NUM_TASKS,), float(task_uncertainty_init_log_var), dtype=torch.float32)
-            )
-        else:
-            self.register_parameter("task_loss_log_vars", None)
+        _ = (learnable_task_uncertainty, task_uncertainty_init_log_var, task_uncertainty_reg)
+        self.learnable_task_uncertainty = False
+        self.task_uncertainty_reg = 0.0
+        self.register_parameter("task_loss_log_vars", None)
         self.automatic_optimization = bool(self.multitask_gradient_mode == "none")
         self.manual_accumulate_grad_batches = 1
         self.lr_group_scales = {
@@ -415,6 +425,15 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         self.fusion_use_task_2d_adapter = bool(fusion_use_task_2d_adapter and self.proj2d is not None)
         self.fusion_use_modality_gates = bool(fusion_use_modality_gates)
         self.fusion_use_modality_interaction = bool(fusion_use_modality_interaction and n_modalities > 1)
+        self.fusion_gate_temperature = float(max(1e-3, fusion_gate_temperature))
+        self.fusion_gate_prior_strength = float(min(max(0.0, fusion_gate_prior_strength), 1.0))
+        self.fusion_gate_prior_weights = {
+            "2d": float(max(0.0, fusion_gate_prior_2d)),
+            "3d_geom": float(max(0.0, fusion_gate_prior_3d_geom)),
+            "3d_qm": float(max(0.0, fusion_gate_prior_3d_qm)),
+        }
+        self.fusion_gate_2d_max = float(min(max(0.0, fusion_gate_2d_max), 1.0))
+        self.fusion_gate_3d_min_total = float(min(max(0.0, fusion_gate_3d_min_total), 1.0))
         gate_hidden = (
             int(fusion_gate_hidden)
             if fusion_gate_hidden is not None
@@ -747,6 +766,13 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             "fusion_task_2d_adapter": bool(self.fusion_use_task_2d_adapter),
             "fusion_modality_gates": bool(self.fusion_use_modality_gates),
             "fusion_modality_interaction": bool(self.fusion_use_modality_interaction),
+            "fusion_gate_temperature": float(self.fusion_gate_temperature),
+            "fusion_gate_prior_strength": float(self.fusion_gate_prior_strength),
+            "fusion_gate_prior_2d": float(self.fusion_gate_prior_weights.get("2d", 0.0)),
+            "fusion_gate_prior_3d_geom": float(self.fusion_gate_prior_weights.get("3d_geom", 0.0)),
+            "fusion_gate_prior_3d_qm": float(self.fusion_gate_prior_weights.get("3d_qm", 0.0)),
+            "fusion_gate_2d_max": float(self.fusion_gate_2d_max),
+            "fusion_gate_3d_min_total": float(self.fusion_gate_3d_min_total),
             "objective_mode": str(self.objective_mode),
             "objective_min_w": float(self.objective_min_w),
             "mixer_type": str(self.mixer_type),
@@ -1287,6 +1313,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 "attn_geom": attn_geom,
                 "attn_qm": attn_qm,
                 "modality_gates": fusion_info.get("modality_gates"),
+                "modality_raw_gates": fusion_info.get("modality_raw_gates"),
                 "modality_scores": fusion_info.get("modality_scores"),
                 "modality_channel_gate_mean": fusion_info.get("modality_channel_gate_mean"),
                 "modality_order": fusion_info.get("modality_order"),
@@ -1406,6 +1433,80 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 return_attn=return_attn,
             )
         return pooled_geom, pooled_qm, attn_geom, attn_qm
+
+    @staticmethod
+    def _renormalize_modality_gates(gates: torch.Tensor, active_mask: torch.Tensor) -> torch.Tensor:
+        gates = torch.clamp(gates, min=0.0) * active_mask
+        denom = gates.sum(dim=-1, keepdim=True)
+        uniform = active_mask / active_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        return torch.where(denom > 1e-6, gates / denom.clamp_min(1e-6), uniform)
+
+    def _modality_prior_for_active_mask(self, active_mask: torch.Tensor) -> torch.Tensor:
+        prior_vals = [
+            float(self.fusion_gate_prior_weights.get(str(name), 1.0))
+            for name in self.active_modalities
+        ]
+        prior = torch.tensor(prior_vals, dtype=active_mask.dtype, device=active_mask.device).view(1, 1, -1)
+        prior = prior * active_mask
+        prior_sum = prior.sum(dim=-1, keepdim=True)
+        uniform = active_mask / active_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        return torch.where(prior_sum > 1e-6, prior / prior_sum.clamp_min(1e-6), uniform)
+
+    def _balance_modality_gates(
+        self,
+        *,
+        gates: torch.Tensor,
+        active_mask: torch.Tensor,
+        sample_has_real_3d: torch.Tensor,
+    ) -> torch.Tensor:
+        gates = self._renormalize_modality_gates(gates, active_mask)
+        if float(self.fusion_gate_prior_strength) > 0.0:
+            prior = self._modality_prior_for_active_mask(active_mask)
+            s = float(self.fusion_gate_prior_strength)
+            gates = self._renormalize_modality_gates((1.0 - s) * gates + s * prior, active_mask)
+
+        if int(gates.shape[-1]) <= 1:
+            return gates
+
+        modality_names = [str(x) for x in self.active_modalities]
+        if "2d" in modality_names and float(self.fusion_gate_2d_max) < 1.0:
+            idx_2d = int(modality_names.index("2d"))
+            one_hot = torch.zeros((1, 1, int(gates.shape[-1])), dtype=gates.dtype, device=gates.device)
+            one_hot[..., idx_2d] = 1.0
+            other_mask = active_mask * (1.0 - one_hot)
+            other_total = (gates * other_mask).sum(dim=-1, keepdim=True)
+            over = torch.clamp(gates[..., idx_2d : idx_2d + 1] - float(self.fusion_gate_2d_max), min=0.0)
+            over = over * (active_mask[..., idx_2d : idx_2d + 1] > 0.5).to(dtype=gates.dtype)
+            over = over * (other_total > 1e-6).to(dtype=gates.dtype)
+            other_share = (gates * other_mask) / other_total.clamp_min(1e-6)
+            gates = gates - over * one_hot + over * other_share
+            gates = self._renormalize_modality_gates(gates, active_mask)
+
+        three_d_indices = [
+            i for i, name in enumerate(modality_names) if name in {"3d_geom", "3d_qm"}
+        ]
+        if three_d_indices and float(self.fusion_gate_3d_min_total) > 0.0:
+            three_d_mask = torch.zeros((1, 1, int(gates.shape[-1])), dtype=gates.dtype, device=gates.device)
+            for idx in three_d_indices:
+                three_d_mask[..., int(idx)] = 1.0
+            active_3d = active_mask * three_d_mask
+            non_3d = active_mask * (1.0 - three_d_mask)
+            three_d_total = (gates * active_3d).sum(dim=-1, keepdim=True)
+            non_3d_total = (gates * non_3d).sum(dim=-1, keepdim=True)
+            needs_3d = sample_has_real_3d.to(dtype=gates.dtype, device=gates.device).view(-1, 1, 1)
+            need = torch.clamp(float(self.fusion_gate_3d_min_total) - three_d_total, min=0.0)
+            need = torch.minimum(need, non_3d_total) * needs_3d
+            need = need * (active_3d.sum(dim=-1, keepdim=True) > 0.5).to(dtype=gates.dtype)
+            need = need * (non_3d_total > 1e-6).to(dtype=gates.dtype)
+            active_3d_count = active_3d.sum(dim=-1, keepdim=True)
+            uniform_3d_share = active_3d / active_3d_count.clamp_min(1.0)
+            current_3d_share = (gates * active_3d) / three_d_total.clamp_min(1e-6)
+            receiver_share = torch.where(three_d_total > 1e-6, current_3d_share, uniform_3d_share)
+            donor_share = (gates * non_3d) / non_3d_total.clamp_min(1e-6)
+            gates = gates + need * receiver_share - need * donor_share
+            gates = self._renormalize_modality_gates(gates, active_mask)
+
+        return gates
 
     def _build_task_representations(
         self,
@@ -1558,6 +1659,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 device=tokens.device,
             )
             modality_gates = active_mask_bt
+            modality_raw_gates = modality_gates
             modality_channel_gates = torch.ones_like(contextual_tokens) * gate_mask
         else:
             modality_scores = self.modality_gate_net(flat_gate_features).reshape(batch_size, NUM_TASKS, n_modalities)
@@ -1568,15 +1670,25 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                     float(torch.finfo(modality_scores.dtype).min),
                 )
             if self.fusion_use_modality_gates:
-                modality_gates = torch.softmax(modality_scores, dim=-1)
+                modality_gates = torch.softmax(
+                    modality_scores / float(max(1e-3, self.fusion_gate_temperature)),
+                    dim=-1,
+                )
                 modality_gates = modality_gates * active_mask_bt
                 modality_gates = modality_gates / modality_gates.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                modality_raw_gates = modality_gates
+                modality_gates = self._balance_modality_gates(
+                    gates=modality_gates,
+                    active_mask=active_mask_bt,
+                    sample_has_real_3d=sample_has_real_3d,
+                )
                 channel_logits = self.modality_channel_gate_net(flat_gate_features).reshape(
                     batch_size, NUM_TASKS, n_modalities, self.proj_dim
                 )
                 modality_channel_gates = (1.0 + 0.5 * torch.tanh(channel_logits)) * gate_mask
             else:
                 modality_gates = active_mask_bt / active_mask_bt.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                modality_raw_gates = modality_gates
                 modality_channel_gates = torch.ones_like(contextual_tokens) * gate_mask
         modality_channel_gate_mean = modality_channel_gates.mean(dim=-1) * active_mask_bt
 
@@ -1640,6 +1752,7 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
         fusion_info = {
             "modality_order": tuple(str(x) for x in self.active_modalities),
             "modality_scores": modality_scores,
+            "modality_raw_gates": modality_raw_gates,
             "modality_gates": modality_gates,
             "modality_channel_gate_mean": modality_channel_gate_mean,
             "modality_attn": modality_attn,
@@ -2132,8 +2245,8 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 lambda_aux_abs=self.lambda_aux_abs,
                 lambda_aux_fluo=self.lambda_aux_fluo,
                 lambda_aux_bitmask=self.lambda_aux_bitmask,
-                task_loss_log_vars=(self.task_loss_log_vars if self.learnable_task_uncertainty else None),
-                task_uncertainty_reg=float(self.task_uncertainty_reg),
+                task_loss_log_vars=None,
+                task_uncertainty_reg=0.0,
             )
             contrastive_cross_modal = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
             contrastive_3d_consistency = torch.zeros((), dtype=losses.total.dtype, device=losses.total.device)
@@ -2202,13 +2315,6 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
             on_epoch=True,
             batch_size=bs,
         )
-        self.log(
-            "train_task_uncertainty_reg_mean",
-            losses.task_uncertainty_reg.mean(),
-            on_step=False,
-            on_epoch=True,
-            batch_size=bs,
-        )
         for task_idx in range(NUM_TASKS):
             self.log(
                 f"train_task_loss_t{int(task_idx)}",
@@ -2231,23 +2337,6 @@ class MILTaskAttnMixerWithAux(pl.LightningModule):
                 on_epoch=True,
                 batch_size=bs,
             )
-        if self.learnable_task_uncertainty and self.task_loss_log_vars is not None:
-            task_precision = torch.exp(-self.task_loss_log_vars.detach())
-            for task_idx in range(NUM_TASKS):
-                self.log(
-                    f"train_task_log_var_t{int(task_idx)}",
-                    self.task_loss_log_vars[int(task_idx)].detach(),
-                    on_step=False,
-                    on_epoch=True,
-                    batch_size=bs,
-                )
-                self.log(
-                    f"train_task_precision_t{int(task_idx)}",
-                    task_precision[int(task_idx)],
-                    on_step=False,
-                    on_epoch=True,
-                    batch_size=bs,
-                )
         self.log("train_concept_alignment", concept_alignment, on_step=False, on_epoch=True, batch_size=bs)
         self.log("train_concept_bonus", concept_bonus, on_step=False, on_epoch=True, batch_size=bs)
         self.log("train_rl_guidance_scale", float(self.rl_guidance_scale), on_step=False, on_epoch=True, batch_size=bs)

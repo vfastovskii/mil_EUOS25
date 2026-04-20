@@ -227,6 +227,7 @@ def export_leaderboard_attention(
         attn_geom_t = attn.get("attn_geom")
         attn_qm_t = attn.get("attn_qm")
         modality_gates_t = attn.get("modality_gates")
+        modality_raw_gates_t = attn.get("modality_raw_gates")
         modality_channel_gate_mean_t = attn.get("modality_channel_gate_mean")
         modality_attn_t = attn.get("modality_attn")
         modality_order = tuple(str(x) for x in (attn.get("modality_order") or ()))
@@ -245,6 +246,9 @@ def export_leaderboard_attention(
         )  # [B,4,N]
         modality_gates_np = (
             None if modality_gates_t is None else modality_gates_t.detach().cpu().numpy()
+        )  # [B,4,M]
+        modality_raw_gates_np = (
+            None if modality_raw_gates_t is None else modality_raw_gates_t.detach().cpu().numpy()
         )  # [B,4,M]
         modality_channel_gate_mean_np = (
             None
@@ -344,6 +348,15 @@ def export_leaderboard_attention(
                         for mi, modality_name in enumerate(modality_order):
                             row[f"fusion_gate_{str(modality_name)}_{TASK_COLS[t]}"] = float(
                                 modality_gates_np[b, t, mi]
+                            )
+                if (
+                    modality_raw_gates_np is not None
+                    and len(modality_order) == int(modality_raw_gates_np.shape[2])
+                ):
+                    for t in range(T):
+                        for mi, modality_name in enumerate(modality_order):
+                            row[f"fusion_raw_gate_{str(modality_name)}_{TASK_COLS[t]}"] = float(
+                                modality_raw_gates_np[b, t, mi]
                             )
                 if (
                     modality_channel_gate_mean_np is not None

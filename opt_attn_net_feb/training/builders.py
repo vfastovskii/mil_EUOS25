@@ -100,6 +100,13 @@ class MILModelBuilder:
                     None if b.fusion_gate_hidden is None else int(b.fusion_gate_hidden)
                 ),
                 fusion_interaction_heads=int(b.fusion_interaction_heads),
+                fusion_gate_temperature=float(b.fusion_gate_temperature),
+                fusion_gate_prior_strength=float(b.fusion_gate_prior_strength),
+                fusion_gate_prior_2d=float(b.fusion_gate_prior_2d),
+                fusion_gate_prior_3d_geom=float(b.fusion_gate_prior_3d_geom),
+                fusion_gate_prior_3d_qm=float(b.fusion_gate_prior_3d_qm),
+                fusion_gate_2d_max=float(b.fusion_gate_2d_max),
+                fusion_gate_3d_min_total=float(b.fusion_gate_3d_min_total),
             ),
             predictor=MILPredictorConfig(
                 predictor_name=str(b.predictor_name),

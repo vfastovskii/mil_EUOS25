@@ -32,6 +32,13 @@ class MILBackboneConfig:
     fusion_use_modality_interaction: bool = True
     fusion_gate_hidden: Optional[int] = None
     fusion_interaction_heads: int = 4
+    fusion_gate_temperature: float = 1.0
+    fusion_gate_prior_strength: float = 0.0
+    fusion_gate_prior_2d: float = 1.0
+    fusion_gate_prior_3d_geom: float = 1.0
+    fusion_gate_prior_3d_qm: float = 1.0
+    fusion_gate_2d_max: float = 1.0
+    fusion_gate_3d_min_total: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -69,13 +76,13 @@ class MILLossConfig:
     lambda_contrastive_cross_modal: float = 0.05
     lambda_contrastive_3d_consistency: float = 0.05
     lambda_contrastive_supervised: float = 0.05
-    contrastive_proj_dim: int = 64
+    contrastive_proj_dim: int = 256
     contrastive_temperature: float = 0.10
     consistency_view_keep_rate: float = 0.70
     cross_modal_include_geom_qm: bool = True
-    learnable_task_uncertainty: bool = True
+    learnable_task_uncertainty: bool = False
     task_uncertainty_init_log_var: float = 0.0
-    task_uncertainty_reg: float = 0.5
+    task_uncertainty_reg: float = 0.0
     reg_loss_type: str = "mse"
     bitmask_group_top_ids: Optional[List[int]] = None
     bitmask_group_class_weight: Optional[List[float]] = None

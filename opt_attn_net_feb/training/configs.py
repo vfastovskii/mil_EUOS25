@@ -64,6 +64,13 @@ class BackboneConfig:
     fusion_use_modality_interaction: bool = True
     fusion_gate_hidden: int | None = None
     fusion_interaction_heads: int = 4
+    fusion_gate_temperature: float = 1.0
+    fusion_gate_prior_strength: float = 0.0
+    fusion_gate_prior_2d: float = 1.0
+    fusion_gate_prior_3d_geom: float = 1.0
+    fusion_gate_prior_3d_qm: float = 1.0
+    fusion_gate_2d_max: float = 1.0
+    fusion_gate_3d_min_total: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -223,13 +230,13 @@ class LossWeightingConfig:
     lambda_contrastive_cross_modal: float = 0.05
     lambda_contrastive_3d_consistency: float = 0.05
     lambda_contrastive_supervised: float = 0.05
-    contrastive_proj_dim: int = 64
+    contrastive_proj_dim: int = 256
     contrastive_temperature: float = 0.10
     consistency_view_keep_rate: float = 0.70
     cross_modal_include_geom_qm: bool = True
-    learnable_task_uncertainty: bool = True
+    learnable_task_uncertainty: bool = False
     task_uncertainty_init_log_var: float = 0.0
-    task_uncertainty_reg: float = 0.5
+    task_uncertainty_reg: float = 0.0
     bitmask_group_top_k: int = 6
     bitmask_group_weight_alpha: float = 0.5
     bitmask_group_weight_cap: float = 5.0
@@ -280,13 +287,13 @@ class LossWeightingConfig:
             lambda_contrastive_cross_modal=float(params.get("lambda_contrastive_cross_modal", 0.05)),
             lambda_contrastive_3d_consistency=float(params.get("lambda_contrastive_3d_consistency", 0.05)),
             lambda_contrastive_supervised=float(params.get("lambda_contrastive_supervised", 0.05)),
-            contrastive_proj_dim=int(params.get("contrastive_proj_dim", 64)),
+            contrastive_proj_dim=256,
             contrastive_temperature=float(params.get("contrastive_temperature", 0.10)),
             consistency_view_keep_rate=float(params.get("consistency_view_keep_rate", 0.70)),
             cross_modal_include_geom_qm=bool(params.get("cross_modal_include_geom_qm", True)),
-            learnable_task_uncertainty=bool(params.get("learnable_task_uncertainty", True)),
-            task_uncertainty_init_log_var=float(params.get("task_uncertainty_init_log_var", 0.0)),
-            task_uncertainty_reg=float(params.get("task_uncertainty_reg", 0.5)),
+            learnable_task_uncertainty=False,
+            task_uncertainty_init_log_var=0.0,
+            task_uncertainty_reg=0.0,
             bitmask_group_top_k=int(params.get("bitmask_group_top_k", 6)),
             bitmask_group_weight_alpha=float(params.get("bitmask_group_weight_alpha", 0.5)),
             bitmask_group_weight_cap=float(params.get("bitmask_group_weight_cap", 5.0)),
@@ -396,6 +403,13 @@ class HPOConfig:
                 else int(params.get("fusion_gate_hidden"))
             ),
             fusion_interaction_heads=int(params.get("fusion_interaction_heads", 4)),
+            fusion_gate_temperature=float(params.get("fusion_gate_temperature", 1.0)),
+            fusion_gate_prior_strength=float(params.get("fusion_gate_prior_strength", 0.0)),
+            fusion_gate_prior_2d=float(params.get("fusion_gate_prior_2d", 1.0)),
+            fusion_gate_prior_3d_geom=float(params.get("fusion_gate_prior_3d_geom", 1.0)),
+            fusion_gate_prior_3d_qm=float(params.get("fusion_gate_prior_3d_qm", 1.0)),
+            fusion_gate_2d_max=float(params.get("fusion_gate_2d_max", 1.0)),
+            fusion_gate_3d_min_total=float(params.get("fusion_gate_3d_min_total", 0.0)),
         )
 
         heads = HeadConfig(

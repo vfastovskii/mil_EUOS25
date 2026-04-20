@@ -692,10 +692,12 @@ def _search_space_mt_2d(trial: optuna.Trial) -> Dict[str, Any]:
         "lambda_contrastive_supervised": trial.suggest_float("lambda_contrastive_supervised", 0.005, 0.2, log=True),
         "lambda_contrastive_cross_modal": 0.0,
         "lambda_contrastive_3d_consistency": 0.0,
+        "contrastive_proj_dim": 256,
         "reg_loss_type": trial.suggest_categorical("reg_loss_type", ["mse"]),
         "min_w": 0.40,
         "stage_2d_only_epochs": 0,
         "stage_3d_only_epochs": 0,
+        "learnable_task_uncertainty": False,
         "accumulate_grad_batches": trial.suggest_categorical("accumulate_grad_batches", [8, 16]),
         "head_stochastic_depth": trial.suggest_float("head_stochastic_depth", 0.0, 0.1),
     }
@@ -720,9 +722,20 @@ def _complete_mil_family_params(*, family: str, params: Mapping[str, Any]) -> Di
     fam = str(family)
     out: Dict[str, Any] = dict(params)
     out.setdefault("min_w", 0.40)
+    out["contrastive_proj_dim"] = 256
+    out["learnable_task_uncertainty"] = False
+    out["task_uncertainty_init_log_var"] = 0.0
+    out["task_uncertainty_reg"] = 0.0
 
     if fam == "mt_2d":
         out.update(_mt_2d_fixed_inactive_params())
+        out.setdefault("fusion_gate_temperature", 1.0)
+        out.setdefault("fusion_gate_prior_strength", 0.0)
+        out.setdefault("fusion_gate_prior_2d", 1.0)
+        out.setdefault("fusion_gate_prior_3d_geom", 1.0)
+        out.setdefault("fusion_gate_prior_3d_qm", 1.0)
+        out.setdefault("fusion_gate_2d_max", 1.0)
+        out.setdefault("fusion_gate_3d_min_total", 0.0)
         out.setdefault("lr_scale_3d", 1.0)
         out.setdefault("lambda_contrastive_cross_modal", 0.0)
         out.setdefault("lambda_contrastive_3d_consistency", 0.0)
@@ -742,6 +755,13 @@ def _complete_mil_family_params(*, family: str, params: Mapping[str, Any]) -> Di
         out.setdefault("batch_size", 512)
         out.setdefault("reg_loss_type", "mse")
         out.setdefault("accumulate_grad_batches", 16)
+        out.setdefault("fusion_gate_temperature", 1.0)
+        out.setdefault("fusion_gate_prior_strength", 0.0)
+        out.setdefault("fusion_gate_prior_2d", 1.0)
+        out.setdefault("fusion_gate_prior_3d_geom", 1.0)
+        out.setdefault("fusion_gate_prior_3d_qm", 1.0)
+        out.setdefault("fusion_gate_2d_max", 1.0)
+        out.setdefault("fusion_gate_3d_min_total", 0.0)
         out.update(_mt_3d_fixed_inactive_params())
         return out
 
@@ -759,10 +779,19 @@ def _complete_mil_family_params(*, family: str, params: Mapping[str, Any]) -> Di
         out.setdefault("batch_size", 256)
         out.setdefault("reg_loss_type", "mse")
         out.setdefault("accumulate_grad_batches", 8)
+        # Balance the 2D/3D fusion prior for legacy best-param JSONs that predate
+        # explicit fusion-balancing HPO knobs. HPO can still override all of these.
+        out["fusion_gate_temperature"] = float(out.get("fusion_gate_temperature", 1.6))
+        out["fusion_gate_prior_strength"] = float(out.get("fusion_gate_prior_strength", 0.10))
+        out["fusion_gate_prior_2d"] = float(out.get("fusion_gate_prior_2d", 0.50))
+        out["fusion_gate_prior_3d_geom"] = float(out.get("fusion_gate_prior_3d_geom", 0.30))
+        out["fusion_gate_prior_3d_qm"] = float(out.get("fusion_gate_prior_3d_qm", 0.20))
+        out["fusion_gate_2d_max"] = float(out.get("fusion_gate_2d_max", 0.72))
+        out["fusion_gate_3d_min_total"] = float(out.get("fusion_gate_3d_min_total", 0.25))
         out.setdefault("stage_2d_only_epochs", 1)
         out.setdefault("stage_3d_only_epochs", 1)
         out.setdefault("multitask_gradient_mode", "pcgrad_shared")
-        out.setdefault("learnable_task_uncertainty", True)
+        out["learnable_task_uncertainty"] = False
         return out
 
     return out
@@ -815,8 +844,10 @@ def _search_space_mt_3d(trial: optuna.Trial) -> Dict[str, Any]:
         "lambda_contrastive_cross_modal": trial.suggest_float("lambda_contrastive_cross_modal", 0.001, 0.02, log=True),
         "lambda_contrastive_3d_consistency": trial.suggest_float("lambda_contrastive_3d_consistency", 0.035, 0.12, log=True),
         "lambda_contrastive_supervised": trial.suggest_float("lambda_contrastive_supervised", 0.008, 0.05, log=True),
+        "contrastive_proj_dim": 256,
         "reg_loss_type": "mse",
         "min_w": 0.40,
+        "learnable_task_uncertainty": False,
         "accumulate_grad_batches": 16,
         "head_stochastic_depth": trial.suggest_float("head_stochastic_depth", 0.0, 0.06),
     }
@@ -1491,6 +1522,14 @@ def _run_mil_final_train_and_predict(
         "lambda_contrastive_cross_modal",
         "lambda_contrastive_3d_consistency",
         "lambda_contrastive_supervised",
+        "contrastive_proj_dim",
+        "fusion_gate_temperature",
+        "fusion_gate_prior_strength",
+        "fusion_gate_prior_2d",
+        "fusion_gate_prior_3d_geom",
+        "fusion_gate_prior_3d_qm",
+        "fusion_gate_2d_max",
+        "fusion_gate_3d_min_total",
     )
     missing_audit_keys = [str(k) for k in audit_keys if k not in best_params]
     log_event(
@@ -1524,6 +1563,14 @@ def _run_mil_final_train_and_predict(
         lambda_contrastive_cross_modal=float(hpo_cfg.loss.lambda_contrastive_cross_modal),
         lambda_contrastive_3d_consistency=float(hpo_cfg.loss.lambda_contrastive_3d_consistency),
         lambda_contrastive_supervised=float(hpo_cfg.loss.lambda_contrastive_supervised),
+        contrastive_proj_dim=int(hpo_cfg.loss.contrastive_proj_dim),
+        fusion_gate_temperature=float(hpo_cfg.backbone.fusion_gate_temperature),
+        fusion_gate_prior_strength=float(hpo_cfg.backbone.fusion_gate_prior_strength),
+        fusion_gate_prior_2d=float(hpo_cfg.backbone.fusion_gate_prior_2d),
+        fusion_gate_prior_3d_geom=float(hpo_cfg.backbone.fusion_gate_prior_3d_geom),
+        fusion_gate_prior_3d_qm=float(hpo_cfg.backbone.fusion_gate_prior_3d_qm),
+        fusion_gate_2d_max=float(hpo_cfg.backbone.fusion_gate_2d_max),
+        fusion_gate_3d_min_total=float(hpo_cfg.backbone.fusion_gate_3d_min_total),
     )
     lam = compute_lam(hpo_cfg.loss, y_train=family_data.y_cls_train)
     posw = pos_weight_per_task(
