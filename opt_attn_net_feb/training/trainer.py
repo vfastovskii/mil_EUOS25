@@ -32,6 +32,9 @@ class LightningTrainerConfig:
             The maximum number of training epochs to run.
         patience: int
             The patience value for early stopping in terms of epochs.
+        early_stopping_min_delta: float
+            Minimum improvement in the monitored metric required to reset
+            early stopping patience.
         accelerator: str
             Backend to use for training, e.g., 'cpu', 'gpu', 'tpu'.
         devices: int
@@ -51,6 +54,7 @@ class LightningTrainerConfig:
     devices: int
     precision: str
     accumulate_grad_batches: int
+    early_stopping_min_delta: float = 1e-4
     save_checkpoint: bool = True
     save_weights_only: bool = True
 
@@ -85,6 +89,7 @@ class LightningTrainerFactory:
             monitor=monitor_metric,
             mode="max",
             patience=int(self.config.patience),
+            min_delta=float(self.config.early_stopping_min_delta),
         )
         callbacks: List[Callback] = [es]
         ckpt: Optional[pl.callbacks.ModelCheckpoint] = None
@@ -223,6 +228,7 @@ def make_trainer_gpu(
     cfg = LightningTrainerConfig(
         max_epochs=int(max_epochs),
         patience=int(patience),
+        early_stopping_min_delta=1e-4,
         accelerator=str(accelerator),
         devices=int(devices),
         precision=str(precision),

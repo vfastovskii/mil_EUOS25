@@ -872,7 +872,7 @@ class _MILMacroCrossValidator:
         self.data = data
         self.run_config = run_config
         self.family = str(family)
-        self.full_cv_warmup_trials = 5
+        self.full_cv_warmup_trials = 2
         self._focus_fold_id: int | None = None
         self._focus_fold_source_trials: int = 0
 
@@ -1819,6 +1819,7 @@ def _run_mil_final_train_and_predict(
     trainer_cfg = LightningTrainerConfig(
         max_epochs=int(target_epochs),
         patience=int(target_patience),
+        early_stopping_min_delta=1e-4,
         accelerator=str(cfg.nn_accelerator),
         devices=int(cfg.nn_devices),
         precision=str(cfg.precision),
@@ -1837,6 +1838,7 @@ def _run_mil_final_train_and_predict(
         n_validation_rows=int(n_validation_rows),
         max_epochs=int(trainer_cfg.max_epochs),
         patience=int(trainer_cfg.patience),
+        early_stopping_min_delta=float(trainer_cfg.early_stopping_min_delta),
         accumulate_grad_batches=int(trainer_cfg.accumulate_grad_batches),
         accelerator=str(trainer_cfg.accelerator),
         devices=int(trainer_cfg.devices),

@@ -1692,7 +1692,7 @@ def _parse_args(argv: Any | None = None):
     ap.add_argument("--folds", nargs="+", type=int, default=None)
 
     ap.add_argument("--max_epochs", type=int, default=150)
-    ap.add_argument("--patience", type=int, default=20)
+    ap.add_argument("--patience", type=int, default=15)
     ap.add_argument("--trials", type=int, default=50)
     ap.add_argument("--trials_mil", type=int, default=None)
     ap.add_argument(

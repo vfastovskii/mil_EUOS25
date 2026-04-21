@@ -1101,6 +1101,7 @@ class MILFoldTrainer:
         trainer_cfg = LightningTrainerConfig(
             max_epochs=int(self.run_config.trainer.max_epochs),
             patience=int(self.run_config.trainer.patience),
+            early_stopping_min_delta=1e-4,
             accelerator=str(self.run_config.trainer.accelerator),
             devices=int(self.run_config.trainer.devices),
             precision=str(self.run_config.trainer.precision),
@@ -1117,6 +1118,7 @@ class MILFoldTrainer:
             run_tag=str(run_tag),
             max_epochs=int(trainer_cfg.max_epochs),
             patience=int(trainer_cfg.patience),
+            early_stopping_min_delta=float(trainer_cfg.early_stopping_min_delta),
             accumulate_grad_batches=int(trainer_cfg.accumulate_grad_batches),
             accelerator=str(trainer_cfg.accelerator),
             devices=int(trainer_cfg.devices),
@@ -2242,6 +2244,7 @@ class MILFinalTrainer:
         trainer_cfg = LightningTrainerConfig(
             max_epochs=int(self.config.trainer.max_epochs),
             patience=int(self.config.trainer.patience),
+            early_stopping_min_delta=1e-4,
             accelerator=str(self.config.trainer.accelerator),
             devices=int(self.config.trainer.devices),
             precision=str(self.config.trainer.precision),
@@ -2255,6 +2258,7 @@ class MILFinalTrainer:
             "final.trainer_plan",
             max_epochs=int(trainer_cfg.max_epochs),
             patience=int(trainer_cfg.patience),
+            early_stopping_min_delta=float(trainer_cfg.early_stopping_min_delta),
             accumulate_grad_batches=int(trainer_cfg.accumulate_grad_batches),
             accelerator=str(trainer_cfg.accelerator),
             devices=int(trainer_cfg.devices),
